@@ -41,6 +41,32 @@ class KVMManager:
 
         print(f"Loaded {len(self.devices)} devices from database")
 
+    def load_devices_from_server(self, device_list: list):
+        """서버 API에서 받은 기기 목록으로 로드"""
+        self.devices.clear()
+        for record in device_list:
+            info = KVMInfo(
+                name=record.get('name', ''),
+                ip=record.get('ip', ''),
+                port=record.get('port', 22),
+                web_port=record.get('web_port', 80),
+                username=record.get('username', 'root'),
+                password=record.get('password', 'luckfox'),
+                group=record.get('group_name', 'default'),
+            )
+            self.devices[record['name']] = KVMDevice(info)
+            # 로컬 DB에도 동기화 (있으면 업데이트, 없으면 추가)
+            try:
+                existing = self.db.get_device_by_name(record['name'])
+                if not existing:
+                    self.db.add_device(
+                        info.name, info.ip, info.port, info.web_port,
+                        info.username, info.password, info.group
+                    )
+            except Exception:
+                pass
+        print(f"Loaded {len(self.devices)} devices from server")
+
     def add_device(self, name: str, ip: str, port: int = 22, web_port: int = 80,
                    username: str = "root", password: str = "luckfox",
                    group: str = "default") -> KVMDevice:

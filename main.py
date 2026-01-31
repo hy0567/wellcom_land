@@ -41,6 +41,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon
 
 from ui import MainWindow
+from ui.login_dialog import LoginDialog
 from config import WINDOW_TITLE, ICON_PATH
 
 
@@ -151,6 +152,12 @@ def main():
     # 업데이트 확인 (업데이트 적용 시 재시작)
     if not check_for_updates(app):
         return
+
+    # 로그인 다이얼로그
+    login_dialog = LoginDialog()
+    if login_dialog.exec() == 0 or not login_dialog.logged_in:
+        print("[App] 로그인 취소됨. 종료합니다.")
+        sys.exit(0)
 
     # 메인 윈도우 생성 및 표시
     window = MainWindow()

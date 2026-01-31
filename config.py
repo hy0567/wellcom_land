@@ -113,6 +113,12 @@ class Settings:
             'github_token': '',
             'auto_check': True,
             'skip_version': ''
+        },
+        'server': {
+            'api_url': 'http://log.wellcomll.org:8000',
+            'token': '',
+            'username': '',
+            'auto_login': False
         }
     }
 

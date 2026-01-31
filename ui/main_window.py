@@ -25,6 +25,7 @@ from core.hid_controller import FastHIDController
 from .dialogs import AddDeviceDialog, DeviceSettingsDialog, AutoDiscoveryDialog, AppSettingsDialog
 from config import settings as app_settings, ICON_PATH
 from .device_control import DeviceControlPanel
+from .admin_panel import AdminPanel
 
 
 class InitialStatusCheckThread(QThread):
@@ -1905,7 +1906,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.manager = KVMManager()
-        self.manager.load_devices_from_db()
+        self._load_devices_from_source()
 
         self.status_thread: StatusUpdateThread = None
         self.current_device: KVMDevice = None
@@ -1925,7 +1926,12 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(5000, self._start_monitoring)
 
     def _init_ui(self):
-        self.setWindowTitle("WellcomLAND")
+        from api_client import api_client
+        title = "WellcomLAND"
+        if api_client.user:
+            name = api_client.user.get('display_name') or api_client.user.get('username', '')
+            title = f"WellcomLAND - {name}"
+        self.setWindowTitle(title)
         self.setMinimumSize(1400, 900)
 
         # 윈도우 아이콘 설정 (타이틀바 + 작업표시줄)
@@ -2006,6 +2012,12 @@ class MainWindow(QMainWindow):
 
         self.batch_tab = self._create_batch_tab()
         self.tab_widget.addTab(self.batch_tab, "일괄 작업")
+
+        # 관리자 탭 (admin 로그인 시에만)
+        from api_client import api_client
+        if api_client.is_admin:
+            self.admin_tab = AdminPanel()
+            self.tab_widget.addTab(self.admin_tab, "관리자")
 
         # 탭 변경 시그널 연결
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
@@ -2249,10 +2261,36 @@ class MainWindow(QMainWindow):
         toolbar.addAction("전체 연결", self._on_connect_all)
         toolbar.addAction("새로고침", self._on_refresh_all_status)
 
+    def _load_devices_from_source(self):
+        """서버 또는 로컬 DB에서 기기 목록 로드"""
+        try:
+            from api_client import api_client
+            if api_client.is_logged_in:
+                devices = api_client.get_my_devices()
+                self.manager.load_devices_from_server(devices)
+                print(f"[MainWindow] 서버에서 {len(devices)}개 기기 로드")
+                return
+        except Exception as e:
+            print(f"[MainWindow] 서버 기기 로드 실패, 로컬 DB 사용: {e}")
+        # 폴백: 로컬 DB
+        self.manager.load_devices_from_db()
+
     def _create_statusbar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("준비됨")
+
+        # 버전 정보 (상태바 우측 고정)
+        from version import __version__
+        from api_client import api_client
+        user_info = ""
+        if api_client.user:
+            name = api_client.user.get('display_name') or api_client.user.get('username', '')
+            role = "관리자" if api_client.is_admin else "사용자"
+            user_info = f"  |  {name} ({role})"
+        version_label = QLabel(f"v{__version__}{user_info}")
+        version_label.setStyleSheet("color: #666; padding-right: 10px; font-size: 12px;")
+        self.status_bar.addPermanentWidget(version_label)
 
     def _initial_status_check(self):
         """최초 실행 시 장치 상태 체크 후 그리드 뷰 초기화 (비동기)"""
