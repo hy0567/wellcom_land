@@ -27,6 +27,7 @@ a = Analysis(
         (str(project_path / 'main.py'), 'app'),
         (str(project_path / 'config.py'), 'app'),
         (str(project_path / 'version.py'), 'app'),
+        (str(project_path / 'api_client.py'), 'app'),
         (str(project_path / 'core'), 'app/core'),
         (str(project_path / 'ui'), 'app/ui'),
         (str(project_path / 'updater'), 'app/updater'),
