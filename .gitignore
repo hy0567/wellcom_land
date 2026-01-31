@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/work/
+
+# Virtual Environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data (사용자 데이터는 git에 포함하지 않음)
+data/settings.json
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temp
+temp/
+logs/
+backup/
+
+# Claude
+.claude/
