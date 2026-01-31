@@ -1992,28 +1992,21 @@ class MainWindow(QMainWindow):
 
         self.tab_widget = QTabWidget()
 
-        # 전체 목록 탭 (그리드 뷰) - 첫 번째 탭으로
+        # 1. 전체 목록 탭 (그리드 뷰)
         self.grid_view_tab = GridViewTab(self.manager)
         self.grid_view_tab.device_selected.connect(self._on_grid_device_selected)
         self.grid_view_tab.device_double_clicked.connect(self._on_grid_device_double_clicked)
         self.tab_widget.addTab(self.grid_view_tab, "전체 목록")
 
-        self.live_tab = self._create_live_tab()
-        self.tab_widget.addTab(self.live_tab, "실시간 제어")
+        # 2. 기기 제어 탭 (실시간 제어 + 개요 + 키보드/마우스 + USB 로그 통합)
+        self.device_control_tab = self._create_device_control_tab()
+        self.tab_widget.addTab(self.device_control_tab, "기기 제어")
 
-        self.overview_tab = self._create_overview_tab()
-        self.tab_widget.addTab(self.overview_tab, "개요")
-
-        self.control_panel = DeviceControlPanel()
-        self.tab_widget.addTab(self.control_panel, "키보드/마우스")
-
-        self.monitor_tab = self._create_monitor_tab()
-        self.tab_widget.addTab(self.monitor_tab, "모니터")
-
+        # 3. 일괄 작업 탭
         self.batch_tab = self._create_batch_tab()
         self.tab_widget.addTab(self.batch_tab, "일괄 작업")
 
-        # 관리자 탭 (admin 로그인 시에만)
+        # 4. 관리자 탭 (admin 로그인 시에만)
         from api_client import api_client
         if api_client.is_admin:
             self.admin_tab = AdminPanel()
@@ -2024,6 +2017,115 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.tab_widget)
         return panel
+
+    def _create_device_control_tab(self) -> QWidget:
+        """기기 제어 통합 탭 (실시간 제어 + 장치 정보 + 키보드/마우스 + USB 로그)"""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(8)
+
+        # === 상단: 선택된 장치 + 제어 버튼 ===
+        top_layout = QHBoxLayout()
+
+        self.live_device_label = QLabel("장치를 선택하세요")
+        self.live_device_label.setStyleSheet("font-weight: bold; font-size: 15px; padding: 5px;")
+        top_layout.addWidget(self.live_device_label, 1)
+
+        self.btn_start_live = QPushButton("실시간 제어")
+        self.btn_start_live.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50; color: white;
+                font-size: 13px; font-weight: bold;
+                padding: 8px 20px; border-radius: 5px;
+            }
+            QPushButton:hover { background-color: #45a049; }
+            QPushButton:disabled { background-color: #ccc; }
+        """)
+        self.btn_start_live.setEnabled(False)
+        self.btn_start_live.clicked.connect(self._on_start_live_control)
+        top_layout.addWidget(self.btn_start_live)
+
+        self.btn_open_web = QPushButton("웹 열기")
+        self.btn_open_web.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3; color: white;
+                font-size: 13px; padding: 8px 20px; border-radius: 5px;
+            }
+            QPushButton:hover { background-color: #1976D2; }
+            QPushButton:disabled { background-color: #ccc; }
+        """)
+        self.btn_open_web.setEnabled(False)
+        self.btn_open_web.clicked.connect(self._on_open_web_browser)
+        top_layout.addWidget(self.btn_open_web)
+
+        main_layout.addLayout(top_layout)
+
+        # === 빠른 작업 버튼 ===
+        quick_layout = QHBoxLayout()
+        for text, handler in [("SSH 연결", self._on_connect_device),
+                               ("SSH 해제", self._on_disconnect_device),
+                               ("USB 재연결", self._on_reconnect_usb),
+                               ("재부팅", self._on_reboot_device)]:
+            btn = QPushButton(text)
+            btn.setStyleSheet("padding: 6px 12px;")
+            btn.clicked.connect(handler)
+            quick_layout.addWidget(btn)
+        main_layout.addLayout(quick_layout)
+
+        # === 중앙: 장치 정보 + 키보드/마우스 (좌우 분할) ===
+        center_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # 좌측: 장치 정보
+        info_widget = QWidget()
+        info_layout = QVBoxLayout(info_widget)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+
+        info_label = QLabel("장치 정보")
+        info_label.setStyleSheet("font-weight: bold; font-size: 13px; padding: 3px;")
+        info_layout.addWidget(info_label)
+
+        self.info_table = QTableWidget(8, 2)
+        self.info_table.setHorizontalHeaderLabels(["항목", "값"])
+        self.info_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.info_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.info_table.verticalHeader().setVisible(False)
+        self.info_table.setMaximumHeight(260)
+
+        for i, prop in enumerate(["이름", "IP 주소", "상태", "USB 상태", "버전", "가동시간", "온도", "메모리"]):
+            self.info_table.setItem(i, 0, QTableWidgetItem(prop))
+            self.info_table.setItem(i, 1, QTableWidgetItem("-"))
+
+        info_layout.addWidget(self.info_table)
+        info_layout.addStretch()
+        center_splitter.addWidget(info_widget)
+
+        # 우측: 키보드/마우스 제어
+        self.control_panel = DeviceControlPanel()
+        center_splitter.addWidget(self.control_panel)
+
+        center_splitter.setSizes([350, 650])
+        main_layout.addWidget(center_splitter, 1)
+
+        # === 하단: USB 로그 ===
+        log_group = QGroupBox("USB 로그")
+        log_layout = QVBoxLayout(log_group)
+        log_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.usb_log_text = QTextEdit()
+        self.usb_log_text.setReadOnly(True)
+        self.usb_log_text.setMaximumHeight(120)
+        self.usb_log_text.setStyleSheet("font-family: 'Consolas', monospace; font-size: 11px;")
+        log_layout.addWidget(self.usb_log_text)
+
+        btn_refresh_log = QPushButton("로그 새로고침")
+        btn_refresh_log.setFixedHeight(28)
+        btn_refresh_log.clicked.connect(self._on_refresh_usb_log)
+        log_layout.addWidget(btn_refresh_log)
+
+        main_layout.addWidget(log_group)
+
+        return widget
 
     def _on_tab_changed(self, index):
         """탭 변경 시 호출"""
