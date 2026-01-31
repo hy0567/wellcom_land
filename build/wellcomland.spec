@@ -18,7 +18,10 @@ block_cipher = None
 a = Analysis(
     [str(project_path / 'launcher.py')],  # 런처가 엔트리포인트
     pathex=[str(project_path)],
-    binaries=[],
+    binaries=[
+        # sqlite3 모듈 명시적 포함
+        (r'C:\Users\-\AppData\Local\Python\pythoncore-3.14-64\DLLs\_sqlite3.pyd', '.'),
+    ],
     datas=[
         # 최초 배포 시 app/ 코드를 포함
         (str(project_path / 'main.py'), 'app'),
@@ -39,9 +42,15 @@ a = Analysis(
         'PyQt6.QtWebEngineWidgets',
         'PyQt6.QtWebEngineCore',
         'PyQt6.QtWebChannel',
+        'PyQt6.QtPrintSupport',
         'paramiko',
         'requests',
         'PIL',
+        'sqlite3',
+        '_sqlite3',
+        'json',
+        'hashlib',
+        'zipfile',
     ],
     hookspath=[],
     runtime_hooks=[],
