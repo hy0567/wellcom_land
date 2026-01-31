@@ -23,7 +23,7 @@ from core import KVMManager, KVMDevice
 from core.kvm_device import DeviceStatus, USBStatus
 from core.hid_controller import FastHIDController
 from .dialogs import AddDeviceDialog, DeviceSettingsDialog, AutoDiscoveryDialog, AppSettingsDialog
-from config import settings as app_settings
+from config import settings as app_settings, ICON_PATH
 from .device_control import DeviceControlPanel
 
 
@@ -1927,6 +1927,12 @@ class MainWindow(QMainWindow):
     def _init_ui(self):
         self.setWindowTitle("WellcomLAND")
         self.setMinimumSize(1400, 900)
+
+        # 윈도우 아이콘 설정 (타이틀바 + 작업표시줄)
+        if ICON_PATH:
+            import os
+            if os.path.exists(ICON_PATH):
+                self.setWindowIcon(QIcon(ICON_PATH))
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)

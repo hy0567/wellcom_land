@@ -112,7 +112,7 @@ def ensure_app_dir():
 
 
 def load_and_run_app():
-    """app/ 폴더의 main.py를 로드하여 실행"""
+    """app/ 폴더의 main 모듈을 로드하여 실행 (.py 또는 .pyc)"""
     logger = logging.getLogger('Launcher')
 
     # app/ 를 sys.path 최상위에 추가
@@ -123,11 +123,23 @@ def load_and_run_app():
     # 환경변수로 base_dir 전달 (config.py가 사용)
     os.environ['WELLCOMLAND_BASE_DIR'] = str(BASE_DIR)
 
-    logger.info(f"앱 로드: {APP_DIR / 'main.py'}")
+    # .pyc 또는 .py 확인
+    has_pyc = (APP_DIR / "main.pyc").exists()
+    has_py = (APP_DIR / "main.py").exists()
+    logger.info(f"앱 로드: {'main.pyc (바이트코드)' if has_pyc else 'main.py (소스)'}")
 
-    # main 모듈 임포트 및 실행
-    import importlib
-    main_module = importlib.import_module('main')
+    if has_pyc and not has_py:
+        # .pyc만 있는 경우: importlib로 직접 로드
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("main", APP_DIR / "main.pyc")
+        main_module = importlib.util.module_from_spec(spec)
+        sys.modules['main'] = main_module
+        spec.loader.exec_module(main_module)
+    else:
+        # .py가 있는 경우: 일반 import
+        import importlib
+        main_module = importlib.import_module('main')
+
     main_module.main()
 
 

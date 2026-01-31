@@ -28,6 +28,24 @@ CONFIG_PATH = os.path.join(DATA_DIR, "settings.json")
 
 # 로그 / 백업 (EXE 환경용)
 LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+# 아이콘 경로
+def _get_icon_path():
+    """아이콘 파일 경로 (EXE/개발 환경 자동 감지)"""
+    if getattr(sys, 'frozen', False):
+        # EXE: _internal/assets/wellcom.ico
+        return os.path.join(sys._MEIPASS, "assets", "wellcom.ico")
+    else:
+        # 개발: build/wellcom.ico 또는 wellcom.ico
+        for p in [
+            os.path.join(BASE_DIR, "build", "wellcom.ico"),
+            os.path.join(BASE_DIR, "wellcom.ico"),
+        ]:
+            if os.path.exists(p):
+                return p
+    return ""
+
+ICON_PATH = _get_icon_path()
 BACKUP_DIR = os.path.join(BASE_DIR, "backup")
 
 # 기본 KVM 설정

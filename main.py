@@ -38,9 +38,10 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
 
 from ui import MainWindow
-from config import WINDOW_TITLE
+from config import WINDOW_TITLE, ICON_PATH
 
 
 def check_for_updates(app: QApplication) -> bool:
@@ -138,6 +139,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(WINDOW_TITLE)
     app.setStyle("Fusion")
+
+    # 애플리케이션 아이콘 설정 (윈도우 타이틀바 + 작업표시줄)
+    if ICON_PATH and os.path.exists(ICON_PATH):
+        app.setWindowIcon(QIcon(ICON_PATH))
+        print(f"[App] 아이콘 적용: {ICON_PATH}")
 
     # OpenGL 소프트웨어 렌더링 비활성화 (하드웨어 가속 강제)
     app.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, False)

@@ -27,6 +27,8 @@ a = Analysis(
         (str(project_path / 'core'), 'app/core'),
         (str(project_path / 'ui'), 'app/ui'),
         (str(project_path / 'updater'), 'app/updater'),
+        # 아이콘 파일 (프로그램 내부에서 사용)
+        (str(project_path / 'build' / 'wellcom.ico'), 'assets'),
     ],
     hiddenimports=[
         'PyQt6.sip',
@@ -70,7 +72,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,          # GUI 앱이므로 콘솔 없음
-    # icon=str(project_path / 'build' / 'wellcomland.ico'),
+    icon=str(project_path / 'build' / 'wellcom.ico'),
     uac_admin=False,
 )
 
