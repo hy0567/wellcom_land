@@ -63,13 +63,9 @@ def check_for_updates(app: QApplication) -> bool:
             return True
 
         token = settings.get('update.github_token', '')
-        if not token:
-            # Private repo는 토큰 없이 접근 불가
-            print("[Update] GitHub 토큰이 설정되지 않았습니다. 업데이트 확인을 건너뜁니다.")
-            return True
 
         base_dir = Path(BASE_DIR)
-        checker = UpdateChecker(base_dir, __github_repo__, token)
+        checker = UpdateChecker(base_dir, __github_repo__, token or None)
 
         print(f"[Update] 현재 버전: v{checker.get_current_version()}")
         print(f"[Update] 업데이트 확인 중... ({__github_repo__})")
