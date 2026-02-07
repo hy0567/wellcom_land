@@ -338,5 +338,201 @@ class KVMDevice:
         except:
             return {}
 
+    # ───────────────────────────────────────────
+    # 파일 전송 (SFTP) - 별도 SSH 연결 사용
+    # ───────────────────────────────────────────
+    def upload_file_sftp(self, local_path: str, remote_path: str,
+                         progress_callback=None) -> bool:
+        """SFTP로 파일 업로드 (별도 SSH 연결, lock 간섭 없음)
+
+        Args:
+            local_path: 로컬 파일 경로
+            remote_path: KVM 장치의 대상 경로
+            progress_callback: callable(bytes_transferred, total_bytes)
+        """
+        ssh = None
+        sftp = None
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                self.info.ip,
+                port=self.info.port,
+                username=self.info.username,
+                password=self.info.password,
+                timeout=10
+            )
+            sftp = ssh.open_sftp()
+            sftp.put(local_path, remote_path, callback=progress_callback)
+            return True
+        except Exception as e:
+            print(f"[{self.name}] SFTP 업로드 실패: {e}")
+            return False
+        finally:
+            if sftp:
+                sftp.close()
+            if ssh:
+                ssh.close()
+
+    # ───────────────────────────────────────────
+    # USB Mass Storage 마운트/해제
+    # ───────────────────────────────────────────
+    def _ssh_exec_standalone(self, ssh, cmd: str, timeout: int = 10) -> tuple:
+        """별도 SSH 연결로 명령 실행 (lock 사용 안함)"""
+        try:
+            stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+            return stdout.read().decode().strip(), stderr.read().decode().strip()
+        except Exception as e:
+            return "", str(e)
+
+    def _create_standalone_ssh(self):
+        """독립 SSH 연결 생성 (lock 간섭 방지)"""
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            self.info.ip,
+            port=self.info.port,
+            username=self.info.username,
+            password=self.info.password,
+            timeout=10
+        )
+        return ssh
+
+    def mount_usb_mass_storage(self, file_path: str) -> tuple:
+        """KVM 장치의 파일을 USB Mass Storage로 마운트
+        별도 SSH 연결 사용 (메인 스레드 lock 간섭 방지)
+
+        Args:
+            file_path: KVM 장치 내 파일 경로 (예: /tmp/test.exe)
+        Returns:
+            (success: bool, message: str)
+        """
+        import os as _os
+        filename = _os.path.basename(file_path)
+        img_path = "/tmp/usb_drive.img"
+        mnt_path = "/tmp/usb_mnt"
+        ssh = None
+
+        try:
+            ssh = self._create_standalone_ssh()
+
+            # 파일 크기 확인 (busybox stat 호환)
+            out, err = self._ssh_exec_standalone(ssh, f"ls -l {file_path}")
+            if not out or file_path not in out:
+                return False, f"파일을 찾을 수 없습니다: {file_path}\n{err}"
+
+            # ls -l 에서 파일 크기 파싱 (5번째 필드)
+            try:
+                parts = out.split()
+                file_size = int(parts[4])
+            except (IndexError, ValueError):
+                # fallback: wc -c 사용
+                out2, _ = self._ssh_exec_standalone(ssh, f"wc -c < {file_path}")
+                file_size = int(out2.strip()) if out2.strip().isdigit() else 0
+
+            if file_size == 0:
+                return False, f"파일 크기를 확인할 수 없습니다: {file_path}"
+
+            img_mb = max(4, (file_size // (1024 * 1024)) + 2)
+
+            # gadget 경로 확인
+            gadget_out, _ = self._ssh_exec_standalone(
+                ssh, "ls -d /sys/kernel/config/usb_gadget/*/functions/mass_storage.usb0 2>/dev/null | head -1"
+            )
+            gadget_path = gadget_out.strip()
+            if not gadget_path:
+                return False, "USB Mass Storage를 지원하지 않는 장치입니다"
+
+            # 이미지 생성 + 포맷 + 파일 복사
+            self._ssh_exec_standalone(ssh, f"umount {mnt_path} 2>/dev/null")
+            self._ssh_exec_standalone(ssh, f"echo '' > {gadget_path}/lun.0/file 2>/dev/null")
+            self._ssh_exec_standalone(ssh, f"dd if=/dev/zero of={img_path} bs=1M count={img_mb}", timeout=120)
+            self._ssh_exec_standalone(ssh, f"mkfs.vfat {img_path}")
+            self._ssh_exec_standalone(ssh, f"mkdir -p {mnt_path}")
+
+            _, err = self._ssh_exec_standalone(ssh, f"mount -o loop {img_path} {mnt_path}")
+            if err and "failed" in err.lower():
+                return False, f"이미지 마운트 실패: {err}"
+
+            self._ssh_exec_standalone(ssh, f"cp {file_path} {mnt_path}/")
+            self._ssh_exec_standalone(ssh, "sync")
+            self._ssh_exec_standalone(ssh, f"umount {mnt_path}")
+
+            # USB gadget에 연결
+            self._ssh_exec_standalone(ssh, f"echo 0 > {gadget_path}/lun.0/cdrom")
+            self._ssh_exec_standalone(ssh, f"echo 0 > {gadget_path}/lun.0/ro")
+            self._ssh_exec_standalone(ssh, f"echo {img_path} > {gadget_path}/lun.0/file")
+
+            return True, f"'{filename}' USB 드라이브로 마운트됨"
+        except Exception as e:
+            return False, f"USB 마운트 실패: {e}"
+        finally:
+            if ssh:
+                ssh.close()
+
+    def unmount_usb_mass_storage(self) -> tuple:
+        """USB Mass Storage 해제
+        별도 SSH 연결 사용 (메인 스레드 lock 간섭 방지)
+
+        Returns:
+            (success: bool, message: str)
+        """
+        ssh = None
+        try:
+            ssh = self._create_standalone_ssh()
+
+            gadget_out, _ = self._ssh_exec_standalone(
+                ssh, "ls -d /sys/kernel/config/usb_gadget/*/functions/mass_storage.usb0 2>/dev/null | head -1"
+            )
+            gadget_path = gadget_out.strip()
+            if not gadget_path:
+                return False, "USB Mass Storage를 지원하지 않는 장치입니다"
+
+            self._ssh_exec_standalone(ssh, f"echo '' > {gadget_path}/lun.0/file")
+            self._ssh_exec_standalone(ssh, "rm -f /tmp/usb_drive.img")
+            self._ssh_exec_standalone(ssh, "rm -rf /tmp/usb_mnt")
+
+            return True, "USB 드라이브 해제됨"
+        except Exception as e:
+            return False, f"USB 해제 실패: {e}"
+        finally:
+            if ssh:
+                ssh.close()
+
+    def download_from_url(self, url: str, dest_path: str, token: str = None) -> tuple:
+        """KVM 장치에서 URL로 파일 다운로드 (별도 SSH)
+
+        Args:
+            url: 다운로드 URL
+            dest_path: KVM 내 저장 경로 (예: /tmp/file.exe)
+            token: JWT 토큰 (Authorization 헤더용)
+        Returns:
+            (success: bool, message: str)
+        """
+        ssh = None
+        try:
+            ssh = self._create_standalone_ssh()
+
+            # wget으로 다운로드 (curl이 있으면 curl 사용)
+            if token:
+                cmd = f'wget -q --header="Authorization: Bearer {token}" -O {dest_path} "{url}" 2>&1 || ' \
+                      f'curl -s -H "Authorization: Bearer {token}" -o {dest_path} "{url}" 2>&1'
+            else:
+                cmd = f'wget -q -O {dest_path} "{url}" 2>&1 || curl -s -o {dest_path} "{url}" 2>&1'
+
+            out, err = self._ssh_exec_standalone(ssh, cmd, timeout=120)
+
+            # 파일 존재 확인
+            check_out, _ = self._ssh_exec_standalone(ssh, f"ls -l {dest_path}")
+            if dest_path not in (check_out or ""):
+                return False, f"다운로드 실패: {out} {err}"
+
+            return True, dest_path
+        except Exception as e:
+            return False, f"다운로드 실패: {e}"
+        finally:
+            if ssh:
+                ssh.close()
+
     def __repr__(self):
         return f"KVMDevice({self.name}, {self.ip}, {self.status.value})"

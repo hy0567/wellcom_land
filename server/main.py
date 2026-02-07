@@ -2,21 +2,26 @@
 WellcomLAND API 서버
 FastAPI + MySQL + JWT 인증
 """
+import os
+import uuid
 from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse as FastAPIFileResponse
 
 from auth import (
     hash_password, verify_password, create_token,
     get_current_user, require_admin,
 )
 from database import get_db
+from config import UPLOAD_DIR, MAX_FILE_SIZE
 from models import (
     LoginRequest, LoginResponse, UserInfo,
     UserCreate, UserUpdate, UserResponse,
     DeviceCreate, DeviceUpdate, DeviceResponse,
     GroupCreate, GroupResponse,
     DeviceAssign,
+    FileResponse, QuotaResponse,
 )
 
 app = FastAPI(title="WellcomLAND API", version="1.0.0")
@@ -27,6 +32,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _get_cloud_used(cur, user_id: int) -> int:
+    """사용자의 클라우드 사용량 계산 (bytes)"""
+    cur.execute(
+        "SELECT COALESCE(SUM(size), 0) AS used FROM files WHERE user_id = %s",
+        (user_id,),
+    )
+    return cur.fetchone()["used"]
 
 
 # ===========================================================
@@ -42,6 +56,34 @@ def startup_init():
                 hashed = hash_password("admin")
                 cur.execute("UPDATE users SET password = %s WHERE id = %s", (hashed, admin["id"]))
                 print("[Init] admin 비밀번호 bcrypt 해싱 완료 (초기 비밀번호: admin)")
+
+            # files 테이블 자동 생성
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    filename VARCHAR(255) NOT NULL,
+                    stored_name VARCHAR(255) NOT NULL,
+                    size BIGINT NOT NULL,
+                    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            """)
+            print("[Init] files 테이블 확인 완료")
+
+            # cloud_quota 컬럼 자동 마이그레이션
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN cloud_quota BIGINT DEFAULT 0")
+                print("[Init] users.cloud_quota 컬럼 추가 완료")
+            except Exception:
+                pass  # 이미 존재
+
+            # admin 사용자에게 무제한 쿼타 설정
+            cur.execute("UPDATE users SET cloud_quota = NULL WHERE role = 'admin' AND cloud_quota = 0")
+
+    # 업로드 디렉토리 생성
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    print(f"[Init] 업로드 디렉토리: {UPLOAD_DIR}")
 
 
 # ===========================================================
@@ -145,6 +187,14 @@ def admin_get_all_devices(user: dict = Depends(require_admin)):
 def admin_create_device(req: DeviceCreate, user: dict = Depends(require_admin)):
     with get_db() as conn:
         with conn.cursor() as cur:
+            # 중복 체크 (이름 또는 IP)
+            cur.execute(
+                "SELECT id FROM devices WHERE name = %s OR ip = %s",
+                (req.name, req.ip),
+            )
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="이미 존재하는 기기입니다 (이름 또는 IP 중복)")
+
             cur.execute(
                 """INSERT INTO devices (name, ip, port, web_port, username, password, group_id, description)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -200,7 +250,12 @@ def admin_delete_device(device_id: int, user: dict = Depends(require_admin)):
 def admin_get_users(user: dict = Depends(require_admin)):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, username, role, display_name, is_active, created_at, last_login FROM users ORDER BY id")
+            cur.execute("""
+                SELECT u.id, u.username, u.role, u.display_name, u.is_active,
+                       u.created_at, u.last_login, u.cloud_quota,
+                       COALESCE((SELECT SUM(f.size) FROM files f WHERE f.user_id = u.id), 0) AS cloud_used
+                FROM users u ORDER BY u.id
+            """)
             users = cur.fetchall()
     result = []
     for u in users:
@@ -212,6 +267,8 @@ def admin_get_users(user: dict = Depends(require_admin)):
             is_active=u["is_active"],
             created_at=str(u["created_at"]) if u["created_at"] else None,
             last_login=str(u["last_login"]) if u["last_login"] else None,
+            cloud_quota=u["cloud_quota"],
+            cloud_used=u["cloud_used"],
         ))
     return result
 
@@ -219,17 +276,22 @@ def admin_get_users(user: dict = Depends(require_admin)):
 @app.post("/api/admin/users", response_model=UserResponse)
 def admin_create_user(req: UserCreate, user: dict = Depends(require_admin)):
     hashed = hash_password(req.password)
+    # -1 → NULL (무제한)
+    quota_val = None if req.cloud_quota == -1 else (req.cloud_quota or 0)
     with get_db() as conn:
         with conn.cursor() as cur:
             try:
                 cur.execute(
-                    "INSERT INTO users (username, password, role, display_name) VALUES (%s, %s, %s, %s)",
-                    (req.username, hashed, req.role, req.display_name),
+                    "INSERT INTO users (username, password, role, display_name, cloud_quota) VALUES (%s, %s, %s, %s, %s)",
+                    (req.username, hashed, req.role, req.display_name, quota_val),
                 )
             except Exception:
                 raise HTTPException(status_code=409, detail="이미 존재하는 사용자입니다")
             user_id = cur.lastrowid
-            cur.execute("SELECT id, username, role, display_name, is_active, created_at, last_login FROM users WHERE id = %s", (user_id,))
+            cur.execute("""
+                SELECT u.*, COALESCE((SELECT SUM(f.size) FROM files f WHERE f.user_id = u.id), 0) AS cloud_used
+                FROM users u WHERE u.id = %s
+            """, (user_id,))
             new_user = cur.fetchone()
     return UserResponse(
         id=new_user["id"],
@@ -239,6 +301,8 @@ def admin_create_user(req: UserCreate, user: dict = Depends(require_admin)):
         is_active=new_user["is_active"],
         created_at=str(new_user["created_at"]) if new_user["created_at"] else None,
         last_login=None,
+        cloud_quota=new_user["cloud_quota"],
+        cloud_used=new_user["cloud_used"],
     )
 
 
@@ -253,6 +317,9 @@ def admin_update_user(user_id: int, req: UserUpdate, admin: dict = Depends(requi
         updates["is_active"] = req.is_active
     if req.password is not None:
         updates["password"] = hash_password(req.password)
+    if req.cloud_quota is not None:
+        # -1 → NULL (무제한), 0 → 비활성, >0 → 제한
+        updates["cloud_quota"] = None if req.cloud_quota == -1 else req.cloud_quota
 
     if not updates:
         raise HTTPException(status_code=400, detail="수정할 항목이 없습니다")
@@ -263,7 +330,10 @@ def admin_update_user(user_id: int, req: UserUpdate, admin: dict = Depends(requi
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(f"UPDATE users SET {set_clause} WHERE id = %s", values)
-            cur.execute("SELECT id, username, role, display_name, is_active, created_at, last_login FROM users WHERE id = %s", (user_id,))
+            cur.execute("""
+                SELECT u.*, COALESCE((SELECT SUM(f.size) FROM files f WHERE f.user_id = u.id), 0) AS cloud_used
+                FROM users u WHERE u.id = %s
+            """, (user_id,))
             user = cur.fetchone()
     if not user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
@@ -275,6 +345,8 @@ def admin_update_user(user_id: int, req: UserUpdate, admin: dict = Depends(requi
         is_active=user["is_active"],
         created_at=str(user["created_at"]) if user["created_at"] else None,
         last_login=str(user["last_login"]) if user["last_login"] else None,
+        cloud_quota=user["cloud_quota"],
+        cloud_used=user["cloud_used"],
     )
 
 
@@ -339,11 +411,159 @@ def admin_create_group(req: GroupCreate, user: dict = Depends(require_admin)):
 
 
 # ===========================================================
+# Files (클라우드 드라이브)
+# ===========================================================
+@app.post("/api/files/upload", response_model=FileResponse)
+async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """파일 업로드 (사용자별 폴더)"""
+    # 파일 크기 체크
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"파일 크기 제한 초과 ({MAX_FILE_SIZE // (1024*1024)}MB)")
+
+    # 쿼타 체크
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT cloud_quota FROM users WHERE id = %s", (user["id"],))
+            user_row = cur.fetchone()
+            quota = user_row["cloud_quota"] if user_row else 0
+
+            if quota == 0:
+                raise HTTPException(status_code=403, detail="클라우드 저장소 접근 권한이 없습니다")
+
+            if quota is not None:  # None = 무제한
+                used = _get_cloud_used(cur, user["id"])
+                if used + len(content) > quota:
+                    remaining_mb = max(0, (quota - used)) // (1024 * 1024)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"클라우드 저장 용량 초과 (남은 용량: {remaining_mb}MB)"
+                    )
+
+    # 사용자별 디렉토리
+    user_dir = os.path.join(UPLOAD_DIR, str(user["id"]))
+    os.makedirs(user_dir, exist_ok=True)
+
+    # 저장 (UUID + 원본 확장자)
+    ext = os.path.splitext(file.filename)[1] if file.filename else ""
+    stored_name = f"{uuid.uuid4().hex}{ext}"
+    file_path = os.path.join(user_dir, stored_name)
+
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # DB 저장
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO files (user_id, filename, stored_name, size) VALUES (%s, %s, %s, %s)",
+                (user["id"], file.filename, stored_name, len(content)),
+            )
+            file_id = cur.lastrowid
+            cur.execute("SELECT * FROM files WHERE id = %s", (file_id,))
+            row = cur.fetchone()
+
+    return FileResponse(
+        id=row["id"],
+        filename=row["filename"],
+        size=row["size"],
+        uploaded_at=str(row["uploaded_at"]) if row["uploaded_at"] else None,
+    )
+
+
+@app.get("/api/files", response_model=list[FileResponse])
+def get_my_files(user: dict = Depends(get_current_user)):
+    """내 파일 목록"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM files WHERE user_id = %s ORDER BY uploaded_at DESC",
+                (user["id"],),
+            )
+            rows = cur.fetchall()
+    return [
+        FileResponse(
+            id=r["id"],
+            filename=r["filename"],
+            size=r["size"],
+            uploaded_at=str(r["uploaded_at"]) if r["uploaded_at"] else None,
+        )
+        for r in rows
+    ]
+
+
+@app.get("/api/files/{file_id}/download")
+def download_file(file_id: int, user: dict = Depends(get_current_user)):
+    """파일 다운로드"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM files WHERE id = %s AND user_id = %s",
+                (file_id, user["id"]),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다")
+
+    file_path = os.path.join(UPLOAD_DIR, str(user["id"]), row["stored_name"])
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="파일이 서버에서 삭제되었습니다")
+
+    return FastAPIFileResponse(
+        path=file_path,
+        filename=row["filename"],
+        media_type="application/octet-stream",
+    )
+
+
+@app.delete("/api/files/{file_id}")
+def delete_file(file_id: int, user: dict = Depends(get_current_user)):
+    """파일 삭제"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM files WHERE id = %s AND user_id = %s",
+                (file_id, user["id"]),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다")
+
+    # 실제 파일 삭제
+    file_path = os.path.join(UPLOAD_DIR, str(user["id"]), row["stored_name"])
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+    # DB 삭제
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM files WHERE id = %s", (file_id,))
+
+    return {"message": "삭제되었습니다"}
+
+
+@app.get("/api/files/quota", response_model=QuotaResponse)
+def get_my_quota(user: dict = Depends(get_current_user)):
+    """내 클라우드 쿼타 조회"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT cloud_quota FROM users WHERE id = %s", (user["id"],))
+            row = cur.fetchone()
+            quota = row["cloud_quota"] if row else 0
+            used = _get_cloud_used(cur, user["id"])
+
+    remaining = None if quota is None else max(0, quota - used)
+    return QuotaResponse(quota=quota, used=used, remaining=remaining)
+
+
+# ===========================================================
 # Version (공개)
 # ===========================================================
 @app.get("/api/version")
 def get_version():
-    return {"version": "1.2.0", "app_name": "WellcomLAND"}
+    return {"version": "1.5.0", "app_name": "WellcomLAND"}
 
 
 # ===========================================================

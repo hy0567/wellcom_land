@@ -29,6 +29,7 @@ class UserCreate(BaseModel):
     password: str
     role: str = "user"
     display_name: Optional[str] = None
+    cloud_quota: Optional[int] = 0  # bytes. 0=비활성, -1=무제한, >0=제한
 
 
 class UserUpdate(BaseModel):
@@ -36,6 +37,7 @@ class UserUpdate(BaseModel):
     role: Optional[str] = None
     is_active: Optional[bool] = None
     password: Optional[str] = None
+    cloud_quota: Optional[int] = None  # None=변경없음, -1=무제한, 0=비활성
 
 
 class UserResponse(BaseModel):
@@ -46,6 +48,8 @@ class UserResponse(BaseModel):
     is_active: bool
     created_at: Optional[str] = None
     last_login: Optional[str] = None
+    cloud_quota: Optional[int] = None  # None=무제한, 0=비활성
+    cloud_used: int = 0  # 사용 중인 용량 (bytes)
 
 
 # === Devices ===
@@ -102,3 +106,17 @@ class GroupResponse(BaseModel):
 class DeviceAssign(BaseModel):
     device_ids: List[int]
     permission: str = "control"
+
+
+# === Files (Cloud Drive) ===
+class FileResponse(BaseModel):
+    id: int
+    filename: str
+    size: int
+    uploaded_at: Optional[str] = None
+
+
+class QuotaResponse(BaseModel):
+    quota: Optional[int] = None  # None=무제한, 0=비활성
+    used: int = 0
+    remaining: Optional[int] = None  # None=무제한

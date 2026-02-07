@@ -10,6 +10,11 @@ from typing import Any, Optional
 
 def _get_base_dir():
     """실행 환경에 따른 기본 디렉터리 결정"""
+    # 런처가 설정한 환경변수 우선 (EXE → importlib 로드 시)
+    env_base = os.environ.get('WELLCOMLAND_BASE_DIR')
+    if env_base and os.path.isdir(env_base):
+        return env_base
+
     if getattr(sys, 'frozen', False):
         # PyInstaller EXE: WellcomLAND.exe가 있는 디렉터리
         return os.path.dirname(sys.executable)
@@ -32,6 +37,19 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 # 아이콘 경로
 def _get_icon_path():
     """아이콘 파일 경로 (EXE/개발 환경 자동 감지)"""
+    # EXE 런처 환경: _internal/assets/ 또는 BASE_DIR 기준
+    env_base = os.environ.get('WELLCOMLAND_BASE_DIR')
+    if env_base:
+        # 런처 경로 기준으로 아이콘 탐색
+        candidates = [
+            os.path.join(env_base, "_internal", "assets", "wellcom.ico"),
+            os.path.join(env_base, "assets", "wellcom.ico"),
+            os.path.join(env_base, "wellcom.ico"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+
     if getattr(sys, 'frozen', False):
         # EXE: _internal/assets/wellcom.ico
         return os.path.join(sys._MEIPASS, "assets", "wellcom.ico")
@@ -119,6 +137,16 @@ class Settings:
             'token': '',
             'username': '',
             'auto_login': False
+        },
+        'vision': {
+            'model_path': '',
+            'confidence': 0.5,
+            'capture_fps': 2,
+            'device': 'auto',
+            'overlay_enabled': True,
+            'auto_action_enabled': False,
+            'action_rules': [],
+            'log_enabled': True,
         }
     }
 

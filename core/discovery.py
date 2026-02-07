@@ -188,6 +188,7 @@ class DiscoveryThread(QThread):
         self.ip_range = ip_range
         self.ports = ports
         self._is_running = True
+        self._executor = None
 
     def run(self):
         """스캔 실행"""
@@ -204,14 +205,15 @@ class DiscoveryThread(QThread):
             current = 0
             found_ips = set()
 
-            with ThreadPoolExecutor(max_workers=50) as executor:
+            self._executor = ThreadPoolExecutor(max_workers=50)
+            try:
                 futures = {}
 
                 for ip in self.ip_range:
                     if not self._is_running:
                         break
                     for port in self.ports:
-                        future = executor.submit(
+                        future = self._executor.submit(
                             NetworkScanner.check_kvm_device,
                             ip, port,
                             NetworkScanner.TIMEOUT
@@ -220,29 +222,38 @@ class DiscoveryThread(QThread):
 
                 for future in as_completed(futures):
                     if not self._is_running:
+                        # 남은 future 모두 취소
+                        for f in futures:
+                            f.cancel()
                         break
 
                     current += 1
                     self.progress_updated.emit(current, total)
 
                     try:
-                        device = future.result()
+                        device = future.result(timeout=0.1)
                         if device and device.ip not in found_ips:
                             found_ips.add(device.ip)
                             discovered.append(device)
                             self.device_found.emit(device)
                     except Exception:
                         pass
+            finally:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = None
 
             if self._is_running:
                 self.scan_completed.emit(discovered)
 
         except Exception as e:
-            self.scan_error.emit(str(e))
+            if self._is_running:
+                self.scan_error.emit(str(e))
 
     def stop(self):
-        """스캔 중지"""
+        """스캔 중지 - executor도 즉시 종료"""
         self._is_running = False
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 class AutoDiscoveryManager(QObject):

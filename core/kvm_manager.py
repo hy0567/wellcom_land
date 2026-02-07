@@ -24,10 +24,19 @@ class KVMManager:
         self._lock = threading.Lock()
 
     def load_devices_from_db(self):
-        """Load all devices from database"""
+        """Load all devices from database (기존 목록 초기화 후 재로드)"""
         device_records = self.db.get_all_devices()
 
+        # 기존 연결 해제 후 목록 초기화
+        for device in self.devices.values():
+            try:
+                device.disconnect()
+            except Exception:
+                pass
+        self.devices.clear()
+
         for record in device_records:
+            group = record.get('group_name') or 'default'
             info = KVMInfo(
                 name=record['name'],
                 ip=record['ip'],
@@ -35,7 +44,7 @@ class KVMManager:
                 web_port=record['web_port'],
                 username=record['username'],
                 password=record['password'],
-                group=record['group_name']
+                group=group
             )
             self.devices[record['name']] = KVMDevice(info)
 
@@ -52,7 +61,7 @@ class KVMManager:
                 web_port=record.get('web_port', 80),
                 username=record.get('username', 'root'),
                 password=record.get('password', 'luckfox'),
-                group=record.get('group_name', 'default'),
+                group=record.get('group_name') or 'default',
             )
             self.devices[record['name']] = KVMDevice(info)
             # 로컬 DB에도 동기화 (있으면 업데이트, 없으면 추가)
@@ -67,11 +76,41 @@ class KVMManager:
                 pass
         print(f"Loaded {len(self.devices)} devices from server")
 
+    def merge_devices_from_server(self, device_list: list):
+        """서버 기기를 기존 목록에 병합 (로컬 기기 유지)"""
+        added = 0
+        for record in device_list:
+            name = record.get('name', '')
+            if not name or name in self.devices:
+                continue  # 이미 로컬에 있으면 스킵
+            info = KVMInfo(
+                name=name,
+                ip=record.get('ip', ''),
+                port=record.get('port', 22),
+                web_port=record.get('web_port', 80),
+                username=record.get('username', 'root'),
+                password=record.get('password', 'luckfox'),
+                group=record.get('group_name') or 'default',
+            )
+            self.devices[name] = KVMDevice(info)
+            # 로컬 DB에도 저장
+            try:
+                existing = self.db.get_device_by_name(name)
+                if not existing:
+                    self.db.add_device(
+                        info.name, info.ip, info.port, info.web_port,
+                        info.username, info.password, info.group
+                    )
+            except Exception:
+                pass
+            added += 1
+        print(f"Merged {added} new devices from server (total: {len(self.devices)})")
+
     def add_device(self, name: str, ip: str, port: int = 22, web_port: int = 80,
                    username: str = "root", password: str = "luckfox",
                    group: str = "default") -> KVMDevice:
-        """Add new KVM device"""
-        # Add to database
+        """Add new KVM device (로컬 DB + 서버 동기화)"""
+        # Add to local database
         self.db.add_device(name, ip, port, web_port, username, password, group)
 
         # Create device instance
@@ -81,7 +120,99 @@ class KVMManager:
         with self._lock:
             self.devices[name] = device
 
+        # 서버에도 동기화 (admin인 경우)
+        self._sync_device_to_server(name, ip, port, web_port, username, password)
+
         return device
+
+    def _sync_device_to_server(self, name: str, ip: str, port: int = 22,
+                                web_port: int = 80, username: str = "root",
+                                password: str = "luckfox"):
+        """단일 기기를 서버에 동기화 (실패해도 무시)"""
+        try:
+            from api_client import api_client
+            if api_client.is_logged_in and api_client.is_admin:
+                api_client.sync_device_to_server({
+                    'name': name,
+                    'ip': ip,
+                    'port': port,
+                    'web_port': web_port,
+                    'username': username,
+                    'password': password,
+                })
+                print(f"[KVMManager] 서버 동기화 완료: {name} ({ip})")
+        except Exception as e:
+            print(f"[KVMManager] 서버 동기화 실패 (무시): {e}")
+
+    def sync_all_to_server(self) -> dict:
+        """로컬 DB의 모든 기기를 서버에 일괄 동기화
+        Returns: {'synced': int, 'skipped': int, 'failed': int}
+        """
+        try:
+            from api_client import api_client
+            if not api_client.is_logged_in or not api_client.is_admin:
+                return {'synced': 0, 'skipped': 0, 'failed': 0, 'error': '관리자 로그인 필요'}
+
+            device_list = []
+            for device in self.devices.values():
+                device_list.append({
+                    'name': device.name,
+                    'ip': device.ip,
+                    'port': device.info.port,
+                    'web_port': device.info.web_port,
+                    'username': device.info.username,
+                    'password': device.info.password,
+                })
+
+            result = api_client.sync_devices_to_server(device_list)
+            print(f"[KVMManager] 일괄 동기화 결과: {result}")
+            return result
+        except Exception as e:
+            print(f"[KVMManager] 일괄 동기화 실패: {e}")
+            return {'synced': 0, 'skipped': 0, 'failed': 0, 'error': str(e)}
+
+    def rename_device(self, old_name: str, new_name: str) -> bool:
+        """장치 이름 변경 (로컬 DB + 메모리 + 서버 동기화)
+        Returns: True if success
+        """
+        if old_name == new_name:
+            return True
+        if new_name in self.devices:
+            return False  # 이름 중복
+
+        with self._lock:
+            device = self.devices.get(old_name)
+            if not device:
+                return False
+
+            # 1) 로컬 DB 업데이트
+            record = self.db.get_device_by_name(old_name)
+            if record:
+                self.db.update_device(record['id'], name=new_name)
+
+            # 2) 메모리 업데이트
+            device.info.name = new_name
+            del self.devices[old_name]
+            self.devices[new_name] = device
+
+        # 3) 서버 동기화 (admin인 경우)
+        try:
+            from api_client import api_client
+            if api_client.is_logged_in and api_client.is_admin:
+                try:
+                    server_devices = api_client.admin_get_all_devices()
+                    for sd in server_devices:
+                        if sd.get('ip') == device.ip or sd.get('name') == old_name:
+                            api_client.admin_update_device(sd['id'], {'name': new_name})
+                            print(f"[KVMManager] 서버 이름 변경: {old_name} → {new_name}")
+                            break
+                except Exception as e:
+                    print(f"[KVMManager] 서버 이름 변경 실패 (무시): {e}")
+        except Exception:
+            pass
+
+        print(f"[KVMManager] 이름 변경: {old_name} → {new_name}")
+        return True
 
     def remove_device(self, name: str):
         """Remove KVM device"""

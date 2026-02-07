@@ -361,7 +361,7 @@ class AutoDiscoveryDialog(QDialog):
         button_layout.addStretch()
 
         self.btn_add = QPushButton("선택 장치 추가")
-        self.btn_add.clicked.connect(self.accept)
+        self.btn_add.clicked.connect(self._on_add_clicked)
         self.btn_add.setEnabled(False)
         button_layout.addWidget(self.btn_add)
 
@@ -419,7 +419,10 @@ class AutoDiscoveryDialog(QDialog):
         """스캔 중지"""
         if self.scan_thread:
             self.scan_thread.stop()
-            self.scan_thread.wait()
+            # 짧은 대기 후 타임아웃 — UI 멈춤 방지
+            if not self.scan_thread.wait(1000):
+                # 1초 내 종료 안되면 UI만 먼저 리셋, 스레드는 백그라운드 정리
+                self.scan_thread.finished.connect(self.scan_thread.deleteLater)
 
         self._reset_ui()
 
@@ -489,8 +492,27 @@ class AutoDiscoveryDialog(QDialog):
             if device and device.ip not in self.existing_ips:
                 item.setSelected(True)
 
+    def _on_add_clicked(self):
+        """선택 장치 추가 버튼 클릭 - 스캔 중지 후 선택 목록 캐시"""
+        # 선택된 장치를 미리 캐시 (accept() 후 위젯 접근 문제 방지)
+        self._cached_selected = []
+        for item in self.device_list.selectedItems():
+            device = item.data(Qt.ItemDataRole.UserRole)
+            if device:
+                self._cached_selected.append(device)
+
+        # 스캔 중이면 중지 (논블로킹)
+        if self.scan_thread and self.scan_thread.isRunning():
+            self.scan_thread.stop()
+
+        self.accept()
+
     def get_selected_devices(self) -> list[DiscoveredDevice]:
         """선택된 장치 목록 반환"""
+        # 캐시된 선택 목록이 있으면 사용
+        if hasattr(self, '_cached_selected') and self._cached_selected:
+            return self._cached_selected
+
         selected = []
         for item in self.device_list.selectedItems():
             device = item.data(Qt.ItemDataRole.UserRole)
@@ -502,7 +524,8 @@ class AutoDiscoveryDialog(QDialog):
         """다이얼로그 닫힐 때 스레드 정리"""
         if self.scan_thread and self.scan_thread.isRunning():
             self.scan_thread.stop()
-            self.scan_thread.wait()
+            if not self.scan_thread.wait(500):
+                self.scan_thread.finished.connect(self.scan_thread.deleteLater)
         super().closeEvent(event)
 
 

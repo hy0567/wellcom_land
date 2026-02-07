@@ -18,3 +18,7 @@ JWT_EXPIRE_HOURS = 24
 # Server
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
+
+# File Storage
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/opt/wellcomland/uploads")
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB

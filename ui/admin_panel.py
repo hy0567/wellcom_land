@@ -34,6 +34,9 @@ class LoadThread(QThread):
 class AdminPanel(QWidget):
     """관리자 패널 (탭 위젯 내부)"""
 
+    # 기기 변경 시그널 (이름 변경 등 → 메인 윈도우에서 UI 갱신)
+    device_changed = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._threads = []
@@ -74,9 +77,9 @@ class AdminPanel(QWidget):
 
         # 테이블
         self.user_table = QTableWidget()
-        self.user_table.setColumnCount(7)
+        self.user_table.setColumnCount(8)
         self.user_table.setHorizontalHeaderLabels(
-            ["ID", "아이디", "이름", "역할", "상태", "기기 할당", "작업"]
+            ["ID", "아이디", "이름", "역할", "상태", "클라우드", "기기 할당", "작업"]
         )
         self.user_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.user_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -109,10 +112,28 @@ class AdminPanel(QWidget):
                 status_item.setForeground(Qt.GlobalColor.red)
             self.user_table.setItem(row, 4, status_item)
 
+            # 클라우드 쿼타 표시
+            quota = user.get('cloud_quota')
+            used = user.get('cloud_used', 0)
+            if quota is None:
+                quota_text = f"{self._format_size(used)} / 무제한"
+            elif quota == 0:
+                quota_text = "미사용"
+            else:
+                quota_text = f"{self._format_size(used)} / {self._format_size(quota)}"
+            cloud_item = QTableWidgetItem(quota_text)
+            if quota is not None and quota > 0:
+                usage_pct = used / quota * 100
+                if usage_pct >= 90:
+                    cloud_item.setForeground(Qt.GlobalColor.red)
+                elif usage_pct >= 70:
+                    cloud_item.setForeground(Qt.GlobalColor.darkYellow)
+            self.user_table.setItem(row, 5, cloud_item)
+
             # 기기 할당 버튼
             assign_btn = QPushButton("기기 할당")
             assign_btn.clicked.connect(lambda checked, uid=user['id'], uname=user['username']: self._on_assign_devices(uid, uname))
-            self.user_table.setCellWidget(row, 5, assign_btn)
+            self.user_table.setCellWidget(row, 6, assign_btn)
 
             # 작업 버튼
             action_widget = QWidget()
@@ -129,7 +150,7 @@ class AdminPanel(QWidget):
                 del_btn.clicked.connect(lambda checked, uid=user['id'], uname=user['username']: self._on_delete_user(uid, uname))
                 action_layout.addWidget(del_btn)
 
-            self.user_table.setCellWidget(row, 6, action_widget)
+            self.user_table.setCellWidget(row, 7, action_widget)
 
     def _on_add_user(self):
         dlg = UserFormDialog(self)
@@ -192,6 +213,11 @@ class AdminPanel(QWidget):
         add_btn = QPushButton("+ 기기 추가")
         add_btn.clicked.connect(self._on_add_device)
         btn_layout.addWidget(add_btn)
+
+        sync_btn = QPushButton("🔄 로컬 기기 동기화")
+        sync_btn.setToolTip("로컬에서 추가한 기기를 서버에 동기화합니다")
+        sync_btn.clicked.connect(self._on_sync_local_devices)
+        btn_layout.addWidget(sync_btn)
 
         refresh_btn = QPushButton("새로고침")
         refresh_btn.clicked.connect(self._load_devices)
@@ -257,6 +283,7 @@ class AdminPanel(QWidget):
             try:
                 api_client.admin_create_device(data)
                 self._load_devices()
+                self.device_changed.emit()
             except Exception as e:
                 QMessageBox.warning(self, "오류", f"기기 추가 실패: {e}")
 
@@ -267,6 +294,23 @@ class AdminPanel(QWidget):
             try:
                 api_client.admin_update_device(device['id'], data)
                 self._load_devices()
+
+                # 이름 변경 시 로컬 매니저에도 반영
+                old_name = device.get('name', '')
+                new_name = data.get('name', old_name)
+                if old_name != new_name:
+                    try:
+                        from core.kvm_manager import KVMManager
+                        from core.database import Database
+                        db = Database()
+                        record = db.get_device_by_name(old_name)
+                        if record:
+                            db.update_device(record['id'], name=new_name)
+                    except Exception:
+                        pass
+
+                # 변경 시그널 발행 → 메인 윈도우 UI 갱신
+                self.device_changed.emit()
             except Exception as e:
                 QMessageBox.warning(self, "오류", f"기기 수정 실패: {e}")
 
@@ -280,8 +324,64 @@ class AdminPanel(QWidget):
             try:
                 api_client.admin_delete_device(device_id)
                 self._load_devices()
+                self.device_changed.emit()
             except Exception as e:
                 QMessageBox.warning(self, "오류", f"삭제 실패: {e}")
+
+    def _on_sync_local_devices(self):
+        """로컬 DB 기기를 서버에 동기화"""
+        try:
+            from core.database import Database
+            db = Database()
+            local_devices = db.get_all_devices()
+
+            if not local_devices:
+                QMessageBox.information(self, "동기화", "로컬에 저장된 기기가 없습니다.")
+                return
+
+            reply = QMessageBox.question(
+                self, "로컬 기기 동기화",
+                f"로컬 DB에 {len(local_devices)}개 기기가 있습니다.\n서버에 동기화하시겠습니까?\n(이미 서버에 있는 기기는 건너뜁니다)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            result = api_client.sync_devices_to_server([
+                {
+                    'name': d['name'],
+                    'ip': d['ip'],
+                    'port': d.get('port', 22),
+                    'web_port': d.get('web_port', 80),
+                    'username': d.get('username', 'root'),
+                    'password': d.get('password', 'luckfox'),
+                }
+                for d in local_devices
+            ])
+
+            msg = f"동기화 완료!\n추가: {result['synced']}개\n건너뜀(중복): {result['skipped']}개"
+            if result['failed'] > 0:
+                msg += f"\n실패: {result['failed']}개"
+            QMessageBox.information(self, "동기화 결과", msg)
+
+            # 기기 목록 새로고침
+            self._load_devices()
+
+        except Exception as e:
+            QMessageBox.warning(self, "오류", f"동기화 실패: {e}")
+
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        """바이트를 읽기 좋은 형태로 변환"""
+        if size_bytes == 0:
+            return "0B"
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if abs(size_bytes) < 1024.0:
+                if unit == 'B':
+                    return f"{int(size_bytes)}{unit}"
+                return f"{size_bytes:.1f}{unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f}PB"
 
     def _load_all_data(self):
         self._load_users()
@@ -298,10 +398,22 @@ class UserFormDialog(QDialog):
         self._user = user
         self._init_ui()
 
+    # 쿼타 옵션 매핑 (표시명 → 바이트)
+    QUOTA_MAP = {
+        "없음 (클라우드 비활성)": 0,
+        "1 GB": 1 * 1024**3,
+        "2 GB": 2 * 1024**3,
+        "5 GB": 5 * 1024**3,
+        "10 GB": 10 * 1024**3,
+        "50 GB": 50 * 1024**3,
+        "100 GB": 100 * 1024**3,
+        "무제한": -1,
+    }
+
     def _init_ui(self):
         is_edit = self._user is not None
         self.setWindowTitle("사용자 수정" if is_edit else "사용자 추가")
-        self.setFixedSize(350, 280)
+        self.setFixedSize(350, 340)
 
         layout = QFormLayout(self)
 
@@ -327,6 +439,26 @@ class UserFormDialog(QDialog):
             self.role_combo.setCurrentText(self._user['role'])
         layout.addRow("역할:", self.role_combo)
 
+        # 클라우드 쿼타
+        self.quota_combo = QComboBox()
+        self.quota_combo.addItems(list(self.QUOTA_MAP.keys()))
+        if is_edit:
+            quota = self._user.get('cloud_quota')
+            if quota is None:
+                self.quota_combo.setCurrentText("무제한")
+            elif quota == 0:
+                self.quota_combo.setCurrentIndex(0)
+            else:
+                gb = quota / (1024 ** 3)
+                label = f"{int(gb)} GB" if gb == int(gb) else f"{gb:.1f} GB"
+                idx = self.quota_combo.findText(label)
+                if idx >= 0:
+                    self.quota_combo.setCurrentIndex(idx)
+                else:
+                    self.quota_combo.addItem(label)
+                    self.quota_combo.setCurrentText(label)
+        layout.addRow("클라우드 쿼타:", self.quota_combo)
+
         if is_edit:
             self.active_cb = QCheckBox("활성")
             self.active_cb.setChecked(self._user.get('is_active', True))
@@ -348,6 +480,11 @@ class UserFormDialog(QDialog):
         if name:
             data['display_name'] = name
         data['role'] = self.role_combo.currentText()
+
+        # 클라우드 쿼타
+        quota_text = self.quota_combo.currentText()
+        data['cloud_quota'] = self.QUOTA_MAP.get(quota_text, 0)
+
         if self._user and hasattr(self, 'active_cb'):
             data['is_active'] = self.active_cb.isChecked()
         return data

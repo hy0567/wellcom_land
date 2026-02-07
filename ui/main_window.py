@@ -3,6 +3,13 @@ WellcomLAND 메인 윈도우
 아이온2 모드 지원 - 마우스 커서 비활성화 + 무한 회전
 """
 
+import math
+import os
+import struct
+import sys
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QToolBar, QStatusBar, QMenuBar, QMenu, QMessageBox,
@@ -10,10 +17,10 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
     QLineEdit, QSpinBox, QComboBox, QTextEdit, QProgressBar,
     QDialog, QDialogButtonBox, QApplication, QSlider, QFrame,
-    QScrollArea, QGridLayout, QSizePolicy
+    QScrollArea, QGridLayout, QSizePolicy, QInputDialog
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QUrl, QPoint, QRect, QByteArray
-from PyQt6.QtGui import QAction, QIcon, QColor, QDesktopServices, QCursor, QPainter, QBrush, QPixmap
+from PyQt6.QtGui import QAction, QIcon, QColor, QDesktopServices, QCursor, QPainter, QBrush, QPen, QPixmap, QShortcut, QKeySequence
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
@@ -23,9 +30,15 @@ from core import KVMManager, KVMDevice
 from core.kvm_device import DeviceStatus, USBStatus
 from core.hid_controller import FastHIDController
 from .dialogs import AddDeviceDialog, DeviceSettingsDialog, AutoDiscoveryDialog, AppSettingsDialog
-from config import settings as app_settings, ICON_PATH
+from config import settings as app_settings, ICON_PATH, LOG_DIR
 from .device_control import DeviceControlPanel
 from .admin_panel import AdminPanel
+
+try:
+    from vision import VisionController, DetectionOverlay
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
 
 
 class InitialStatusCheckThread(QThread):
@@ -95,10 +108,174 @@ class StatusUpdateThread(QThread):
         self.running = False
 
 
+class SFTPUploadThread(QThread):
+    """SFTP 파일 업로드 스레드"""
+    progress = pyqtSignal(int, str)   # (percent, label)
+    finished_ok = pyqtSignal(str)     # success message
+    finished_err = pyqtSignal(str)    # error message
+
+    def __init__(self, device, local_path, remote_path):
+        super().__init__()
+        self.device = device
+        self.local_path = local_path
+        self.remote_path = remote_path
+
+    def run(self):
+        import os
+        try:
+            filename = os.path.basename(self.local_path)
+
+            self.progress.emit(0, f"{filename}\nSSH 연결 중...")
+
+            def on_progress(transferred, total):
+                if total > 0:
+                    pct = int((transferred / total) * 100)
+                    if total < 1024 * 1024:
+                        txt = f"{filename}\n{transferred//1024}KB / {total//1024}KB"
+                    else:
+                        txt = f"{filename}\n{transferred/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
+                    self.progress.emit(pct, txt)
+
+            # upload_file_sftp가 자체 SSH 연결을 생성 (lock 간섭 없음)
+            ok = self.device.upload_file_sftp(self.local_path, self.remote_path, on_progress)
+            if ok:
+                self.finished_ok.emit(f"'{filename}' → {self.device.name}:{self.remote_path}")
+            else:
+                self.finished_err.emit("SFTP 업로드 실패")
+        except Exception as e:
+            self.finished_err.emit(str(e))
+
+
+class CloudUploadThread(QThread):
+    """클라우드 파일 업로드 스레드"""
+    finished_ok = pyqtSignal(str)
+    finished_err = pyqtSignal(str)
+
+    def __init__(self, local_path):
+        super().__init__()
+        self.local_path = local_path
+
+    def run(self):
+        try:
+            import os
+            from api_client import api_client
+            filename = os.path.basename(self.local_path)
+            result = api_client.upload_file(self.local_path)
+            self.finished_ok.emit(f"'{filename}' 클라우드 업로드 완료")
+        except Exception as e:
+            self.finished_err.emit(str(e))
+
+
+class USBWorkerThread(QThread):
+    """USB Mass Storage 작업 스레드 (파일목록/마운트/해제/클라우드)"""
+    files_ready = pyqtSignal(list)      # 파일 목록 결과
+    cloud_files_ready = pyqtSignal(list) # 클라우드 파일 목록 결과
+    progress = pyqtSignal(str)          # 상태 메시지
+    finished_ok = pyqtSignal(str)       # 성공 메시지
+    finished_err = pyqtSignal(str)      # 실패 메시지
+
+    # 작업 모드
+    MODE_LIST = "list"
+    MODE_MOUNT = "mount"
+    MODE_EJECT = "eject"
+    MODE_CLOUD_LIST = "cloud_list"
+    MODE_CLOUD_MOUNT = "cloud_mount"  # 클라우드 다운로드 + 마운트
+
+    def __init__(self, device, mode="list", file_path=None,
+                 download_url=None, token=None, filename=None):
+        super().__init__()
+        self.device = device
+        self.mode = mode
+        self.file_path = file_path
+        self.download_url = download_url
+        self.token = token
+        self.filename = filename
+
+    def run(self):
+        try:
+            if self.mode == self.MODE_CLOUD_LIST:
+                # 클라우드 파일 목록 (SSH 불필요, API 호출)
+                try:
+                    from api_client import api_client
+                    files = api_client.get_files()
+                    self.cloud_files_ready.emit(files)
+                except Exception as e:
+                    self.cloud_files_ready.emit([])
+                return
+
+            if self.mode == self.MODE_CLOUD_MOUNT:
+                # 클라우드 → KVM 다운로드 → 마운트
+                self.progress.emit("다운로드 중...")
+                dest = f"/tmp/{self.filename}"
+                ok, msg = self.device.download_from_url(
+                    self.download_url, dest, self.token
+                )
+                if not ok:
+                    self.finished_err.emit(f"다운로드 실패: {msg}")
+                    return
+
+                self.progress.emit("USB 마운트 중...")
+                ok, msg = self.device.mount_usb_mass_storage(dest)
+                if ok:
+                    self.finished_ok.emit(msg)
+                else:
+                    self.finished_err.emit(msg)
+                return
+
+            # 기존 로컬 모드 — SSH 필요
+            import paramiko
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                self.device.info.ip,
+                port=self.device.info.port,
+                username=self.device.info.username,
+                password=self.device.info.password,
+                timeout=10
+            )
+
+            try:
+                if self.mode == self.MODE_LIST:
+                    stdin, stdout, stderr = ssh.exec_command(
+                        "ls -1p /tmp/ 2>/dev/null | grep -v '/$' | grep -v -E '^(usb_drive\\.img)$'",
+                        timeout=10
+                    )
+                    out = stdout.read().decode().strip()
+                    files = [f.strip() for f in out.split('\n') if f.strip()] if out else []
+                    self.files_ready.emit(files)
+
+                elif self.mode == self.MODE_MOUNT:
+                    self.progress.emit("USB 마운트 중...")
+                    ok, msg = self.device.mount_usb_mass_storage(self.file_path)
+                    if ok:
+                        self.finished_ok.emit(msg)
+                    else:
+                        self.finished_err.emit(msg)
+
+                elif self.mode == self.MODE_EJECT:
+                    self.progress.emit("USB 해제 중...")
+                    ok, msg = self.device.unmount_usb_mass_storage()
+                    if ok:
+                        self.finished_ok.emit(msg)
+                    else:
+                        self.finished_err.emit(msg)
+            finally:
+                ssh.close()
+
+        except Exception as e:
+            if self.mode in (self.MODE_LIST,):
+                self.files_ready.emit([])
+            elif self.mode == self.MODE_CLOUD_LIST:
+                self.cloud_files_ready.emit([])
+            else:
+                self.finished_err.emit(str(e))
+
+
 class KVMThumbnailWidget(QFrame):
     """KVM 장치 썸네일 위젯 - WebRTC 실시간 미리보기 (저비트레이트)"""
     clicked = pyqtSignal(object)  # KVMDevice
     double_clicked = pyqtSignal(object)  # KVMDevice
+    right_clicked = pyqtSignal(object, object)  # KVMDevice, QPoint (global pos)
 
     # 썸네일용 JavaScript: 보기 전용 (입력 차단) + 저비트레이트
     THUMBNAIL_JS = """
@@ -473,6 +650,10 @@ class KVMThumbnailWidget(QFrame):
             self.double_clicked.emit(self.device)
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event):
+        self.right_clicked.emit(self.device, event.globalPos())
+        event.accept()
+
     def cleanup(self):
         """메모리 정리"""
         try:
@@ -492,6 +673,7 @@ class GridViewTab(QWidget):
     """전체 KVM 그리드 뷰 탭 - 미니 웹뷰로 실시간 미리보기"""
     device_selected = pyqtSignal(object)  # KVMDevice
     device_double_clicked = pyqtSignal(object)  # KVMDevice
+    device_right_clicked = pyqtSignal(object, object)  # KVMDevice, QPoint
 
     def __init__(self, manager: KVMManager, parent=None):
         super().__init__(parent)
@@ -499,6 +681,7 @@ class GridViewTab(QWidget):
         self.thumbnails: list[KVMThumbnailWidget] = []
         self._is_visible = False
         self._live_preview_enabled = True  # 실시간 미리보기 활성화
+        self._filter_group = None  # None이면 전체, 문자열이면 해당 그룹만
         self._init_ui()
 
     def _init_ui(self):
@@ -510,10 +693,6 @@ class GridViewTab(QWidget):
         title_label = QLabel("전체 KVM 미리보기")
         title_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         control_layout.addWidget(title_label)
-
-        self.status_label = QLabel("🎬 실시간 미리보기 (저비트레이트)")
-        self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-        control_layout.addWidget(self.status_label)
 
         control_layout.addStretch()
 
@@ -556,8 +735,6 @@ class GridViewTab(QWidget):
 
         if self._live_preview_enabled:
             self.btn_toggle_preview.setText("🎬 미리보기 ON")
-            self.status_label.setText("🎬 실시간 미리보기 (저비트레이트)")
-            self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
             # 모든 썸네일 미리보기 활성화
             for thumb in self.thumbnails:
                 thumb._use_preview = True
@@ -565,8 +742,6 @@ class GridViewTab(QWidget):
                     thumb.start_capture()
         else:
             self.btn_toggle_preview.setText("🎬 미리보기 OFF")
-            self.status_label.setText("상태만 표시 (리소스 절약)")
-            self.status_label.setStyleSheet("color: #888;")
             # 모든 썸네일 미리보기 비활성화
             for thumb in self.thumbnails:
                 thumb._use_preview = False
@@ -596,8 +771,12 @@ class GridViewTab(QWidget):
                     except Exception:
                         pass
 
-            # 장치 목록 가져오기
-            devices = self.manager.get_all_devices()
+            # 장치 목록 가져오기 (그룹 필터 적용)
+            all_devices = self.manager.get_all_devices()
+            if self._filter_group is not None:
+                devices = [d for d in all_devices if (d.info.group or 'default') == self._filter_group]
+            else:
+                devices = all_devices
 
             # 열 수 계산 (창 크기에 따라 조정, 최소 4개)
             cols = max(4, self.scroll_area.width() // 210)
@@ -610,6 +789,7 @@ class GridViewTab(QWidget):
                 thumb._use_preview = self._live_preview_enabled
                 thumb.clicked.connect(self._on_thumbnail_clicked)
                 thumb.double_clicked.connect(self._on_thumbnail_double_clicked)
+                thumb.right_clicked.connect(self._on_thumbnail_right_clicked)
                 self.thumbnails.append(thumb)
                 self.grid_layout.addWidget(thumb, row, col)
 
@@ -695,29 +875,62 @@ class GridViewTab(QWidget):
     def _on_thumbnail_double_clicked(self, device):
         self.device_double_clicked.emit(device)
 
+    def _on_thumbnail_right_clicked(self, device, pos):
+        self.device_right_clicked.emit(device, pos)
+
+    def _get_filtered_device_count(self) -> int:
+        """현재 필터에 맞는 장치 수 반환"""
+        all_devices = self.manager.get_all_devices()
+        if self._filter_group is not None:
+            return len([d for d in all_devices if (d.info.group or 'default') == self._filter_group])
+        return len(all_devices)
+
     def on_tab_activated(self):
         """탭이 활성화될 때 호출 (외부에서 호출)"""
         try:
-            print(f"[GridView] on_tab_activated - thumbnails: {len(self.thumbnails)}, devices: {len(self.manager.get_all_devices())}")
+            expected = self._get_filtered_device_count()
+            print(f"[GridView] on_tab_activated - thumbnails: {len(self.thumbnails)}, expected: {expected}, filter: {self._filter_group}")
             self._is_visible = True
             # 처음 로드 또는 장치 수 변경 시 로드
-            if len(self.thumbnails) != len(self.manager.get_all_devices()):
+            if len(self.thumbnails) != expected:
                 print("[GridView] load_devices 예약...")
                 QTimer.singleShot(500, self.load_devices)
             else:
-                print("[GridView] _start_all_captures 예약...")
-                QTimer.singleShot(300, self._start_all_captures)
+                # 이미 로드된 상태면 캡처만 재개 (pause → resume)
+                print("[GridView] _resume_all_captures 예약...")
+                QTimer.singleShot(100, self._resume_all_captures)
         except Exception as e:
             print(f"[GridView] on_tab_activated 오류: {e}")
 
     def on_tab_deactivated(self):
-        """탭이 비활성화될 때 호출 (외부에서 호출)"""
+        """탭이 비활성화될 때 호출 - pause만 (WebView 유지, 비트레이트만 중지)"""
         try:
-            print("[GridView] on_tab_deactivated - WebView 중지 및 비트레이트 해제")
+            print(f"[GridView] on_tab_deactivated - pause (filter: {self._filter_group})")
             self._is_visible = False
-            self._stop_all_captures()
+            self._pause_all_captures()
         except Exception as e:
             print(f"[GridView] on_tab_deactivated 오류: {e}")
+
+    def _pause_all_captures(self):
+        """모든 썸네일 일시정지 (WebView URL 유지, 새로고침만 중지)"""
+        for thumb in self.thumbnails:
+            try:
+                thumb.pause_capture()
+            except Exception:
+                pass
+
+    def _resume_all_captures(self):
+        """일시정지된 썸네일 재개"""
+        if not self._live_preview_enabled:
+            return
+        for thumb in self.thumbnails:
+            try:
+                if thumb._is_paused:
+                    thumb.resume_capture()
+                elif not thumb._is_active:
+                    thumb.start_capture()
+            except Exception:
+                pass
 
     def cleanup(self):
         """메모리 정리"""
@@ -731,6 +944,333 @@ class GridViewTab(QWidget):
             self.thumbnails.clear()
         except Exception as e:
             print(f"[GridView] cleanup 오류: {e}")
+
+
+class RegionSelectOverlay(QWidget):
+    """드래그로 사각 영역을 선택하는 투명 오버레이"""
+    region_selected = pyqtSignal(float, float, float, float)  # x, y, w, h (0~1 비율)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._start = None
+        self._current = None
+        self._selecting = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.raise_()
+        self.setFocus()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        # 반투명 검정 배경
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 120))
+
+        if self._start and self._current:
+            rect = QRect(self._start, self._current).normalized()
+            # 선택 영역은 투명하게 비우기
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.fillRect(rect, Qt.GlobalColor.transparent)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            # 빨간 테두리
+            painter.setPen(QPen(QColor(255, 50, 50), 2))
+            painter.drawRect(rect)
+
+        # 안내 텍스트
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        painter.drawText(10, 20, "드래그로 영역 선택 | ESC: 취소")
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._start = event.pos()
+            self._current = event.pos()
+            self._selecting = True
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._selecting:
+            self._current = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._selecting:
+            self._selecting = False
+            self._current = event.pos()
+            rect = QRect(self._start, self._current).normalized()
+            w = self.width()
+            h = self.height()
+            if w > 0 and h > 0 and rect.width() > 10 and rect.height() > 10:
+                rx = rect.x() / w
+                ry = rect.y() / h
+                rw = rect.width() / w
+                rh = rect.height() / h
+                self.hide()
+                self.region_selected.emit(rx, ry, rw, rh)
+            else:
+                # 너무 작은 영역 — 무시
+                self._start = None
+                self._current = None
+                self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._start = None
+            self._current = None
+            self.hide()
+
+
+class PartialControlDialog(QDialog):
+    """부분제어 — 그룹 KVM들의 동일 영역을 격자 표시 + 입력 브로드캐스트"""
+
+    # PicoKVM UI 정리 + 영역 크롭 JavaScript
+    CROP_JS_TEMPLATE = """
+    (function() {{
+        'use strict';
+        var _done = false;
+        function apply() {{
+            if (_done) return;
+            // UI 정리
+            var style = document.createElement('style');
+            style.textContent = `
+                header, nav, aside, footer,
+                .header, .sidebar, .footer, .toolbar, .controls,
+                [class*="header"], [class*="sidebar"], [class*="footer"],
+                [class*="toolbar"], [class*="status-bar"], [class*="info-bar"],
+                [class*="navbar"], [class*="menu"], [class*="button-bar"],
+                [class*="control-bar"] {{ display: none !important; }}
+                body {{ background: #000 !important; overflow: hidden !important; margin: 0 !important; padding: 0 !important; }}
+                body > *:not(video):not(canvas):not(script):not(style) {{ display: none !important; }}
+                video, canvas {{
+                    display: block !important;
+                    position: fixed !important;
+                    top: 0 !important; left: 0 !important;
+                    width: 100vw !important; height: 100vh !important;
+                    object-fit: fill !important;
+                    z-index: 9999 !important;
+                    background: #000 !important;
+                    transform-origin: 0 0 !important;
+                    transform: scale({sx}, {sy}) translate({tx}%, {ty}%) !important;
+                }}
+            `;
+            document.head.appendChild(style);
+            var v = document.querySelector('video') || document.querySelector('canvas');
+            if (v) {{
+                document.body.appendChild(v);
+                _done = true;
+            }}
+        }}
+        var n = 0;
+        function loop() {{
+            apply();
+            if (!_done && n < 60) {{ n++; setTimeout(loop, 500); }}
+        }}
+        setTimeout(loop, 2000);
+    }})();
+    """
+
+    # HID 키코드 매핑 (Qt Key → HID)
+    QT_TO_HID = {
+        Qt.Key.Key_A: 0x04, Qt.Key.Key_B: 0x05, Qt.Key.Key_C: 0x06, Qt.Key.Key_D: 0x07,
+        Qt.Key.Key_E: 0x08, Qt.Key.Key_F: 0x09, Qt.Key.Key_G: 0x0A, Qt.Key.Key_H: 0x0B,
+        Qt.Key.Key_I: 0x0C, Qt.Key.Key_J: 0x0D, Qt.Key.Key_K: 0x0E, Qt.Key.Key_L: 0x0F,
+        Qt.Key.Key_M: 0x10, Qt.Key.Key_N: 0x11, Qt.Key.Key_O: 0x12, Qt.Key.Key_P: 0x13,
+        Qt.Key.Key_Q: 0x14, Qt.Key.Key_R: 0x15, Qt.Key.Key_S: 0x16, Qt.Key.Key_T: 0x17,
+        Qt.Key.Key_U: 0x18, Qt.Key.Key_V: 0x19, Qt.Key.Key_W: 0x1A, Qt.Key.Key_X: 0x1B,
+        Qt.Key.Key_Y: 0x1C, Qt.Key.Key_Z: 0x1D,
+        Qt.Key.Key_1: 0x1E, Qt.Key.Key_2: 0x1F, Qt.Key.Key_3: 0x20, Qt.Key.Key_4: 0x21,
+        Qt.Key.Key_5: 0x22, Qt.Key.Key_6: 0x23, Qt.Key.Key_7: 0x24, Qt.Key.Key_8: 0x25,
+        Qt.Key.Key_9: 0x26, Qt.Key.Key_0: 0x27,
+        Qt.Key.Key_Return: 0x28, Qt.Key.Key_Escape: 0x29, Qt.Key.Key_Backspace: 0x2A,
+        Qt.Key.Key_Tab: 0x2B, Qt.Key.Key_Space: 0x2C,
+        Qt.Key.Key_F1: 0x3A, Qt.Key.Key_F2: 0x3B, Qt.Key.Key_F3: 0x3C, Qt.Key.Key_F4: 0x3D,
+        Qt.Key.Key_F5: 0x3E, Qt.Key.Key_F6: 0x3F, Qt.Key.Key_F7: 0x40, Qt.Key.Key_F8: 0x41,
+        Qt.Key.Key_F9: 0x42, Qt.Key.Key_F10: 0x43, Qt.Key.Key_F11: 0x44, Qt.Key.Key_F12: 0x45,
+        Qt.Key.Key_Up: 0x52, Qt.Key.Key_Down: 0x51, Qt.Key.Key_Left: 0x50, Qt.Key.Key_Right: 0x4F,
+    }
+
+    def __init__(self, devices: list, region: tuple, parent=None):
+        super().__init__(parent)
+        self.devices = devices
+        self.region = region  # (x, y, w, h) 0~1 비율
+        self.hid_controllers: list[FastHIDController] = []
+        self.web_views: list[QWebEngineView] = []
+        self._executor = ThreadPoolExecutor(max_workers=len(devices))
+
+        self.setWindowTitle(f"부분제어 — {len(devices)}대")
+        self.resize(1600, 900)
+        self._init_ui()
+        self._connect_hids()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 상단 정보 바
+        info_bar = QWidget()
+        info_bar.setFixedHeight(26)
+        info_bar.setStyleSheet("background-color:#1a1a1a;")
+        hbox = QHBoxLayout(info_bar)
+        hbox.setContentsMargins(5, 2, 5, 2)
+        hbox.setSpacing(8)
+
+        x, y, w, h = self.region
+        info_label = QLabel(
+            f"부분제어 | {len(self.devices)}대 | "
+            f"영역: ({x:.0%}, {y:.0%}) ~ ({x+w:.0%}, {y+h:.0%})"
+        )
+        info_label.setStyleSheet("color:#4CAF50; font-weight:bold; font-size:11px;")
+        hbox.addWidget(info_label)
+        hbox.addStretch()
+
+        btn_close = QPushButton("X")
+        btn_close.setStyleSheet("padding:2px 7px; font-size:11px; border-radius:3px; background-color:#333; color:#f44;")
+        btn_close.clicked.connect(self.close)
+        hbox.addWidget(btn_close)
+
+        layout.addWidget(info_bar)
+
+        # 격자 WebView 영역
+        grid_widget = QWidget()
+        self._grid_layout = QGridLayout(grid_widget)
+        self._grid_layout.setSpacing(2)
+        self._grid_layout.setContentsMargins(2, 2, 2, 2)
+
+        cols = max(1, math.ceil(math.sqrt(len(self.devices))))
+        rows = max(1, math.ceil(len(self.devices) / cols))
+
+        x, y, w, h = self.region
+        sx = 1.0 / w
+        sy = 1.0 / h
+        tx = -x * 100.0
+        ty = -y * 100.0
+        crop_js = self.CROP_JS_TEMPLATE.format(sx=sx, sy=sy, tx=tx, ty=ty)
+
+        for idx, device in enumerate(self.devices):
+            r = idx // cols
+            c = idx % cols
+
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+
+            # WebView
+            wv = QWebEngineView()
+            page = QWebEnginePage(wv)
+            page.featurePermissionRequested.connect(
+                lambda origin, feature, p=page: p.setFeaturePermission(
+                    origin, feature, QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+                )
+            )
+            wv.setPage(page)
+
+            ws = wv.settings()
+            ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+            ws.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+            ws.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
+            ws.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+
+            # 로드 완료 시 크롭 JS 주입
+            wv.loadFinished.connect(
+                lambda ok, view=wv, js=crop_js: view.page().runJavaScript(js) if ok else None
+            )
+
+            url = f"http://{device.ip}:{device.info.web_port}/"
+            wv.setUrl(QUrl(url))
+
+            container_layout.addWidget(wv, 1)
+
+            # 기기명 라벨
+            name_label = QLabel(device.name)
+            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_label.setStyleSheet("background-color:#333; color:white; font-size:10px; font-weight:bold; padding:2px;")
+            container_layout.addWidget(name_label)
+
+            self._grid_layout.addWidget(container, r, c)
+            self.web_views.append(wv)
+
+        layout.addWidget(grid_widget, 1)
+
+    def _connect_hids(self):
+        """모든 기기의 HID 컨트롤러 연결 (백그라운드)"""
+        for device in self.devices:
+            hid = FastHIDController(
+                device.ip, device.info.port,
+                device.info.username, device.info.password
+            )
+            self.hid_controllers.append(hid)
+
+        # 병렬 연결
+        def connect_hid(hid):
+            try:
+                hid.connect()
+            except Exception as e:
+                print(f"[PartialControl] HID 연결 실패: {e}")
+
+        for hid in self.hid_controllers:
+            self._executor.submit(connect_hid, hid)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+
+        hid_code = self.QT_TO_HID.get(event.key())
+        if hid_code is None:
+            super().keyPressEvent(event)
+            return
+
+        # Qt 수정자 → HID 수정자
+        mods = 0
+        qt_mods = event.modifiers()
+        if qt_mods & Qt.KeyboardModifier.ControlModifier:
+            mods |= 0x01
+        if qt_mods & Qt.KeyboardModifier.ShiftModifier:
+            mods |= 0x02
+        if qt_mods & Qt.KeyboardModifier.AltModifier:
+            mods |= 0x04
+
+        report_down = struct.pack('BBBBBBBB', mods, 0, hid_code, 0, 0, 0, 0, 0)
+        report_up = struct.pack('BBBBBBBB', 0, 0, 0, 0, 0, 0, 0, 0)
+
+        def send_key(hid):
+            try:
+                hex_down = ''.join(f'\\x{b:02x}' for b in report_down)
+                hex_up = ''.join(f'\\x{b:02x}' for b in report_up)
+                hid._cmd_queue.put(f"echo -ne '{hex_down}' > /dev/hidg0")
+                hid._cmd_queue.put(f"echo -ne '{hex_up}' > /dev/hidg0")
+            except Exception:
+                pass
+
+        for hid in self.hid_controllers:
+            if hid.is_connected():
+                self._executor.submit(send_key, hid)
+
+    def closeEvent(self, event):
+        # WebView 정리
+        for wv in self.web_views:
+            try:
+                wv.setUrl(QUrl("about:blank"))
+                wv.deleteLater()
+            except Exception:
+                pass
+        self.web_views.clear()
+
+        # HID 연결 해제
+        for hid in self.hid_controllers:
+            try:
+                hid.disconnect()
+            except Exception:
+                pass
+        self.hid_controllers.clear()
+
+        self._executor.shutdown(wait=False)
+        super().closeEvent(event)
 
 
 class Aion2WebPage(QWebEnginePage):
@@ -777,16 +1317,53 @@ class LiveViewDialog(QDialog):
         var _sensitivity = %SENSITIVITY%;
         var _canvas = null;
 
-        // 즉시 전송 모드 (RAF 배칭 vs 즉시 전송)
-        var _immediateMode = true;  // true = 최소 지연, false = 배칭
+        // 부드러운 이동을 위한 RAF 배칭 모드 사용
+        var _immediateMode = false;  // false = RAF 배칭 (부드러운 이동)
 
         // 배칭 모드용 변수
         var _pendingDX = 0;
         var _pendingDY = 0;
         var _rafId = null;
 
+        // 이동 보정: 소수점 누적 (정밀도 유지)
+        var _fracDX = 0;
+        var _fracDY = 0;
+
+        // 최대 이동량 제한 (한 프레임당)
+        var _maxDelta = 25;
+
         // 재사용 객체 (GC 방지)
         var _moveEvent = { dx: 0, dy: 0 };
+
+        // 마우스 전송 헬퍼 (클램핑 + 분할 전송)
+        function _sendMouseClamped(dx, dy) {
+            // 소수점 누적 처리
+            dx += _fracDX;
+            dy += _fracDY;
+            var idx = Math.round(dx);
+            var idy = Math.round(dy);
+            _fracDX = dx - idx;
+            _fracDY = dy - idy;
+
+            if (idx === 0 && idy === 0) return;
+
+            // 큰 이동은 분할 전송 (부드러운 이동)
+            var sendFn = (window._pointer && window._pointer.sendMouse)
+                ? function(x, y) { window._pointer.sendMouse(x, y); }
+                : (window.sendMouseRelative
+                    ? function(x, y) { window.sendMouseRelative(x, y); }
+                    : null);
+
+            if (!sendFn) return;
+
+            while (idx !== 0 || idy !== 0) {
+                var sx = Math.max(-_maxDelta, Math.min(_maxDelta, idx));
+                var sy = Math.max(-_maxDelta, Math.min(_maxDelta, idy));
+                sendFn(sx, sy);
+                idx -= sx;
+                idy -= sy;
+            }
+        }
 
         // 바인딩된 핸들러 캐시
         var _handlers = {};
@@ -936,18 +1513,10 @@ class LiveViewDialog(QDialog):
                 if (dx === 0 && dy === 0) return;
 
                 if (_immediateMode) {
-                    // 즉시 전송 모드: 지연 없이 바로 전송
-                    var scaledDx = dx * _sensitivity;
-                    var scaledDy = dy * _sensitivity;
-
-                    // PicoKVM WebRTC DataChannel로 전송
-                    if (window._pointer && window._pointer.sendMouse) {
-                        window._pointer.sendMouse(scaledDx, scaledDy);
-                    } else if (window.sendMouseRelative) {
-                        window.sendMouseRelative(scaledDx, scaledDy);
-                    }
+                    // 즉시 전송 모드: 클램핑 적용
+                    _sendMouseClamped(dx * _sensitivity, dy * _sensitivity);
                 } else {
-                    // 배칭 모드: RAF에서 일괄 처리
+                    // 배칭 모드: RAF에서 일괄 처리 (부드러운 이동)
                     _pendingDX += dx;
                     _pendingDY += dy;
                 }
@@ -963,11 +1532,7 @@ class LiveViewDialog(QDialog):
                     _pendingDX = 0;
                     _pendingDY = 0;
 
-                    if (window._pointer && window._pointer.sendMouse) {
-                        window._pointer.sendMouse(dx, dy);
-                    } else if (window.sendMouseRelative) {
-                        window.sendMouseRelative(dx, dy);
-                    }
+                    _sendMouseClamped(dx, dy);
                 }
 
                 _rafId = requestAnimationFrame(_handlers.renderFrame);
@@ -1103,7 +1668,7 @@ class LiveViewDialog(QDialog):
         super().__init__(parent)
         self.device = device
         self.setWindowTitle(f"{device.name} ({device.ip})")
-        self.setMinimumSize(1280, 800)
+        self.resize(1920, 1080)
 
         # HID 컨트롤러 (백업용)
         self.hid = FastHIDController(
@@ -1114,151 +1679,192 @@ class LiveViewDialog(QDialog):
         )
 
         self.game_mode_active = False
-        self.sensitivity = 1.0
+        self.sensitivity = 0.5
         self.control_bar_visible = True
         self._quality_timer = None  # 품질 변경 디바운싱용 타이머
         self._pending_quality = None  # 대기 중인 품질 값
         self._previous_quality = 80  # 저지연 모드 해제 시 복원할 품질
+        self._page_loaded = False
         self._init_ui()
+        self.show()  # 즉시 표시 (로딩 오버레이와 함께)
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 상단 컨트롤 바 - 컴팩트하게
+        # ── 공통 버튼 스타일 ──
+        _btn_style = "padding:2px 7px; font-size:11px; border-radius:3px;"
+        _sep_style = "color:#555; font-size:11px;"
+
+        # ═══════════════════════════════════════════════
+        #  1줄 — 제어 바 (입력 + 영상)
+        # ═══════════════════════════════════════════════
         self.control_widget = QWidget()
         control_bar = QHBoxLayout(self.control_widget)
         control_bar.setContentsMargins(5, 2, 5, 2)
-        control_bar.setSpacing(5)
+        control_bar.setSpacing(4)
 
+        # 기기명
         self.status_label = QLabel(f"{self.device.name}")
-        self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
+        self.status_label.setStyleSheet("color:#4CAF50; font-weight:bold; font-size:11px;")
         control_bar.addWidget(self.status_label)
 
-        control_bar.addStretch()
+        sep0 = QLabel("|"); sep0.setStyleSheet(_sep_style)
+        control_bar.addWidget(sep0)
 
-        # 민감도 - 컴팩트 (설정에서 기본값 로드)
-        default_sensitivity = app_settings.get('aion2.sensitivity', 1.0)
+        # ── 입력 그룹: 감도, 마우스모드, 아이온2 ──
+        default_sensitivity = app_settings.get('aion2.sensitivity', 0.5)
         lbl = QLabel("감도:")
-        lbl.setStyleSheet("color: #ccc; font-size: 11px;")
+        lbl.setStyleSheet("color:#ccc; font-size:11px;")
         control_bar.addWidget(lbl)
         self.sensitivity_slider = QSlider(Qt.Orientation.Horizontal)
         self.sensitivity_slider.setRange(1, 30)
         self.sensitivity_slider.setValue(int(default_sensitivity * 10))
-        self.sensitivity_slider.setFixedWidth(60)
+        self.sensitivity_slider.setFixedWidth(55)
         self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
         control_bar.addWidget(self.sensitivity_slider)
-
         self.sensitivity_label = QLabel(f"{default_sensitivity:.1f}")
-        self.sensitivity_label.setStyleSheet("color: #ccc; font-size: 11px;")
-        self.sensitivity_label.setFixedWidth(25)
+        self.sensitivity_label.setStyleSheet("color:#ccc; font-size:11px;")
+        self.sensitivity_label.setFixedWidth(22)
         control_bar.addWidget(self.sensitivity_label)
         self.sensitivity = default_sensitivity
 
-        control_bar.addStretch()
-
-        # 마우스 모드 버튼 (Absolute/Relative)
-        self.mouse_mode_absolute = True  # 기본: Absolute
-        self.btn_mouse_mode = QPushButton("🖱 Abs")
+        self.mouse_mode_absolute = True
+        self.btn_mouse_mode = QPushButton("Abs")
         self.btn_mouse_mode.setToolTip("Absolute: 일반작업\nRelative: 3D게임")
-        self.btn_mouse_mode.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                padding: 3px 8px;
-                border-radius: 3px;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #1976D2; }
-        """)
+        self.btn_mouse_mode.setStyleSheet(f"{_btn_style} background-color:#2196F3; color:white;")
         self.btn_mouse_mode.clicked.connect(self._toggle_mouse_mode)
         control_bar.addWidget(self.btn_mouse_mode)
 
-        # 아이온2 모드 버튼 - 컴팩트
-        self.btn_game_mode = QPushButton("아이온2 (G)")
-        self.btn_game_mode.setStyleSheet("""
-            QPushButton {
-                background-color: #FF5722;
-                color: white;
-                padding: 3px 10px;
-                border-radius: 3px;
-                font-weight: bold;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #E64A19; }
-        """)
+        self.btn_game_mode = QPushButton("아이온2")
+        self.btn_game_mode.setToolTip("Alt+1: 시작 (자동 Rel 전환)\nAlt+2: 해제 (자동 Abs 복원)\nALT: 커서 일시 표시")
+        self.btn_game_mode.setStyleSheet(f"{_btn_style} background-color:#FF5722; color:white; font-weight:bold;")
         self.btn_game_mode.clicked.connect(self._toggle_game_mode)
         control_bar.addWidget(self.btn_game_mode)
 
-        btn_fullscreen = QPushButton("전체 (F11)")
-        btn_fullscreen.setStyleSheet("padding: 3px 8px; font-size: 11px;")
-        btn_fullscreen.clicked.connect(self._toggle_fullscreen)
-        control_bar.addWidget(btn_fullscreen)
+        sep1 = QLabel("|"); sep1.setStyleSheet(_sep_style)
+        control_bar.addWidget(sep1)
 
-        btn_hide = QPushButton("바 숨김 (H)")
-        btn_hide.setStyleSheet("padding: 3px 8px; font-size: 11px;")
-        btn_hide.clicked.connect(self._toggle_control_bar)
-        control_bar.addWidget(btn_hide)
-
-        # 원본 UI 토글 버튼
-        self.btn_original_ui = QPushButton("원본 UI")
-        self.btn_original_ui.setStyleSheet("padding: 3px 8px; font-size: 11px;")
-        self.btn_original_ui.setCheckable(True)
-        self.btn_original_ui.clicked.connect(self._toggle_original_ui)
-        control_bar.addWidget(self.btn_original_ui)
-
-        # 구분선
-        sep = QLabel("|")
-        sep.setStyleSheet("color: #555; font-size: 11px;")
-        control_bar.addWidget(sep)
-
-        # 비디오 품질 슬라이더 (지연 완화용)
+        # ── 영상 그룹: 품질, 저지연 ──
         quality_lbl = QLabel("품질:")
-        quality_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
+        quality_lbl.setStyleSheet("color:#ccc; font-size:11px;")
         control_bar.addWidget(quality_lbl)
-
         self.quality_slider = QSlider(Qt.Orientation.Horizontal)
         self.quality_slider.setRange(10, 100)
-        self.quality_slider.setValue(80)  # 기본 80%
-        self.quality_slider.setFixedWidth(60)
-        self.quality_slider.setToolTip("낮을수록 지연↓ 화질↓\n높을수록 지연↑ 화질↑")
+        self.quality_slider.setValue(80)
+        self.quality_slider.setFixedWidth(55)
+        self.quality_slider.setToolTip("낮을수록 지연↓ 화질↓")
         self.quality_slider.valueChanged.connect(self._on_quality_changed)
         control_bar.addWidget(self.quality_slider)
-
         self.quality_label = QLabel("80%")
-        self.quality_label.setStyleSheet("color: #ccc; font-size: 11px;")
-        self.quality_label.setFixedWidth(30)
+        self.quality_label.setStyleSheet("color:#ccc; font-size:11px;")
+        self.quality_label.setFixedWidth(28)
         control_bar.addWidget(self.quality_label)
 
-        # 저지연 모드 버튼
         self.low_latency_mode = False
         self.btn_low_latency = QPushButton("저지연")
         self.btn_low_latency.setToolTip("저지연 모드: 품질↓ 지연↓\n(게임/실시간 작업용)")
-        self.btn_low_latency.setStyleSheet("""
-            QPushButton {
-                background-color: #607D8B;
-                color: white;
-                padding: 3px 8px;
-                border-radius: 3px;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #546E7A; }
-        """)
+        self.btn_low_latency.setStyleSheet(f"{_btn_style} background-color:#607D8B; color:white;")
         self.btn_low_latency.clicked.connect(self._toggle_low_latency_mode)
         control_bar.addWidget(self.btn_low_latency)
 
+        sep2 = QLabel("|"); sep2.setStyleSheet(_sep_style)
+        control_bar.addWidget(sep2)
+
+        # ── 창 그룹: 전체화면, 닫기 ──
+        btn_fullscreen = QPushButton("전체(F11)")
+        btn_fullscreen.setStyleSheet(f"{_btn_style} background-color:#333; color:#ddd;")
+        btn_fullscreen.clicked.connect(self._toggle_fullscreen)
+        control_bar.addWidget(btn_fullscreen)
+
         btn_close = QPushButton("X")
-        btn_close.setStyleSheet("padding: 3px 8px; font-size: 11px; color: #f44;")
+        btn_close.setStyleSheet(f"{_btn_style} background-color:#333; color:#f44;")
         btn_close.clicked.connect(self.close)
         control_bar.addWidget(btn_close)
 
-        self.control_widget.setStyleSheet("background-color: #1a1a1a;")
-        self.control_widget.setFixedHeight(28)
+        self.control_widget.setStyleSheet("background-color:#1a1a1a;")
+        self.control_widget.setFixedHeight(26)
         layout.addWidget(self.control_widget)
 
+        # ═══════════════════════════════════════════════
+        #  2줄 — 기능 바 (USB + Vision)
+        # ═══════════════════════════════════════════════
+        self._usb_thread = None
+
+        self.shortcut_bar = QWidget()
+        self.shortcut_bar.setFixedHeight(26)
+        self.shortcut_bar.setStyleSheet("background-color:#222;")
+        func_bar = QHBoxLayout(self.shortcut_bar)
+        func_bar.setContentsMargins(5, 2, 5, 2)
+        func_bar.setSpacing(4)
+
+        # ── USB 그룹 ──
+        self.btn_usb_mount = QPushButton("USB 마운트")
+        self.btn_usb_mount.setToolTip("클라우드 파일을 USB 드라이브로 마운트\n(연결된 PC에서 USB로 인식)")
+        self.btn_usb_mount.setStyleSheet(f"{_btn_style} background-color:#FF9800; color:white; font-weight:bold;")
+        self.btn_usb_mount.clicked.connect(self._on_usb_mount)
+        func_bar.addWidget(self.btn_usb_mount)
+
+        self.btn_usb_eject = QPushButton("USB 해제")
+        self.btn_usb_eject.setToolTip("USB Mass Storage 드라이브 해제")
+        self.btn_usb_eject.setStyleSheet(f"{_btn_style} background-color:#795548; color:white;")
+        self.btn_usb_eject.clicked.connect(self._on_usb_eject)
+        func_bar.addWidget(self.btn_usb_eject)
+
+        sep_pc = QLabel("|"); sep_pc.setStyleSheet(_sep_style)
+        func_bar.addWidget(sep_pc)
+
+        # ── 부분제어 ──
+        self.btn_partial_control = QPushButton("부분제어")
+        self.btn_partial_control.setToolTip("그룹 KVM 동일 영역 동시 표시 + 입력 브로드캐스트")
+        self.btn_partial_control.setStyleSheet(f"{_btn_style} background-color:#00BCD4; color:white; font-weight:bold;")
+        self.btn_partial_control.clicked.connect(self._start_partial_control)
+        func_bar.addWidget(self.btn_partial_control)
+
+        # ── Vision 그룹 (YOLO) ──
+        if VISION_AVAILABLE:
+            sep_v = QLabel("|"); sep_v.setStyleSheet(_sep_style)
+            func_bar.addWidget(sep_v)
+
+            self.btn_vision = QPushButton("Vision")
+            self.btn_vision.setToolTip("YOLO 이미지 인식 on/off (V)")
+            self.btn_vision.setStyleSheet(f"{_btn_style} background-color:#9C27B0; color:white;")
+            self.btn_vision.clicked.connect(self._toggle_vision)
+            func_bar.addWidget(self.btn_vision)
+
+            self.btn_vision_settings = QPushButton("V-Set")
+            self.btn_vision_settings.setToolTip("Vision 설정")
+            self.btn_vision_settings.setStyleSheet(f"{_btn_style} background-color:#333; color:#ddd;")
+            self.btn_vision_settings.clicked.connect(self._show_vision_settings)
+            func_bar.addWidget(self.btn_vision_settings)
+
+            self.btn_rec = QPushButton("Rec")
+            self.btn_rec.setToolTip("학습 데이터 수집 on/off (R)")
+            self.btn_rec.setStyleSheet(f"{_btn_style} background-color:#607D8B; color:white;")
+            self.btn_rec.clicked.connect(self._toggle_recording)
+            func_bar.addWidget(self.btn_rec)
+
+            self.rec_count_label = QLabel("")
+            self.rec_count_label.setStyleSheet("color:#f44; font-size:11px; font-weight:bold;")
+            func_bar.addWidget(self.rec_count_label)
+
+        func_bar.addStretch()
+
+        # 수집 모드 상태
+        self._recording = False
+        self._rec_timer = None
+        self._rec_count = 0
+        self._rec_output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                             "dataset", "images", "raw") if not getattr(sys, 'frozen', False) \
+            else os.path.join(os.path.dirname(sys.executable), "dataset", "images", "raw")
+        self._rec_input_log = []  # 캡처 간 입력 이벤트 버퍼
+        self._rec_input_injected = False  # JS 이벤트 후킹 여부
+
+        layout.addWidget(self.shortcut_bar)
+
         # 아이온2 모드 안내 바 - 더 컴팩트
-        self.game_mode_bar = QLabel("  아이온2 모드 | 클릭: 잠금 | ALT: 커서 | ESC: 해제")
+        self.game_mode_bar = QLabel("  아이온2 모드 | 클릭: 잠금 | ALT: 커서 | Alt+2: 해제")
         self.game_mode_bar.setStyleSheet("""
             background-color: #4CAF50;
             color: white;
@@ -1289,24 +1895,87 @@ class LiveViewDialog(QDialog):
         settings.setAttribute(QWebEngineSettings.WebAttribute.FocusOnNavigationEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript, True)
 
+        layout.addWidget(self.web_view, 1)  # stretch factor 1 - 최대 공간
+
+        # 로딩 오버레이
+        self._loading_overlay = QLabel(self.web_view)
+        self._loading_overlay.setText(f"{self.device.name} 연결 중...")
+        self._loading_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._loading_overlay.setStyleSheet("""
+            QLabel {
+                background-color: rgba(26, 26, 26, 220);
+                color: #4CAF50;
+                font-size: 18px;
+                font-weight: bold;
+            }
+        """)
+
+        # URL 로드
         web_port = self.device.info.web_port if hasattr(self.device.info, 'web_port') else 80
         url = f"http://{self.device.ip}:{web_port}"
         self.web_view.setUrl(QUrl(url))
-        layout.addWidget(self.web_view, 1)  # stretch factor 1 - 최대 공간
+
+        # Vision 오버레이 (WebView 위에 투명하게 표시)
+        self.vision_controller = None
+        if VISION_AVAILABLE:
+            self._vision_overlay = DetectionOverlay(self.web_view)
+            self._vision_overlay.setGeometry(self.web_view.rect())
+            self._vision_overlay.hide()
+
+            self.vision_controller = VisionController(
+                web_view=self.web_view,
+                overlay=self._vision_overlay,
+                hid_controller=self.hid,
+                log_dir=LOG_DIR,
+            )
+            self.vision_controller.status_changed.connect(self._on_vision_status_changed)
+
+            # 설정에서 모델 경로 로드
+            model_path = app_settings.get('vision.model_path', '')
+            if model_path:
+                self.vision_controller.load_model(model_path)
+
+            # 설정 적용
+            self.vision_controller.set_fps(app_settings.get('vision.capture_fps', 2))
+            self.vision_controller.set_confidence(app_settings.get('vision.confidence', 0.5))
+            self.vision_controller.set_auto_action(app_settings.get('vision.auto_action_enabled', False))
+            self.vision_controller.set_log_enabled(app_settings.get('vision.log_enabled', True))
+
+            # 액션 규칙 로드
+            rules = app_settings.get('vision.action_rules', [])
+            if rules:
+                self.vision_controller.load_action_rules(rules)
 
         # 페이지 로드 완료 시 처리
         self.web_view.loadFinished.connect(self._on_page_loaded)
 
+        # ── 글로벌 단축키 (QShortcut) ──
+        # WebEngineView가 포커스를 가져가도 다이얼로그 레벨에서 키를 잡음
+        sc_start = QShortcut(QKeySequence("Alt+1"), self)
+        sc_start.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_start.activated.connect(lambda: self._start_game_mode() if not self.game_mode_active else None)
+
+        sc_stop = QShortcut(QKeySequence("Alt+2"), self)
+        sc_stop.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_stop.activated.connect(lambda: self._stop_game_mode() if self.game_mode_active else None)
+
     def _toggle_control_bar(self):
-        """상단 바 토글"""
+        """상단 바 + 단축키 바 토글"""
         self.control_bar_visible = not self.control_bar_visible
         self.control_widget.setVisible(self.control_bar_visible)
+        self.shortcut_bar.setVisible(self.control_bar_visible)
 
     def _on_page_loaded(self, ok):
+        self._page_loaded = True
+        # 로딩 오버레이 숨기기
+        if hasattr(self, '_loading_overlay') and self._loading_overlay:
+            self._loading_overlay.hide()
         if ok:
             self.status_label.setText(f"{self.device.name} - 연결됨")
             # UI 정리 (비디오만 표시) - 약간의 지연 후 실행
             QTimer.singleShot(500, self._clean_kvm_ui)
+        else:
+            self.status_label.setText(f"{self.device.name} - 연결 실패")
 
     def _clean_kvm_ui(self):
         """PicoKVM UI 정리 - 비디오 스트림만 표시"""
@@ -1812,8 +2481,12 @@ class LiveViewDialog(QDialog):
             self._start_game_mode()
 
     def _start_game_mode(self):
-        """아이온2 모드 시작 - Pointer Lock API 사용"""
+        """아이온2 모드 시작 - Pointer Lock API 사용 + 자동 Rel 전환"""
         self.game_mode_active = True
+
+        # 마우스 모드를 Relative로 자동 전환
+        if self.mouse_mode_absolute:
+            self._toggle_mouse_mode()
 
         # JavaScript로 아이온2 모드 활성화
         js = self.AION2_MODE_JS.replace("%SENSITIVITY%", str(self.sensitivity))
@@ -1821,7 +2494,7 @@ class LiveViewDialog(QDialog):
 
         # UI 업데이트
         self.game_mode_bar.show()
-        self.btn_game_mode.setText("해제 (ESC)")
+        self.btn_game_mode.setText("해제 (Alt+2)")
         self.btn_game_mode.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
@@ -1842,18 +2515,22 @@ class LiveViewDialog(QDialog):
         """아이온2 모드 JavaScript 실행 결과"""
         if not result:
             # Pointer Lock 실패 시 대체 메시지
-            self.game_mode_bar.setText("  화면 클릭하여 마우스 잠금 | ALT: 커서 | ESC: 해제")
+            self.game_mode_bar.setText("  화면 클릭하여 마우스 잠금 | ALT: 커서 | Alt+2: 해제")
 
     def _stop_game_mode(self):
-        """아이온2 모드 중지"""
+        """아이온2 모드 중지 + 자동 Abs 복원"""
         self.game_mode_active = False
 
         # JavaScript로 아이온2 모드 해제
         self.web_view.page().runJavaScript(self.AION2_STOP_JS)
 
+        # 마우스 모드를 Absolute로 자동 복원
+        if not self.mouse_mode_absolute:
+            self._toggle_mouse_mode()
+
         # UI 업데이트
         self.game_mode_bar.hide()
-        self.btn_game_mode.setText("아이온2 (G)")
+        self.btn_game_mode.setText("아이온2 (Alt+1)")
         self.btn_game_mode.setStyleSheet("""
             QPushButton {
                 background-color: #FF5722;
@@ -1876,27 +2553,625 @@ class LiveViewDialog(QDialog):
             self.showFullScreen()
             # 전체화면에서도 컨트롤 바는 유지 (H로 숨길 수 있음)
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_G and not self.game_mode_active:
-            self._start_game_mode()
-        elif event.key() == Qt.Key.Key_H:
-            self._toggle_control_bar()
-        elif event.key() == Qt.Key.Key_F11:
-            self._toggle_fullscreen()
-        elif event.key() == Qt.Key.Key_Escape:
-            if self.game_mode_active:
-                self._stop_game_mode()
-            elif self.isFullScreen():
-                self.showNormal()
-            else:
-                self.close()
+    # ─── USB Mass Storage ─────────────────────────────────
+
+    def _on_usb_mount(self):
+        """USB 마운트: 클라우드 파일 목록 조회 → 선택 → 다운로드+마운트"""
+        try:
+            if self._usb_thread and self._usb_thread.isRunning():
+                QMessageBox.warning(self, "USB", "USB 작업이 진행 중입니다.")
+                return
+
+            from api_client import api_client
+            if not api_client.is_logged_in:
+                QMessageBox.warning(self, "USB 마운트", "로그인이 필요합니다.")
+                return
+
+            self.btn_usb_mount.setEnabled(False)
+            self.btn_usb_mount.setText("조회 중...")
+
+            self._usb_thread = USBWorkerThread(self.device, mode=USBWorkerThread.MODE_CLOUD_LIST)
+            self._usb_thread.cloud_files_ready.connect(self._on_cloud_files_ready)
+            self._usb_thread.start()
+        except Exception as e:
+            self.btn_usb_mount.setEnabled(True)
+            self.btn_usb_mount.setText("USB 마운트")
+            print(f"[USB 마운트 오류] {e}")
+
+    def _on_usb_files_ready(self, files):
+        """로컬 파일 목록 수신 → 선택 → 마운트"""
+        try:
+            self.btn_usb_mount.setEnabled(True)
+            self.btn_usb_mount.setText("USB 마운트")
+
+            if not files:
+                QMessageBox.information(
+                    self, "USB 마운트",
+                    "KVM /tmp에 파일이 없습니다.\n"
+                    "먼저 '파일 전송'으로 파일을 업로드하세요."
+                )
+                return
+
+            selected, ok = QInputDialog.getItem(
+                self, "USB 마운트 (로컬)", "마운트할 파일 선택:", files, 0, False
+            )
+            if not ok or not selected:
+                return
+
+            file_path = f"/tmp/{selected}"
+
+            self.btn_usb_mount.setEnabled(False)
+            self.btn_usb_mount.setText("마운트 중...")
+            self.btn_usb_eject.setEnabled(False)
+
+            self._usb_thread = USBWorkerThread(self.device, mode=USBWorkerThread.MODE_MOUNT, file_path=file_path)
+            self._usb_thread.progress.connect(self._on_usb_progress)
+            self._usb_thread.finished_ok.connect(self._on_usb_mount_done)
+            self._usb_thread.finished_err.connect(self._on_usb_mount_error)
+            self._usb_thread.start()
+        except Exception as e:
+            self.btn_usb_mount.setEnabled(True)
+            self.btn_usb_mount.setText("USB 마운트")
+            self.btn_usb_eject.setEnabled(True)
+            print(f"[USB 파일선택 오류] {e}")
+
+    def _on_cloud_files_ready(self, files):
+        """클라우드 파일 목록 수신 → 전체 목록에서 선택 → 다운로드+마운트"""
+        try:
+            self.btn_usb_mount.setEnabled(True)
+            self.btn_usb_mount.setText("USB 마운트")
+
+            if not files:
+                QMessageBox.information(
+                    self, "USB 마운트",
+                    "클라우드에 파일이 없습니다.\n"
+                    "먼저 우클릭 → '클라우드 업로드'로 파일을 업로드하세요."
+                )
+                return
+
+            from api_client import api_client
+
+            # 쿼타 정보
+            quota_str = ""
+            try:
+                qi = api_client.get_quota()
+                q = qi.get('quota')
+                used = qi.get('used', 0)
+                if q is None:
+                    quota_str = f"사용: {used // (1024*1024)}MB / 무제한"
+                elif q > 0:
+                    quota_str = f"사용: {used // (1024*1024)}MB / {q // (1024*1024)}MB"
+            except Exception:
+                pass
+
+            # 파일 목록 표시 (이름 + 크기)
+            display_list = []
+            for f in files:
+                size_mb = f.get('size', 0) / (1024 * 1024)
+                name = f.get('filename', '?')
+                if size_mb >= 1:
+                    display_list.append(f"{name} ({size_mb:.1f}MB)")
+                else:
+                    size_kb = f.get('size', 0) / 1024
+                    display_list.append(f"{name} ({size_kb:.1f}KB)")
+
+            label = f"파일 {len(files)}개"
+            if quota_str:
+                label = f"{quota_str} | 파일 {len(files)}개"
+
+            selected, ok = QInputDialog.getItem(
+                self, "USB 마운트", label, display_list, 0, False
+            )
+            if not ok or not selected:
+                return
+
+            # 선택된 인덱스로 파일 정보 찾기
+            idx = display_list.index(selected)
+            file_info = files[idx]
+
+            download_url = api_client.get_file_download_url(file_info['id'])
+            token = api_client._token
+
+            self.btn_usb_mount.setEnabled(False)
+            self.btn_usb_mount.setText("다운로드 중...")
+            self.btn_usb_eject.setEnabled(False)
+
+            self._usb_thread = USBWorkerThread(
+                self.device,
+                mode=USBWorkerThread.MODE_CLOUD_MOUNT,
+                download_url=download_url,
+                token=token,
+                filename=file_info['filename'],
+            )
+            self._usb_thread.progress.connect(self._on_usb_progress)
+            self._usb_thread.finished_ok.connect(self._on_usb_mount_done)
+            self._usb_thread.finished_err.connect(self._on_usb_mount_error)
+            self._usb_thread.start()
+        except Exception as e:
+            self.btn_usb_mount.setEnabled(True)
+            self.btn_usb_mount.setText("USB 마운트")
+            self.btn_usb_eject.setEnabled(True)
+            print(f"[클라우드 마운트 오류] {e}")
+
+    def _on_usb_eject(self):
+        """USB Mass Storage 해제 (백그라운드)"""
+        try:
+            if self._usb_thread and self._usb_thread.isRunning():
+                QMessageBox.warning(self, "USB", "USB 작업이 진행 중입니다.")
+                return
+
+            self.btn_usb_eject.setEnabled(False)
+            self.btn_usb_eject.setText("해제 중...")
+            self.btn_usb_mount.setEnabled(False)
+
+            self._usb_thread = USBWorkerThread(self.device, mode=USBWorkerThread.MODE_EJECT)
+            self._usb_thread.progress.connect(self._on_usb_progress)
+            self._usb_thread.finished_ok.connect(self._on_usb_eject_done)
+            self._usb_thread.finished_err.connect(self._on_usb_eject_error)
+            self._usb_thread.start()
+        except Exception as e:
+            self.btn_usb_eject.setEnabled(True)
+            self.btn_usb_eject.setText("USB 해제")
+            self.btn_usb_mount.setEnabled(True)
+            print(f"[USB 해제 오류] {e}")
+
+    def _on_usb_progress(self, msg):
+        try:
+            self.btn_usb_mount.setText(msg[:20])
+        except Exception:
+            pass
+
+    def _on_usb_mount_done(self, msg):
+        try:
+            self.btn_usb_mount.setEnabled(True)
+            self.btn_usb_mount.setText("USB 마운트")
+            self.btn_usb_eject.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            QMessageBox.information(self, "USB 마운트", f"{msg}\n\n연결된 PC에서 새 USB 드라이브를 확인하세요.")
+        except Exception:
+            pass
+
+    def _on_usb_mount_error(self, msg):
+        try:
+            self.btn_usb_mount.setEnabled(True)
+            self.btn_usb_mount.setText("USB 마운트")
+            self.btn_usb_eject.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "USB 마운트 실패", msg)
+        except Exception:
+            pass
+
+    def _on_usb_eject_done(self, msg):
+        try:
+            self.btn_usb_eject.setEnabled(True)
+            self.btn_usb_eject.setText("USB 해제")
+            self.btn_usb_mount.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            QMessageBox.information(self, "USB 해제", msg)
+        except Exception:
+            pass
+
+    def _on_usb_eject_error(self, msg):
+        try:
+            self.btn_usb_eject.setEnabled(True)
+            self.btn_usb_eject.setText("USB 해제")
+            self.btn_usb_mount.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "USB 해제 실패", msg)
+        except Exception:
+            pass
+
+    # ─── 부분제어 ──────────────────────────────────────────
+
+    def _start_partial_control(self):
+        """부분제어 시작 — 영역 선택 오버레이 표시"""
+        group = self.device.info.group or 'default'
+
+        # MainWindow(parent)에서 manager 가져오기
+        main_win = self.parent()
+        if not hasattr(main_win, 'manager'):
+            QMessageBox.warning(self, "오류", "KVM 매니저를 찾을 수 없습니다.")
+            return
+
+        group_devices = main_win.manager.get_devices_by_group(group)
+        if len(group_devices) < 1:
+            QMessageBox.warning(self, "부분제어", "그룹에 기기가 없습니다.")
+            return
+
+        self._partial_devices = group_devices
+
+        # 영역 선택 오버레이
+        if not hasattr(self, '_region_overlay') or self._region_overlay is None:
+            self._region_overlay = RegionSelectOverlay(self.web_view)
+            self._region_overlay.region_selected.connect(self._on_region_selected)
+
+        self._region_overlay.setGeometry(self.web_view.rect())
+        self._region_overlay.show()
+
+    def _on_region_selected(self, x, y, w, h):
+        """영역 선택 완료 → PartialControlDialog 열기"""
+        devices = getattr(self, '_partial_devices', [])
+        if not devices:
+            return
+
+        dialog = PartialControlDialog(devices, (x, y, w, h), self)
+        dialog.exec()
+
+    # ─── Vision 기능 ─────────────────────────────────────
+
+    def _toggle_vision(self):
+        """Vision(YOLO) 모드 토글"""
+        if not VISION_AVAILABLE or self.vision_controller is None:
+            return
+
+        if self.vision_controller.is_running:
+            self.vision_controller.stop()
+            self._vision_overlay.hide()
         else:
-            super().keyPressEvent(event)
+            if not self.vision_controller._detector.is_model_loaded:
+                model_path = app_settings.get('vision.model_path', '')
+                if not model_path:
+                    QMessageBox.warning(
+                        self, "Vision",
+                        "YOLO 모델이 설정되지 않았습니다.\n"
+                        "V-Set 버튼에서 모델 경로를 설정해주세요."
+                    )
+                    return
+                self.vision_controller.load_model(model_path)
+
+            self._vision_overlay.show()
+            self.vision_controller.start()
+
+    def _on_vision_status_changed(self, status: str):
+        """Vision 상태 변경 시 UI 업데이트"""
+        if not VISION_AVAILABLE:
+            return
+
+        if status == "running":
+            self.btn_vision.setText("Vision ON")
+            self.btn_vision.setStyleSheet("""
+                QPushButton {
+                    background-color: #4CAF50;
+                    color: white;
+                    padding: 3px 8px;
+                    border-radius: 3px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+            """)
+        elif status == "error":
+            self.btn_vision.setText("Vision ERR")
+            self.btn_vision.setStyleSheet("""
+                QPushButton {
+                    background-color: #f44336;
+                    color: white;
+                    padding: 3px 8px;
+                    border-radius: 3px;
+                    font-size: 11px;
+                }
+            """)
+        else:
+            self.btn_vision.setText("Vision")
+            self.btn_vision.setStyleSheet("""
+                QPushButton {
+                    background-color: #9C27B0;
+                    color: white;
+                    padding: 3px 8px;
+                    border-radius: 3px;
+                    font-size: 11px;
+                }
+                QPushButton:hover { background-color: #7B1FA2; }
+            """)
+
+    def _show_vision_settings(self):
+        """Vision 설정 다이얼로그"""
+        if not VISION_AVAILABLE:
+            return
+
+        dialog = VisionSettingsDialog(self.vision_controller, self)
+        dialog.exec()
+
+    # ─── 데이터 수집 (Rec) ─────────────────────────────────
+
+    def _toggle_recording(self):
+        """학습 데이터 수집 모드 토글"""
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    # 입력 이벤트 캡처 JS - keydown/keyup/mousedown/mouseup을 기록
+    REC_INPUT_HOOK_JS = """
+    (function() {
+        if (window._wlRecHooked) return;
+        window._wlRecHooked = true;
+        window._wlInputLog = [];
+        function logEv(type, e) {
+            var entry = {t: Date.now(), type: type};
+            if (type.startsWith('key')) {
+                entry.key = e.key || '';
+                entry.code = e.code || '';
+            } else {
+                entry.btn = e.button;
+                entry.x = e.clientX;
+                entry.y = e.clientY;
+            }
+            window._wlInputLog.push(entry);
+            if (window._wlInputLog.length > 500) window._wlInputLog.shift();
+        }
+        document.addEventListener('keydown', function(e){ logEv('keydown', e); }, true);
+        document.addEventListener('keyup', function(e){ logEv('keyup', e); }, true);
+        document.addEventListener('mousedown', function(e){ logEv('mousedown', e); }, true);
+        document.addEventListener('mouseup', function(e){ logEv('mouseup', e); }, true);
+    })();
+    """
+
+    # JS에서 입력 로그를 가져오고 버퍼 비우기
+    REC_FLUSH_INPUT_JS = """
+    (function() {
+        var log = window._wlInputLog || [];
+        window._wlInputLog = [];
+        return JSON.stringify(log);
+    })();
+    """
+
+    def _start_recording(self):
+        """수집 시작"""
+        os.makedirs(self._rec_output_dir, exist_ok=True)
+        self._recording = True
+        self._rec_count = 0
+        self._rec_input_log = []
+
+        # 입력 이벤트 캡처 JS 주입
+        if not self._rec_input_injected:
+            self.web_view.page().runJavaScript(self.REC_INPUT_HOOK_JS)
+            self._rec_input_injected = True
+
+        fps = app_settings.get('vision.capture_fps', 2)
+        interval_ms = max(500, int(1000 / fps))
+
+        self._rec_timer = QTimer(self)
+        self._rec_timer.timeout.connect(self._rec_capture_frame)
+        self._rec_timer.start(interval_ms)
+
+        self.btn_rec.setText("REC ●")
+        self.btn_rec.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                padding: 3px 8px;
+                border-radius: 3px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        self.rec_count_label.setText("0장")
+        print(f"[수집] 시작 - 저장: {self._rec_output_dir} (입력 기록 활성)")
+
+    def _stop_recording(self):
+        """수집 중지"""
+        self._recording = False
+        if self._rec_timer:
+            self._rec_timer.stop()
+            self._rec_timer = None
+
+        self.btn_rec.setText("Rec")
+        self.btn_rec.setStyleSheet("""
+            QPushButton {
+                background-color: #607D8B;
+                color: white;
+                padding: 3px 8px;
+                border-radius: 3px;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #546E7A; }
+        """)
+        self.rec_count_label.setText("")
+        print(f"[수집] 중지 - 총 {self._rec_count}장 저장됨")
+
+    def _rec_capture_frame(self):
+        """현재 WebView 화면을 이미지로 저장 + 입력 로그 수집"""
+        if not self._recording:
+            return
+        try:
+            pixmap = self.web_view.grab()
+            if pixmap.isNull() or pixmap.width() < 100:
+                return
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = f"frame_{timestamp}.jpg"
+            filepath = os.path.join(self._rec_output_dir, filename)
+            pixmap.save(filepath, "JPEG", 95)
+            self._rec_count += 1
+            self.rec_count_label.setText(f"{self._rec_count}장")
+
+            # JS에서 입력 로그 가져오기 (비동기)
+            import json
+            def _on_input_log(result):
+                if not result:
+                    return
+                try:
+                    events = json.loads(result)
+                    if events:
+                        log_name = f"frame_{timestamp}.json"
+                        log_path = os.path.join(self._rec_output_dir, log_name)
+                        with open(log_path, 'w') as f:
+                            json.dump(events, f)
+                except Exception:
+                    pass
+            self.web_view.page().runJavaScript(self.REC_FLUSH_INPUT_JS, _on_input_log)
+
+        except Exception as e:
+            print(f"[수집] 캡처 오류: {e}")
+
+    def resizeEvent(self, event):
+        """오버레이 크기를 WebView에 맞춤"""
+        super().resizeEvent(event)
+        if hasattr(self, '_loading_overlay') and self._loading_overlay and not self._page_loaded:
+            self._loading_overlay.setGeometry(self.web_view.geometry())
+        if VISION_AVAILABLE and hasattr(self, '_vision_overlay'):
+            self._vision_overlay.setGeometry(self.web_view.geometry())
+        if hasattr(self, '_region_overlay') and self._region_overlay and self._region_overlay.isVisible():
+            self._region_overlay.setGeometry(self.web_view.rect())
 
     def closeEvent(self, event):
         self._stop_game_mode()
+        if self._recording:
+            self._stop_recording()
+        if self.vision_controller:
+            self.vision_controller.cleanup()
         self.hid.disconnect()
         super().closeEvent(event)
+
+
+class VisionSettingsDialog(QDialog):
+    """Vision(YOLO) 설정 다이얼로그"""
+
+    def __init__(self, vision_controller, parent=None):
+        super().__init__(parent)
+        self._vc = vision_controller
+        self.setWindowTitle("Vision (YOLO) 설정")
+        self.setMinimumWidth(400)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 모델 경로
+        group_model = QGroupBox("YOLO 모델")
+        model_layout = QHBoxLayout(group_model)
+        self.model_path_edit = QLineEdit(app_settings.get('vision.model_path', ''))
+        self.model_path_edit.setPlaceholderText("모델 파일 경로 (.pt)")
+        model_layout.addWidget(self.model_path_edit)
+        btn_browse = QPushButton("찾기")
+        btn_browse.clicked.connect(self._browse_model)
+        model_layout.addWidget(btn_browse)
+        btn_load = QPushButton("로드")
+        btn_load.clicked.connect(self._load_model)
+        model_layout.addWidget(btn_load)
+        layout.addWidget(group_model)
+
+        # 추론 설정
+        group_infer = QGroupBox("추론 설정")
+        infer_layout = QVBoxLayout(group_infer)
+
+        # 신뢰도
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel("신뢰도 임계값:"))
+        self.conf_spin = QSpinBox()
+        self.conf_spin.setRange(1, 99)
+        self.conf_spin.setValue(int(app_settings.get('vision.confidence', 0.5) * 100))
+        self.conf_spin.setSuffix("%")
+        conf_row.addWidget(self.conf_spin)
+        infer_layout.addLayout(conf_row)
+
+        # 캡처 FPS
+        fps_row = QHBoxLayout()
+        fps_row.addWidget(QLabel("캡처 FPS:"))
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 30)
+        self.fps_spin.setValue(app_settings.get('vision.capture_fps', 2))
+        fps_row.addWidget(self.fps_spin)
+        infer_layout.addLayout(fps_row)
+
+        # 디바이스
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel("추론 디바이스:"))
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(["auto", "cpu", "cuda"])
+        current_device = app_settings.get('vision.device', 'auto')
+        idx = self.device_combo.findText(current_device)
+        if idx >= 0:
+            self.device_combo.setCurrentIndex(idx)
+        device_row.addWidget(self.device_combo)
+        infer_layout.addLayout(device_row)
+
+        layout.addWidget(group_infer)
+
+        # 기능 토글
+        group_features = QGroupBox("기능")
+        feat_layout = QVBoxLayout(group_features)
+
+        from PyQt6.QtWidgets import QCheckBox
+        self.chk_overlay = QCheckBox("오버레이 표시 (바운딩 박스)")
+        self.chk_overlay.setChecked(app_settings.get('vision.overlay_enabled', True))
+        feat_layout.addWidget(self.chk_overlay)
+
+        self.chk_auto_action = QCheckBox("자동 HID 입력 (규칙 기반)")
+        self.chk_auto_action.setChecked(app_settings.get('vision.auto_action_enabled', False))
+        feat_layout.addWidget(self.chk_auto_action)
+
+        self.chk_log = QCheckBox("감지 로깅")
+        self.chk_log.setChecked(app_settings.get('vision.log_enabled', True))
+        feat_layout.addWidget(self.chk_log)
+
+        layout.addWidget(group_features)
+
+        # 모델 정보
+        if self._vc and self._vc._detector.is_model_loaded:
+            names = self._vc.get_model_names()
+            if names:
+                group_info = QGroupBox(f"모델 클래스 ({len(names)}개)")
+                info_layout = QVBoxLayout(group_info)
+                classes_text = ", ".join(f"{v}" for v in names.values())
+                lbl = QLabel(classes_text)
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+                info_layout.addWidget(lbl)
+                layout.addWidget(group_info)
+
+        # 버튼
+        btn_layout = QHBoxLayout()
+        btn_save = QPushButton("저장")
+        btn_save.clicked.connect(self._save_settings)
+        btn_layout.addWidget(btn_save)
+        btn_cancel = QPushButton("취소")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def _browse_model(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "YOLO 모델 선택", "", "YOLO Model (*.pt *.onnx);;All Files (*)"
+        )
+        if path:
+            self.model_path_edit.setText(path)
+
+    def _load_model(self):
+        path = self.model_path_edit.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Vision", "모델 경로를 입력해주세요.")
+            return
+        if self._vc:
+            self._vc.load_model(path)
+            app_settings.set('vision.model_path', path)
+
+    def _save_settings(self):
+        app_settings.set('vision.model_path', self.model_path_edit.text().strip())
+        app_settings.set('vision.confidence', self.conf_spin.value() / 100.0)
+        app_settings.set('vision.capture_fps', self.fps_spin.value())
+        app_settings.set('vision.device', self.device_combo.currentText())
+        app_settings.set('vision.overlay_enabled', self.chk_overlay.isChecked())
+        app_settings.set('vision.auto_action_enabled', self.chk_auto_action.isChecked())
+        app_settings.set('vision.log_enabled', self.chk_log.isChecked())
+
+        # 실시간 적용
+        if self._vc:
+            self._vc.set_confidence(self.conf_spin.value() / 100.0)
+            self._vc.set_fps(self.fps_spin.value())
+            self._vc.set_overlay_enabled(self.chk_overlay.isChecked())
+            self._vc.set_auto_action(self.chk_auto_action.isChecked())
+            self._vc.set_log_enabled(self.chk_log.isChecked())
+
+        self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -1911,6 +3186,9 @@ class MainWindow(QMainWindow):
         self.status_thread: StatusUpdateThread = None
         self.current_device: KVMDevice = None
         self._initializing = True  # 초기화 중 플래그
+        self._upload_progress = None
+        self._upload_thread = None
+        self._cloud_upload_thread = None
 
         self._init_ui()
         self._create_menus()
@@ -1979,10 +3257,73 @@ class MainWindow(QMainWindow):
         self.device_tree.itemDoubleClicked.connect(self._on_device_double_clicked)
         self.device_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.device_tree.customContextMenuRequested.connect(self._on_device_context_menu)
+
+        # 드래그 앤 드롭 (장치를 그룹 간 이동)
+        self.device_tree.setDragEnabled(True)
+        self.device_tree.setAcceptDrops(True)
+        self.device_tree.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
+        self.device_tree.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # 드롭 완료 후 DB 업데이트를 위해 원본 dropEvent 래핑
+        self._orig_tree_dropEvent = self.device_tree.dropEvent
+        self.device_tree.dropEvent = self._on_tree_drop_event
+
         layout.addWidget(self.device_tree)
 
         self.stats_label = QLabel("전체: 0 | 온라인: 0 | 오프라인: 0")
         layout.addWidget(self.stats_label)
+
+        # ── 장치 기본정보 패널 ──
+        info_group = QGroupBox("장치 정보")
+        info_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 12px; }")
+        info_layout = QVBoxLayout(info_group)
+        info_layout.setContentsMargins(5, 10, 5, 5)
+        info_layout.setSpacing(3)
+
+        self.info_labels = {}
+        for key, label in [("name", "이름"), ("ip", "IP 주소"), ("group", "그룹"),
+                           ("status", "상태"), ("web_port", "웹 포트")]:
+            row = QHBoxLayout()
+            lbl = QLabel(f"{label}:")
+            lbl.setFixedWidth(60)
+            lbl.setStyleSheet("color: #888; font-size: 11px;")
+            val = QLabel("-")
+            val.setStyleSheet("font-size: 11px;")
+            self.info_labels[key] = val
+            row.addWidget(lbl)
+            row.addWidget(val, 1)
+            info_layout.addLayout(row)
+
+        # 제어 버튼
+        btn_layout = QHBoxLayout()
+        self.btn_start_live = QPushButton("실시간 제어")
+        self.btn_start_live.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50; color: white;
+                font-size: 11px; font-weight: bold;
+                padding: 5px 10px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #45a049; }
+            QPushButton:disabled { background-color: #ccc; }
+        """)
+        self.btn_start_live.setEnabled(False)
+        self.btn_start_live.clicked.connect(self._on_start_live_control)
+        btn_layout.addWidget(self.btn_start_live)
+
+        self.btn_open_web = QPushButton("웹 열기")
+        self.btn_open_web.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3; color: white;
+                font-size: 11px; padding: 5px 10px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #1976D2; }
+            QPushButton:disabled { background-color: #ccc; }
+        """)
+        self.btn_open_web.setEnabled(False)
+        self.btn_open_web.clicked.connect(self._on_open_web_browser)
+        btn_layout.addWidget(self.btn_open_web)
+
+        info_layout.addLayout(btn_layout)
+        layout.addWidget(info_group)
 
         return panel
 
@@ -1992,31 +3333,91 @@ class MainWindow(QMainWindow):
 
         self.tab_widget = QTabWidget()
 
-        # 1. 전체 목록 탭 (그리드 뷰)
+        # 1. "전체 목록" 탭 (항상 첫 번째)
         self.grid_view_tab = GridViewTab(self.manager)
         self.grid_view_tab.device_selected.connect(self._on_grid_device_selected)
         self.grid_view_tab.device_double_clicked.connect(self._on_grid_device_double_clicked)
+        self.grid_view_tab.device_right_clicked.connect(self._on_grid_device_right_clicked)
         self.tab_widget.addTab(self.grid_view_tab, "전체 목록")
 
-        # 2. 기기 제어 탭 (실시간 제어 + 개요 + 키보드/마우스 + USB 로그 통합)
-        self.device_control_tab = self._create_device_control_tab()
-        self.tab_widget.addTab(self.device_control_tab, "기기 제어")
-
-        # 3. 일괄 작업 탭
-        self.batch_tab = self._create_batch_tab()
-        self.tab_widget.addTab(self.batch_tab, "일괄 작업")
-
-        # 4. 관리자 탭 (admin 로그인 시에만)
-        from api_client import api_client
-        if api_client.is_admin:
-            self.admin_tab = AdminPanel()
-            self.tab_widget.addTab(self.admin_tab, "관리자")
+        # 2. 그룹별 탭 (옆에 추가)
+        self.group_grid_tabs: dict[str, GridViewTab] = {}
+        self._build_group_tabs()
 
         # 탭 변경 시그널 연결
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         layout.addWidget(self.tab_widget)
         return panel
+
+    def _collect_groups(self) -> dict:
+        """현재 그룹 목록과 장치 수 수집"""
+        groups = {}
+        for device in self.manager.get_all_devices():
+            group = device.info.group or 'default'
+            groups[group] = groups.get(group, 0) + 1
+        # DB에 등록된 빈 그룹도 포함
+        try:
+            db_groups = self.manager.get_groups()
+            for g in db_groups:
+                gn = g['name']
+                if gn not in groups:
+                    groups[gn] = 0
+        except Exception:
+            pass
+        return groups
+
+    def _build_group_tabs(self):
+        """그룹별 탭 초기 생성 (메인 탭 옆에 추가)"""
+        groups = self._collect_groups()
+        for group_name in sorted(groups.keys(), key=lambda x: (x == 'default', x)):
+            self._add_group_tab(group_name, groups[group_name])
+
+    def _add_group_tab(self, group_name: str, device_count: int):
+        """단일 그룹 탭을 메인 탭에 추가"""
+        tab_label = f"{group_name} ({device_count})"
+        group_grid = GridViewTab(self.manager)
+        group_grid.device_selected.connect(self._on_grid_device_selected)
+        group_grid.device_double_clicked.connect(self._on_grid_device_double_clicked)
+        group_grid.device_right_clicked.connect(self._on_grid_device_right_clicked)
+        group_grid._filter_group = group_name
+        self.group_grid_tabs[group_name] = group_grid
+        self.tab_widget.addTab(group_grid, tab_label)
+
+    def refresh_group_tabs(self):
+        """그룹 탭 새로고침 - 기존 탭 유지, 라벨 업데이트, 추가/제거만 처리"""
+        try:
+            groups = self._collect_groups()
+            existing_names = set(self.group_grid_tabs.keys())
+            needed_names = set(groups.keys())
+
+            # 삭제할 그룹 탭
+            for name in existing_names - needed_names:
+                tab = self.group_grid_tabs.pop(name, None)
+                if tab:
+                    idx = self.tab_widget.indexOf(tab)
+                    if idx >= 0:
+                        self.tab_widget.removeTab(idx)
+                    tab.cleanup()
+                    tab.deleteLater()
+
+            # 새로 추가할 그룹 탭
+            for name in needed_names - existing_names:
+                self._add_group_tab(name, groups.get(name, 0))
+
+            # 기존 탭 라벨만 업데이트 (장치 수 반영)
+            for name in needed_names & existing_names:
+                tab = self.group_grid_tabs.get(name)
+                if tab:
+                    idx = self.tab_widget.indexOf(tab)
+                    if idx >= 0:
+                        self.tab_widget.setTabText(idx, f"{name} ({groups.get(name, 0)})")
+
+            # 전체 탭 라벨 업데이트
+            total = len(self.manager.get_all_devices())
+            self.tab_widget.setTabText(0, f"전체 목록 ({total})")
+        except Exception as e:
+            print(f"[MainWindow] refresh_group_tabs 오류: {e}")
 
     def _create_device_control_tab(self) -> QWidget:
         """기기 제어 통합 탭 (실시간 제어 + 장치 정보 + 키보드/마우스 + USB 로그)"""
@@ -2063,9 +3464,7 @@ class MainWindow(QMainWindow):
 
         # === 빠른 작업 버튼 ===
         quick_layout = QHBoxLayout()
-        for text, handler in [("SSH 연결", self._on_connect_device),
-                               ("SSH 해제", self._on_disconnect_device),
-                               ("USB 재연결", self._on_reconnect_usb),
+        for text, handler in [("USB 재연결", self._on_reconnect_usb),
                                ("재부팅", self._on_reboot_device)]:
             btn = QPushButton(text)
             btn.setStyleSheet("padding: 6px 12px;")
@@ -2128,23 +3527,22 @@ class MainWindow(QMainWindow):
         return widget
 
     def _on_tab_changed(self, index):
-        """탭 변경 시 호출"""
+        """메인 탭 변경 시 호출 - 현재 탭만 활성화, 나머지는 pause"""
         try:
-            # 초기화 중에는 탭 변경 무시
             if hasattr(self, '_initializing') and self._initializing:
-                print(f"[MainWindow] _on_tab_changed 무시 (초기화 중)")
                 return
 
             current_widget = self.tab_widget.widget(index)
-            # 전체 목록 탭 활성화
-            if current_widget == self.grid_view_tab:
-                print("[MainWindow] 전체 목록 탭 활성화")
-                self.grid_view_tab.on_tab_activated()
-            else:
-                # 다른 탭으로 이동 시 미리보기 중지
-                print("[MainWindow] 다른 탭으로 이동 - 미리보기 중지")
-                if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
-                    self.grid_view_tab.on_tab_deactivated()
+
+            # 모든 GridViewTab pause (현재 탭 제외)
+            all_tabs = [self.grid_view_tab] + list(self.group_grid_tabs.values())
+            for tab in all_tabs:
+                if tab is not current_widget and tab._is_visible:
+                    tab.on_tab_deactivated()
+
+            # 현재 탭이 GridViewTab이면 활성화
+            if isinstance(current_widget, GridViewTab):
+                current_widget.on_tab_activated()
         except Exception as e:
             print(f"[MainWindow] _on_tab_changed 오류: {e}")
 
@@ -2216,9 +3614,7 @@ class MainWindow(QMainWindow):
         quick_group = QGroupBox("빠른 작업")
         quick_layout = QHBoxLayout(quick_group)
 
-        for text, handler in [("SSH 연결", self._on_connect_device),
-                               ("SSH 해제", self._on_disconnect_device),
-                               ("USB 재연결", self._on_reconnect_usb),
+        for text, handler in [("USB 재연결", self._on_reconnect_usb),
                                ("재부팅", self._on_reboot_device)]:
             btn = QPushButton(text)
             btn.clicked.connect(handler)
@@ -2284,9 +3680,7 @@ class MainWindow(QMainWindow):
         actions_group = QGroupBox("일괄 작업")
         actions_layout = QHBoxLayout(actions_group)
 
-        for text, handler in [("전체 SSH 연결", self._on_connect_all),
-                               ("전체 SSH 해제", self._on_disconnect_all),
-                               ("전체 상태 새로고침", self._on_refresh_all_status)]:
+        for text, handler in [("전체 상태 새로고침", self._on_refresh_all_status)]:
             btn = QPushButton(text)
             btn.clicked.connect(handler)
             actions_layout.addWidget(btn)
@@ -2320,6 +3714,14 @@ class MainWindow(QMainWindow):
         discover_action.triggered.connect(self._on_auto_discover)
         file_menu.addAction(discover_action)
 
+        # 관리자 패널 (admin 로그인 시에만 표시)
+        from api_client import api_client
+        if api_client.is_admin:
+            file_menu.addSeparator()
+            admin_action = QAction("관리자 패널...", self)
+            admin_action.triggered.connect(self._on_open_admin_panel)
+            file_menu.addAction(admin_action)
+
         file_menu.addSeparator()
         exit_action = QAction("종료", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -2327,21 +3729,10 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
         device_menu = menubar.addMenu("장치")
-        live_action = QAction("실시간 제어", self)
-        live_action.setShortcut("Ctrl+L")
-        live_action.triggered.connect(self._on_start_live_control)
-        device_menu.addAction(live_action)
-        device_menu.addSeparator()
-        device_menu.addAction("SSH 연결", self._on_connect_device)
-        device_menu.addAction("SSH 해제", self._on_disconnect_device)
-        device_menu.addSeparator()
         device_menu.addAction("설정", self._on_device_settings)
 
         tools_menu = menubar.addMenu("도구")
         tools_menu.addAction("자동 검색...", self._on_auto_discover)
-        tools_menu.addSeparator()
-        tools_menu.addAction("전체 SSH 연결", self._on_connect_all)
-        tools_menu.addAction("전체 SSH 해제", self._on_disconnect_all)
         tools_menu.addSeparator()
         settings_action = QAction("환경 설정...", self)
         settings_action.setShortcut("Ctrl+,")
@@ -2352,30 +3743,31 @@ class MainWindow(QMainWindow):
         help_menu.addAction("WellcomLAND 정보", self._show_about)
 
     def _create_toolbar(self):
-        toolbar = QToolBar()
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-        toolbar.addAction("장치 추가", self._on_add_device)
-        toolbar.addAction("자동 검색", self._on_auto_discover)
-        toolbar.addSeparator()
-        toolbar.addAction("실시간 제어", self._on_start_live_control)
-        toolbar.addSeparator()
-        toolbar.addAction("전체 연결", self._on_connect_all)
-        toolbar.addAction("새로고침", self._on_refresh_all_status)
+        pass  # 메뉴에 통합됨
 
     def _load_devices_from_source(self):
-        """서버 또는 로컬 DB에서 기기 목록 로드"""
+        """서버 + 로컬 DB에서 기기 목록 로드
+
+        서버 기기를 먼저 로드하고, 로컬 DB에만 있는 기기도 추가.
+        (로컬에서 수동 추가한 기기가 사라지지 않도록)
+        """
+        # 항상 로컬 DB를 먼저 로드
+        self.manager.load_devices_from_db()
+        local_count = len(self.manager.devices)
+
+        # 서버 기기를 병합 (로컬 기기를 덮어쓰지 않음)
         try:
             from api_client import api_client
             if api_client.is_logged_in:
                 devices = api_client.get_my_devices()
-                self.manager.load_devices_from_server(devices)
-                print(f"[MainWindow] 서버에서 {len(devices)}개 기기 로드")
-                return
+                if devices:
+                    self.manager.merge_devices_from_server(devices)
+                    print(f"[MainWindow] 서버에서 {len(devices)}개 기기 병합 (로컬 {local_count}개 유지)")
+                    return
         except Exception as e:
-            print(f"[MainWindow] 서버 기기 로드 실패, 로컬 DB 사용: {e}")
-        # 폴백: 로컬 DB
-        self.manager.load_devices_from_db()
+            print(f"[MainWindow] 서버 기기 로드 실패, 로컬 DB만 사용: {e}")
+
+        print(f"[MainWindow] 로컬 DB에서 {local_count}개 기기 로드")
 
     def _create_statusbar(self):
         self.status_bar = QStatusBar()
@@ -2383,15 +3775,15 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("준비됨")
 
         # 버전 정보 (상태바 우측 고정)
-        from version import __version__
+        from version import __version__, __app_name__
         from api_client import api_client
         user_info = ""
         if api_client.user:
             name = api_client.user.get('display_name') or api_client.user.get('username', '')
             role = "관리자" if api_client.is_admin else "사용자"
             user_info = f"  |  {name} ({role})"
-        version_label = QLabel(f"v{__version__}{user_info}")
-        version_label.setStyleSheet("color: #666; padding-right: 10px; font-size: 12px;")
+        version_label = QLabel(f"{__app_name__} v{__version__}{user_info}")
+        version_label.setStyleSheet("color: #888; padding-right: 10px; font-size: 12px; font-weight: bold;")
         self.status_bar.addPermanentWidget(version_label)
 
     def _initial_status_check(self):
@@ -2470,15 +3862,29 @@ class MainWindow(QMainWindow):
 
         groups = {}
         for device in self.manager.get_all_devices():
-            group = device.info.group
+            group = device.info.group or 'default'
             if group not in groups:
                 groups[group] = []
             groups[group].append(device)
 
         item_to_select = None
 
-        for group_name, devices in groups.items():
+        # DB에 등록된 그룹 중 장치가 없는 빈 그룹도 표시
+        try:
+            db_groups = self.manager.get_groups()
+            for g in db_groups:
+                gn = g['name']
+                if gn not in groups:
+                    groups[gn] = []
+        except Exception:
+            pass
+
+        for group_name, devices in sorted(groups.items(), key=lambda x: (x[0] != 'default', x[0])):
             group_item = QTreeWidgetItem([group_name, f"({len(devices)}개)"])
+            # 그룹은 드래그 불가, 드롭 수신만 가능
+            group_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDropEnabled
+            )
             self.device_tree.addTopLevelItem(group_item)
 
             # 확장 상태 복원 (첫 로드시 또는 이전에 확장되어 있었던 경우)
@@ -2489,6 +3895,10 @@ class MainWindow(QMainWindow):
                 status_text = "온라인" if device.status == DeviceStatus.ONLINE else "오프라인"
                 device_item = QTreeWidgetItem([device.name, status_text])
                 device_item.setData(0, Qt.ItemDataRole.UserRole, device.name)
+                # 장치는 드래그 가능, 드롭 수신 불가
+                device_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
+                )
                 self._update_device_item_color(device_item, device.status)
                 group_item.addChild(device_item)
 
@@ -2504,6 +3914,10 @@ class MainWindow(QMainWindow):
             self.device_tree.setCurrentItem(item_to_select)
 
         self._update_statistics()
+
+        # 그룹 탭 갱신
+        if hasattr(self, 'group_grid_tabs'):
+            self.refresh_group_tabs()
 
     def _update_device_item_color(self, item: QTreeWidgetItem, status: DeviceStatus):
         colors = {DeviceStatus.ONLINE: "green", DeviceStatus.OFFLINE: "red"}
@@ -2535,23 +3949,54 @@ class MainWindow(QMainWindow):
         self.grid_view_tab.update_device_status()
 
     def _on_grid_device_selected(self, device: KVMDevice):
-        """그리드 뷰에서 장치 클릭 - 선택만 (탭 이동 없음)"""
+        """그리드 뷰에서 장치 클릭 - 선택만"""
         self.current_device = device
         self._update_device_info()
-        self.control_panel.set_device(device)
 
     def _on_grid_device_double_clicked(self, device: KVMDevice):
         """그리드 뷰에서 장치 더블클릭 - 실시간 제어 창 열기"""
         self.current_device = device
         self._on_start_live_control()
 
+    def _on_grid_device_right_clicked(self, device, pos):
+        """그리드 뷰에서 장치 우클릭 - 컨텍스트 메뉴"""
+        self.current_device = device
+        self._update_device_info()
+
+        menu = QMenu(self)
+        menu.addAction("실시간 제어", self._on_start_live_control)
+        menu.addAction("브라우저에서 열기", self._on_open_web_browser)
+        menu.addAction("파일 전송", self._on_file_transfer)
+        menu.addSeparator()
+
+        # 그룹 이동 서브메뉴
+        move_menu = menu.addMenu("그룹 이동")
+        groups = self.manager.get_groups()
+        all_group_names = set()
+        for g in groups:
+            all_group_names.add(g['name'])
+        for d in self.manager.get_all_devices():
+            gn = d.info.group or 'default'
+            all_group_names.add(gn)
+        current_group = device.info.group if device else ''
+        for gn in sorted(all_group_names):
+            action = move_menu.addAction(gn)
+            if gn == current_group:
+                action.setEnabled(False)
+            else:
+                action.triggered.connect(lambda checked, g=gn: self._on_move_device_to_group(g))
+
+        menu.addAction("이름 변경", self._on_rename_device)
+        menu.addAction("설정", self._on_device_settings)
+        menu.addSeparator()
+        menu.addAction("삭제", self._on_delete_device)
+        menu.exec(pos)
+
     def _on_device_selected(self, item: QTreeWidgetItem, column: int):
         device_name = item.data(0, Qt.ItemDataRole.UserRole)
         if device_name:
             self.current_device = self.manager.get_device(device_name)
             self._update_device_info()
-            self._update_live_tab()
-            self.control_panel.set_device(self.current_device)
 
     def _on_device_double_clicked(self, item: QTreeWidgetItem, column: int):
         device_name = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2559,50 +4004,246 @@ class MainWindow(QMainWindow):
             self.current_device = self.manager.get_device(device_name)
             self._on_start_live_control()
 
-    def _update_live_tab(self):
-        if self.current_device:
-            self.live_device_label.setText(f"선택된 장치: {self.current_device.name} ({self.current_device.ip})")
-            self.btn_start_live.setEnabled(True)
-            self.btn_open_web.setEnabled(True)
-        else:
-            self.live_device_label.setText("선택된 장치: 없음")
-            self.btn_start_live.setEnabled(False)
-            self.btn_open_web.setEnabled(False)
-
     def _update_device_info(self):
+        """왼쪽 패널 장치 기본정보 업데이트"""
         if not self.current_device:
             return
         device = self.current_device
-        self.info_table.item(0, 1).setText(device.name)
-        self.info_table.item(1, 1).setText(device.ip)
-        self.info_table.item(2, 1).setText("온라인" if device.status == DeviceStatus.ONLINE else "오프라인")
-        self.info_table.item(3, 1).setText("정상" if device.usb_status == USBStatus.CONNECTED else "연결 끊김")
-        self.info_table.item(4, 1).setText(device.system_version or "-")
-
-        if device.is_connected():
-            info = device.get_system_info()
-            self.info_table.item(5, 1).setText(info.get('uptime', '-'))
-            temp = info.get('temperature', 0)
-            self.info_table.item(6, 1).setText(f"{temp:.1f}°C" if temp else "-")
-            mem_used, mem_total = info.get('memory_used', 0), info.get('memory_total', 0)
-            self.info_table.item(7, 1).setText(f"{mem_used}/{mem_total} MB" if mem_total else "-")
+        self.info_labels["name"].setText(device.name)
+        self.info_labels["ip"].setText(device.ip)
+        self.info_labels["group"].setText(device.info.group or "default")
+        status_text = "🟢 온라인" if device.status == DeviceStatus.ONLINE else "🔴 오프라인"
+        self.info_labels["status"].setText(status_text)
+        self.info_labels["web_port"].setText(str(device.info.web_port or 80))
+        self.btn_start_live.setEnabled(True)
+        self.btn_open_web.setEnabled(True)
 
     def _on_device_context_menu(self, pos):
         item = self.device_tree.itemAt(pos)
-        if not item or not item.data(0, Qt.ItemDataRole.UserRole):
+        menu = QMenu()
+
+        if not item:
+            # 빈 영역 우클릭 → 그룹 추가만
+            menu.addAction("그룹 추가", self._on_add_group)
+            menu.exec(self.device_tree.mapToGlobal(pos))
             return
 
-        menu = QMenu()
-        menu.addAction("실시간 제어", self._on_start_live_control)
-        menu.addAction("브라우저에서 열기", self._on_open_web_browser)
-        menu.addSeparator()
-        menu.addAction("SSH 연결", self._on_connect_device)
-        menu.addAction("SSH 해제", self._on_disconnect_device)
-        menu.addSeparator()
-        menu.addAction("설정", self._on_device_settings)
-        menu.addSeparator()
-        menu.addAction("삭제", self._on_delete_device)
+        device_name = item.data(0, Qt.ItemDataRole.UserRole)
+
+        if not device_name:
+            # 그룹 항목 우클릭
+            group_name = item.text(0)
+            menu.addAction("그룹 추가", self._on_add_group)
+            if group_name != 'default':
+                menu.addAction("그룹 이름 변경", lambda: self._on_rename_group(item))
+                menu.addAction("그룹 삭제", lambda: self._on_delete_group(group_name))
+        else:
+            # 장치 항목 우클릭
+            menu.addAction("실시간 제어", self._on_start_live_control)
+            menu.addAction("브라우저에서 열기", self._on_open_web_browser)
+            menu.addAction("파일 전송", self._on_file_transfer)
+            menu.addSeparator()
+
+            # 그룹 이동 서브메뉴
+            move_menu = menu.addMenu("그룹 이동")
+            groups = self.manager.get_groups()
+            # DB 그룹 + 현재 사용중인 그룹 합치기
+            all_group_names = set()
+            for g in groups:
+                all_group_names.add(g['name'])
+            for d in self.manager.get_all_devices():
+                gn = d.info.group or 'default'
+                all_group_names.add(gn)
+            current_group = self.current_device.info.group if self.current_device else ''
+            for gn in sorted(all_group_names):
+                action = move_menu.addAction(gn)
+                if gn == current_group:
+                    action.setEnabled(False)  # 현재 그룹은 비활성
+                else:
+                    action.triggered.connect(lambda checked, g=gn: self._on_move_device_to_group(g))
+
+            menu.addAction("이름 변경", self._on_rename_device)
+            menu.addAction("설정", self._on_device_settings)
+            menu.addSeparator()
+            menu.addAction("삭제", self._on_delete_device)
+
         menu.exec(self.device_tree.mapToGlobal(pos))
+
+    # ===== 그룹 관리 =====
+
+    def _on_add_group(self):
+        """그룹 추가"""
+        name, ok = QInputDialog.getText(self, "그룹 추가", "새 그룹 이름:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        try:
+            self.manager.add_group(name)
+            self._load_device_list()
+            self.status_bar.showMessage(f"그룹 '{name}' 추가됨")
+        except Exception as e:
+            QMessageBox.warning(self, "오류", f"그룹 추가 실패: {e}")
+
+    def _on_rename_group(self, item):
+        """그룹 이름 변경"""
+        old_name = item.text(0)
+        new_name, ok = QInputDialog.getText(
+            self, "그룹 이름 변경",
+            f"'{old_name}' 의 새 이름:",
+            QLineEdit.EchoMode.Normal,
+            old_name
+        )
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+        new_name = new_name.strip()
+
+        try:
+            # 1) 새 그룹 추가
+            try:
+                self.manager.add_group(new_name)
+            except Exception:
+                pass
+
+            # 2) 해당 그룹의 모든 장치 → 새 그룹으로 이동
+            for device in self.manager.get_all_devices():
+                if device.info.group == old_name:
+                    self.manager.move_device_to_group(device.name, new_name)
+
+            # 3) 이전 그룹 삭제 (장치는 이미 이동했으므로 안전)
+            self.manager.db.delete_group(old_name)
+
+            self._load_device_list()
+            if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+                self.grid_view_tab.load_devices()
+            self.status_bar.showMessage(f"그룹 이름 변경: {old_name} → {new_name}")
+        except Exception as e:
+            QMessageBox.warning(self, "오류", f"그룹 이름 변경 실패: {e}")
+
+    def _on_delete_group(self, group_name: str):
+        """그룹 삭제 (장치가 있으면 차단)"""
+        device_count = len(self.manager.get_devices_by_group(group_name))
+
+        if device_count > 0:
+            QMessageBox.warning(
+                self, "그룹 삭제 불가",
+                f"'{group_name}' 그룹에 {device_count}개 장치가 있습니다.\n"
+                f"장치를 다른 그룹으로 이동한 후 삭제해주세요.\n\n"
+                f"(장치 우클릭 → '그룹 이동' 또는 드래그 앤 드롭)"
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "그룹 삭제",
+            f"'{group_name}' 그룹을 삭제하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            self.manager.delete_group(group_name)
+            self._load_device_list()
+            if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+                self.grid_view_tab.load_devices()
+            self.status_bar.showMessage(f"그룹 '{group_name}' 삭제됨")
+        except Exception as e:
+            QMessageBox.warning(self, "오류", f"그룹 삭제 실패: {e}")
+
+    def _on_move_device_to_group(self, group_name: str):
+        """장치를 다른 그룹으로 이동 (우클릭 메뉴)"""
+        if not self.current_device:
+            return
+        self.manager.move_device_to_group(self.current_device.name, group_name)
+        self._load_device_list()
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            self.grid_view_tab.load_devices()
+        self.status_bar.showMessage(
+            f"'{self.current_device.name}' → '{group_name}' 그룹으로 이동"
+        )
+
+    def _on_tree_drop_event(self, event):
+        """드래그 앤 드롭으로 장치 그룹 이동"""
+        # 드래그 중인 아이템 정보 저장
+        dragged_item = self.device_tree.currentItem()
+        if not dragged_item:
+            event.ignore()
+            return
+
+        device_name = dragged_item.data(0, Qt.ItemDataRole.UserRole)
+        if not device_name:
+            # 그룹 아이템은 드래그 금지
+            event.ignore()
+            return
+
+        # 드롭 대상 아이템
+        target_item = self.device_tree.itemAt(event.position().toPoint())
+        if not target_item:
+            event.ignore()
+            return
+
+        # 대상이 그룹인지 확인 (UserRole 데이터가 없으면 그룹)
+        target_device = target_item.data(0, Qt.ItemDataRole.UserRole)
+        if target_device:
+            # 장치 위에 드롭 → 그 장치의 부모(그룹)으로 이동
+            parent = target_item.parent()
+            if parent:
+                target_group = parent.text(0)
+            else:
+                event.ignore()
+                return
+        else:
+            # 그룹 위에 드롭
+            target_group = target_item.text(0)
+
+        # 현재 그룹과 같으면 무시
+        device = self.manager.get_device(device_name)
+        if not device or device.info.group == target_group:
+            event.ignore()
+            return
+
+        # DB + 메모리 업데이트
+        self.manager.move_device_to_group(device_name, target_group)
+
+        # 기본 dropEvent 호출하지 않고 직접 리로드 (트리 구조 일관성 유지)
+        event.ignore()
+        self._load_device_list()
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            self.grid_view_tab.load_devices()
+        self.status_bar.showMessage(f"'{device_name}' → '{target_group}' 그룹으로 이동")
+
+    # ===== 장치 관리 =====
+
+    def _on_rename_device(self):
+        """장치 이름 변경"""
+        if not self.current_device:
+            return
+
+        old_name = self.current_device.name
+        new_name, ok = QInputDialog.getText(
+            self, "이름 변경",
+            f"'{old_name}' 의 새 이름을 입력하세요:",
+            QLineEdit.EchoMode.Normal,
+            old_name
+        )
+
+        if not ok or not new_name.strip():
+            return
+
+        new_name = new_name.strip()
+        if new_name == old_name:
+            return
+
+        # 이름 변경 실행
+        if self.manager.rename_device(old_name, new_name):
+            # 장치 목록 새로고침
+            self._load_device_list()
+            # 그리드 뷰 새로고침 (이름 라벨 업데이트)
+            if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+                self.grid_view_tab.load_devices()
+            self.status_bar.showMessage(f"이름 변경: {old_name} → {new_name}")
+        else:
+            QMessageBox.warning(self, "이름 변경 실패",
+                                f"'{new_name}' 이름이 이미 존재하거나 변경에 실패했습니다.")
 
     def _on_start_live_control(self):
         if not self.current_device:
@@ -2612,7 +4253,12 @@ class MainWindow(QMainWindow):
         # 1:1 제어 시작 전: 해당 장치의 미리보기 중지
         self._stop_device_preview(self.current_device)
 
+        # 즉시 커서 변경으로 피드백 제공
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+
         dialog = LiveViewDialog(self.current_device, self)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         dialog.exec()
 
         # 1:1 제어 종료 후: 해당 장치의 미리보기 재시작
@@ -2643,6 +4289,136 @@ class MainWindow(QMainWindow):
         web_port = getattr(self.current_device.info, 'web_port', 80)
         QDesktopServices.openUrl(QUrl(f"http://{self.current_device.ip}:{web_port}"))
 
+    def _on_file_transfer(self):
+        """파일 전송: SFTP(KVM) 또는 클라우드 업로드 선택"""
+        if not self.current_device:
+            return
+
+        from api_client import api_client
+
+        methods = ["KVM 직접 전송 (SFTP)"]
+        if api_client.is_logged_in:
+            try:
+                quota_info = api_client.get_quota()
+                if quota_info.get('quota') != 0:
+                    methods.append("클라우드 업로드")
+            except Exception:
+                methods.append("클라우드 업로드")
+
+        if len(methods) == 1:
+            method = methods[0]
+        else:
+            method, ok = QInputDialog.getItem(
+                self, "파일 전송", "전송 방식 선택:", methods, 0, False
+            )
+            if not ok:
+                return
+
+        from PyQt6.QtWidgets import QFileDialog, QProgressDialog
+        path, _ = QFileDialog.getOpenFileName(self, "전송할 파일 선택", "", "All Files (*)")
+        if not path:
+            return
+
+        import os
+        filename = os.path.basename(path)
+
+        if method == "클라우드 업로드":
+            # 쿼타 사전 체크
+            try:
+                qi = api_client.get_quota()
+                q = qi.get('quota')
+                file_size = os.path.getsize(path)
+                if q == 0:
+                    QMessageBox.warning(self, "클라우드 업로드", "클라우드 저장소 접근 권한이 없습니다.")
+                    return
+                if q is not None:
+                    remaining = qi.get('remaining', 0)
+                    if file_size > remaining:
+                        QMessageBox.warning(
+                            self, "클라우드 업로드",
+                            f"저장 용량이 부족합니다.\n"
+                            f"파일 크기: {file_size // (1024*1024)}MB\n"
+                            f"남은 용량: {remaining // (1024*1024)}MB"
+                        )
+                        return
+            except Exception:
+                pass  # 서버에서 최종 체크
+
+            # 클라우드 업로드
+            self._upload_progress = QProgressDialog(f"{filename}\n클라우드 업로드 중...", None, 0, 0, self)
+            self._upload_progress.setWindowTitle("클라우드 업로드")
+            self._upload_progress.setMinimumWidth(400)
+            self._upload_progress.setModal(True)
+            self._upload_progress.setAutoClose(False)
+            self._upload_progress.setAutoReset(False)
+            self._upload_progress.show()
+
+            self._cloud_upload_thread = CloudUploadThread(path)
+            self._cloud_upload_thread.finished_ok.connect(self._on_cloud_upload_done)
+            self._cloud_upload_thread.finished_err.connect(self._on_cloud_upload_error)
+            self._cloud_upload_thread.start()
+        else:
+            # 기존 SFTP 전송
+            remote_path = f"/tmp/{filename}"
+            self._upload_progress = QProgressDialog(f"{filename}\nSSH 연결 중...", None, 0, 100, self)
+            self._upload_progress.setWindowTitle(f"파일 전송 - {self.current_device.name}")
+            self._upload_progress.setMinimumWidth(400)
+            self._upload_progress.setModal(True)
+            self._upload_progress.setAutoClose(False)
+            self._upload_progress.setAutoReset(False)
+            self._upload_progress.setValue(0)
+            self._upload_progress.show()
+
+            self._upload_thread = SFTPUploadThread(self.current_device, path, remote_path)
+            self._upload_thread.progress.connect(self._on_upload_progress)
+            self._upload_thread.finished_ok.connect(self._on_upload_done)
+            self._upload_thread.finished_err.connect(self._on_upload_error)
+            self._upload_thread.start()
+
+    def _on_upload_progress(self, pct, txt):
+        try:
+            if self._upload_progress and self._upload_progress.isVisible():
+                self._upload_progress.setValue(pct)
+                self._upload_progress.setLabelText(txt)
+        except Exception:
+            pass
+
+    def _on_upload_done(self, msg):
+        try:
+            if self._upload_progress:
+                self._upload_progress.close()
+                self._upload_progress = None
+        except Exception:
+            pass
+        QMessageBox.information(self, "전송 완료", msg)
+
+    def _on_upload_error(self, msg):
+        try:
+            if self._upload_progress:
+                self._upload_progress.close()
+                self._upload_progress = None
+        except Exception:
+            pass
+        QMessageBox.warning(self, "전송 실패", msg)
+
+    def _on_cloud_upload_done(self, msg):
+        try:
+            if self._upload_progress:
+                self._upload_progress.close()
+                self._upload_progress = None
+        except Exception:
+            pass
+        QMessageBox.information(self, "클라우드 업로드", msg)
+
+    def _on_cloud_upload_error(self, msg):
+        try:
+            if self._upload_progress:
+                self._upload_progress.close()
+                self._upload_progress = None
+        except Exception:
+            pass
+        QMessageBox.warning(self, "클라우드 업로드 실패", f"업로드 실패:\n{msg}")
+
     def _on_add_device(self):
         dialog = AddDeviceDialog(self)
         if dialog.exec():
@@ -2657,8 +4433,9 @@ class MainWindow(QMainWindow):
 
     def _on_auto_discover(self):
         """자동 검색 다이얼로그 열기"""
-        # 기존 장치 IP 목록
+        # 기존 장치 IP 및 이름 목록
         existing_ips = [d.ip for d in self.manager.get_all_devices()]
+        existing_names = set(d.name for d in self.manager.get_all_devices())
 
         dialog = AutoDiscoveryDialog(existing_ips, self)
         if dialog.exec():
@@ -2670,14 +4447,22 @@ class MainWindow(QMainWindow):
             skipped_count = 0
 
             for device in selected:
-                # 이미 존재하는지 확인
+                # 이미 존재하는지 확인 (IP 또는 이름)
                 if device.ip in existing_ips:
                     skipped_count += 1
                     continue
 
+                # 이름 중복 시 자동으로 번호 부여
+                name = device.name
+                if name in existing_names:
+                    suffix = 2
+                    while f"{name}_{suffix}" in existing_names:
+                        suffix += 1
+                    name = f"{name}_{suffix}"
+
                 try:
                     self.manager.add_device(
-                        name=device.name,
+                        name=name,
                         ip=device.ip,
                         port=22,  # SSH 기본 포트
                         web_port=device.port,
@@ -2687,12 +4472,14 @@ class MainWindow(QMainWindow):
                     )
                     added_count += 1
                     existing_ips.append(device.ip)
+                    existing_names.add(name)
                 except Exception as e:
                     print(f"장치 추가 실패 ({device.ip}): {e}")
 
             # UI 새로고침
             self._load_device_list()
-            self.grid_view_tab.load_devices()
+            if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+                self.grid_view_tab.load_devices()
 
             # 결과 메시지
             msg = f"{added_count}개 장치 추가됨"
@@ -2754,7 +4541,7 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"{self.current_device.name} USB 재연결됨")
 
     def _on_refresh_usb_log(self):
-        if self.current_device:
+        if self.current_device and hasattr(self, 'usb_log_text'):
             if not self.current_device.is_connected():
                 self.current_device.connect()
             self.usb_log_text.setText(self.current_device.get_dmesg_usb(50))
@@ -2818,6 +4605,27 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[MainWindow] 새로고침 오류: {e}")
             self.status_bar.showMessage("새로고침 오류")
+
+    def _on_open_admin_panel(self):
+        """관리자 패널 다이얼로그 열기"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("관리자 패널")
+        dialog.setMinimumSize(900, 600)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        admin_panel = AdminPanel()
+        # 기기 변경 시 메인 윈도우 UI 갱신
+        admin_panel.device_changed.connect(self._on_admin_device_changed)
+        layout.addWidget(admin_panel)
+        dialog.exec()
+
+    def _on_admin_device_changed(self):
+        """관리자 패널에서 기기 변경 시 메인 UI 갱신"""
+        # 서버에서 최신 기기 목록 다시 로드
+        self._load_devices_from_source()
+        self._load_device_list()
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            self.grid_view_tab.load_devices()
 
     def _on_app_settings(self):
         """환경 설정 다이얼로그 열기"""

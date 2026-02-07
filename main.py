@@ -120,11 +120,27 @@ def check_for_updates(app: QApplication) -> bool:
 def _restart_application():
     """프로그램 재시작"""
     import subprocess
+
+    # 1) 런처가 설정한 EXE 경로 (가장 신뢰)
+    exe_path = os.environ.get('WELLCOMLAND_EXE_PATH')
+    if exe_path and os.path.exists(exe_path):
+        print(f"[Restart] EXE 경로: {exe_path}")
+        subprocess.Popen([exe_path])
+        sys.exit(0)
+
+    # 2) 설치 디렉터리 기준 EXE
+    base_dir = os.environ.get('WELLCOMLAND_BASE_DIR')
+    if base_dir:
+        candidate = os.path.join(base_dir, 'WellcomLAND.exe')
+        if os.path.exists(candidate):
+            print(f"[Restart] BASE_DIR 기준: {candidate}")
+            subprocess.Popen([candidate])
+            sys.exit(0)
+
+    # 3) Fallback
     if getattr(sys, 'frozen', False):
-        # EXE 환경: WellcomLAND.exe 재실행
         subprocess.Popen([sys.executable])
     else:
-        # 개발환경: python main.py 재실행
         subprocess.Popen([sys.executable] + sys.argv)
     sys.exit(0)
 

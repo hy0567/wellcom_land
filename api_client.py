@@ -88,6 +88,55 @@ class APIClient:
         """내게 할당된 기기 목록"""
         return self._get('/api/devices')
 
+    # === Device Sync (로컬 → 서버) ===
+    def sync_device_to_server(self, device_data: dict) -> Optional[dict]:
+        """로컬 기기를 서버에 동기화 (admin 전용)
+        이미 존재하면 스킵, 없으면 추가
+        """
+        if not self.is_admin:
+            return None
+        try:
+            return self._post('/api/admin/devices', device_data)
+        except requests.exceptions.HTTPError as e:
+            # 409 Conflict = 이미 존재 → 무시
+            if e.response is not None and e.response.status_code == 409:
+                return None
+            raise
+
+    def sync_devices_to_server(self, devices: list) -> dict:
+        """여러 기기를 서버에 일괄 동기화
+        Returns: {'synced': int, 'skipped': int, 'failed': int}
+        """
+        result = {'synced': 0, 'skipped': 0, 'failed': 0}
+        if not self.is_admin:
+            return result
+
+        # 서버에 이미 있는 기기 IP 목록
+        try:
+            existing = self.admin_get_all_devices()
+            existing_ips = {d['ip'] for d in existing}
+            existing_names = {d['name'] for d in existing}
+        except Exception:
+            existing_ips = set()
+            existing_names = set()
+
+        for dev in devices:
+            ip = dev.get('ip', '')
+            name = dev.get('name', '')
+            if ip in existing_ips or name in existing_names:
+                result['skipped'] += 1
+                continue
+            try:
+                self.sync_device_to_server(dev)
+                result['synced'] += 1
+                existing_ips.add(ip)
+                existing_names.add(name)
+            except Exception as e:
+                print(f"[Sync] 기기 동기화 실패 ({name}/{ip}): {e}")
+                result['failed'] += 1
+
+        return result
+
     # === Admin: Devices ===
     def admin_get_all_devices(self) -> list:
         return self._get('/api/admin/devices')
@@ -130,6 +179,61 @@ class APIClient:
 
     def admin_create_group(self, data: dict) -> dict:
         return self._post('/api/admin/groups', data)
+
+    # === Files (Cloud Drive) ===
+    def upload_file(self, filepath: str, progress_callback=None) -> dict:
+        """파일 업로드 (multipart) — 쿼타 사전 체크 포함"""
+        import os
+        h = {}
+        if self._token:
+            h['Authorization'] = f'Bearer {self._token}'
+
+        filename = os.path.basename(filepath)
+        file_size = os.path.getsize(filepath)
+
+        # 쿼타 사전 체크
+        try:
+            quota_info = self.get_quota()
+            q = quota_info.get('quota')
+            if q == 0:
+                raise Exception("클라우드 저장소 접근 권한이 없습니다")
+            if q is not None:
+                remaining = quota_info.get('remaining', 0)
+                if file_size > remaining:
+                    raise Exception(
+                        f"클라우드 저장 용량 초과\n"
+                        f"파일 크기: {file_size // (1024*1024)}MB\n"
+                        f"남은 용량: {remaining // (1024*1024)}MB"
+                    )
+        except requests.exceptions.HTTPError:
+            pass  # 쿼타 API 실패 시 서버에서 최종 체크
+
+        with open(filepath, 'rb') as f:
+            files = {'file': (filename, f, 'application/octet-stream')}
+            r = requests.post(
+                f'{self._base_url}/api/files/upload',
+                headers=h,
+                files=files,
+                timeout=300,
+            )
+        r.raise_for_status()
+        return r.json()
+
+    def get_files(self) -> list:
+        """내 파일 목록"""
+        return self._get('/api/files')
+
+    def get_file_download_url(self, file_id: int) -> str:
+        """파일 다운로드 URL (토큰 포함)"""
+        return f'{self._base_url}/api/files/{file_id}/download'
+
+    def delete_file(self, file_id: int) -> dict:
+        """파일 삭제"""
+        return self._delete(f'/api/files/{file_id}')
+
+    def get_quota(self) -> dict:
+        """내 클라우드 쿼타 조회"""
+        return self._get('/api/files/quota')
 
     # === Version ===
     def get_server_version(self) -> dict:

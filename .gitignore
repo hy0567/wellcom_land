@@ -3,7 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+
+# Build output
 dist/
+dist2/
 build/work/
 
 # Virtual Environment
@@ -17,16 +20,28 @@ venv/
 *.swo
 
 # Data (사용자 데이터는 git에 포함하지 않음)
-data/settings.json
+data/
+dataset/
+runs/
+
+# Model weights
+*.pt
 
 # OS
 Thumbs.db
 .DS_Store
+nul
 
 # Temp
 temp/
 logs/
 backup/
+
+# Large binary files (root)
+wellcom.ico
+
+# App runtime (EXE에서 생성)
+app/
 
 # Claude
 .claude/

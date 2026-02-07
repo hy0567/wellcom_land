@@ -44,6 +44,19 @@ APP_FILES = [
     'updater/update_checker.py',
     'updater/update_dialog.py',
     'updater/file_manager.py',
+    'vision/__init__.py',
+    'vision/frame_capture.py',
+    'vision/detector.py',
+    'vision/overlay_widget.py',
+    'vision/action_dispatcher.py',
+    'vision/logger.py',
+    'vision/vision_controller.py',
+    'vision/training/__init__.py',
+    'vision/training/prepare_dataset.py',
+    'vision/training/train.py',
+    'vision/training/capture_dataset.py',
+    'vision/training/auto_label.py',
+    'vision/training/labeler.py',
 ]
 
 
