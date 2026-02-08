@@ -3,15 +3,16 @@ KVM Relay — 관제 PC에서 로컬 KVM을 ZeroTier로 중계
 
 관제 PC가 로컬 네트워크의 KVM을 발견하면:
 1. 각 KVM에 대해 TCP 프록시 포트를 열어줌 (ZT_IP:18xxx → KVM_IP:80)
-2. 서버에 등록하여 원격 PC(admin)가 접근 가능하게 함
-3. 주기적으로 heartbeat 전송
+2. 각 KVM에 대해 UDP 릴레이 포트를 열어줌 (WebRTC 미디어용)
+3. 서버에 등록하여 원격 PC(admin)가 접근 가능하게 함
+4. 주기적으로 heartbeat 전송
 """
 
 import socket
 import threading
 import time
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -142,14 +143,101 @@ class TCPProxy:
                 pass
 
 
+class UDPRelay:
+    """WebRTC 미디어용 UDP 릴레이 (ZT → 로컬 KVM)
+
+    WebRTC는 DTLS/SRTP를 UDP로 전송.
+    원격 클라이언트가 relay_ip:udp_port 로 보내면 → kvm_ip:kvm_udp_port 로 전달.
+    KVM이 응답하면 → 원격 클라이언트에게 그대로 전달.
+    """
+
+    def __init__(self, listen_port: int, target_ip: str):
+        self.listen_port = listen_port
+        self.target_ip = target_ip
+        # KVM의 실제 UDP 포트는 ICE candidate에서 동적으로 결정됨
+        self._target_port: Optional[int] = None
+        self._sock: Optional[socket.socket] = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        # 원격 클라이언트 주소 (첫 패킷에서 학습)
+        self._remote_addr: Optional[Tuple[str, int]] = None
+
+    def start(self) -> bool:
+        """UDP 릴레이 시작"""
+        if self._running:
+            return True
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(('0.0.0.0', self.listen_port))
+            self._sock.settimeout(1.0)
+            self._running = True
+            self._thread = threading.Thread(target=self._relay_loop, daemon=True)
+            self._thread.start()
+            logger.info(f"[UDPRelay] :{self.listen_port} → {self.target_ip} (UDP)")
+            return True
+        except Exception as e:
+            logger.error(f"[UDPRelay] 포트 {self.listen_port} 바인드 실패: {e}")
+            self._running = False
+            return False
+
+    def set_target_port(self, port: int):
+        """KVM의 실제 WebRTC UDP 포트 설정 (ICE candidate에서 추출)"""
+        if self._target_port != port:
+            self._target_port = port
+            logger.info(f"[UDPRelay] 타겟 포트 설정: {self.target_ip}:{port}")
+
+    def stop(self):
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    def _relay_loop(self):
+        """양방향 UDP 릴레이 루프"""
+        while self._running:
+            try:
+                data, addr = self._sock.recvfrom(65536)
+                if not data:
+                    continue
+
+                # KVM에서 온 패킷인지 원격 클라이언트에서 온 패킷인지 판별
+                if addr[0] == self.target_ip:
+                    # KVM → 원격 클라이언트
+                    if self._remote_addr:
+                        self._sock.sendto(data, self._remote_addr)
+                else:
+                    # 원격 클라이언트 → KVM
+                    self._remote_addr = addr
+                    if self._target_port:
+                        self._sock.sendto(data, (self.target_ip, self._target_port))
+
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._running:
+                    continue
+                break
+            except Exception:
+                if self._running:
+                    continue
+                break
+
+
 class KVMRelayManager:
     """KVM 릴레이 관리자 — 발견된 KVM에 대해 프록시 자동 생성"""
 
     # 프록시 포트 시작 번호 (18000 + KVM IP의 마지막 옥텟)
     BASE_PORT = 18000
+    # UDP 릴레이 포트 시작 번호 (28000 + KVM IP의 마지막 옥텟)
+    UDP_BASE_PORT = 28000
 
     def __init__(self):
         self._proxies: Dict[str, TCPProxy] = {}  # key: "kvm_ip:port"
+        self._udp_relays: Dict[str, UDPRelay] = {}  # key: "kvm_ip"
         self._zt_ip: Optional[str] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._running = False
@@ -202,10 +290,18 @@ class KVMRelayManager:
         except (ValueError, IndexError):
             return self.BASE_PORT
 
-    def start_relay(self, kvm_ip: str, kvm_port: int = 80, kvm_name: str = "") -> Optional[int]:
-        """KVM에 대한 TCP 프록시 시작
+    def calc_udp_port(self, kvm_ip: str) -> int:
+        """KVM IP로부터 UDP 릴레이 포트 계산"""
+        try:
+            last_octet = int(kvm_ip.split('.')[-1])
+            return self.UDP_BASE_PORT + last_octet
+        except (ValueError, IndexError):
+            return self.UDP_BASE_PORT
 
-        Returns: 할당된 프록시 포트 (실패 시 None)
+    def start_relay(self, kvm_ip: str, kvm_port: int = 80, kvm_name: str = "") -> Optional[int]:
+        """KVM에 대한 TCP + UDP 프록시 시작
+
+        Returns: 할당된 TCP 프록시 포트 (실패 시 None)
         """
         key = f"{kvm_ip}:{kvm_port}"
         if key in self._proxies:
@@ -213,19 +309,32 @@ class KVMRelayManager:
 
         relay_port = self.calc_relay_port(kvm_ip, kvm_port)
 
-        # 포트 충돌 시 +1000 시도
+        # TCP 프록시 — 포트 충돌 시 +1000 시도
         for offset in [0, 1000, 2000]:
             port = relay_port + offset
             proxy = TCPProxy(port, kvm_ip, kvm_port)
             proxy.start()
             if proxy._running:
                 self._proxies[key] = proxy
-                logger.info(f"[Relay] {kvm_name or kvm_ip} → :{port}")
-                return port
+                logger.info(f"[Relay] {kvm_name or kvm_ip} TCP :{port}")
+                break
             proxy.stop()
+        else:
+            logger.error(f"[Relay] {kvm_ip} TCP 프록시 포트 할당 실패")
+            return None
 
-        logger.error(f"[Relay] {kvm_ip} 프록시 포트 할당 실패")
-        return None
+        # UDP 릴레이 (WebRTC 미디어용)
+        if kvm_ip not in self._udp_relays:
+            udp_port = self.calc_udp_port(kvm_ip)
+            for offset in [0, 1000, 2000]:
+                udp = UDPRelay(udp_port + offset, kvm_ip)
+                if udp.start():
+                    self._udp_relays[kvm_ip] = udp
+                    logger.info(f"[Relay] {kvm_name or kvm_ip} UDP :{udp_port + offset}")
+                    break
+                udp.stop()
+
+        return self._proxies[key].listen_port
 
     def stop_relay(self, kvm_ip: str, kvm_port: int = 80):
         """특정 KVM 프록시 중지"""
@@ -240,6 +349,20 @@ class KVMRelayManager:
         for proxy in self._proxies.values():
             proxy.stop()
         self._proxies.clear()
+        for udp in self._udp_relays.values():
+            udp.stop()
+        self._udp_relays.clear()
+
+    def get_udp_port(self, kvm_ip: str) -> Optional[int]:
+        """특정 KVM에 대한 UDP 릴레이 포트 조회"""
+        udp = self._udp_relays.get(kvm_ip)
+        return udp.listen_port if udp else None
+
+    def set_udp_target_port(self, kvm_ip: str, kvm_udp_port: int):
+        """KVM의 WebRTC UDP 포트 설정 (ICE candidate에서 추출한 포트)"""
+        udp = self._udp_relays.get(kvm_ip)
+        if udp:
+            udp.set_target_port(kvm_udp_port)
 
     def get_relay_info(self) -> List[dict]:
         """현재 활성 릴레이 정보"""
@@ -247,10 +370,12 @@ class KVMRelayManager:
         result = []
         for key, proxy in self._proxies.items():
             kvm_ip, kvm_port = key.rsplit(':', 1)
+            udp_port = self.get_udp_port(kvm_ip)
             result.append({
                 "kvm_local_ip": kvm_ip,
                 "kvm_port": int(kvm_port),
                 "relay_port": proxy.listen_port,
+                "udp_relay_port": udp_port,
                 "relay_zt_ip": zt_ip or "",
                 "access_url": f"http://{zt_ip}:{proxy.listen_port}" if zt_ip else "",
             })
@@ -266,11 +391,13 @@ class KVMRelayManager:
         devices = []
         for key, proxy in self._proxies.items():
             kvm_ip, kvm_port = key.rsplit(':', 1)
+            udp_port = self.get_udp_port(kvm_ip)
             devices.append({
                 "kvm_local_ip": kvm_ip,
                 "kvm_port": int(kvm_port),
                 "kvm_name": f"KVM-{kvm_ip.split('.')[-1]}",
                 "relay_port": proxy.listen_port,
+                "udp_relay_port": udp_port,
             })
 
         if not devices:

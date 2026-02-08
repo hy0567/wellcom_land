@@ -213,13 +213,16 @@ def main():
                     kvm_port = dev.info.web_port if hasattr(dev.info, 'web_port') else 80
                     relay_port = _kvm_relay.start_relay(kvm_ip, kvm_port, dev.name)
                     if relay_port:
+                        udp_port = _kvm_relay.get_udp_port(kvm_ip)
                         relay_devices.append({
                             "kvm_local_ip": kvm_ip,
                             "kvm_port": kvm_port,
                             "kvm_name": dev.name,
                             "relay_port": relay_port,
+                            "udp_relay_port": udp_port,
                         })
-                        print(f"[Relay] {dev.name} ({kvm_ip}:{kvm_port}) → :{relay_port}")
+                        udp_info = f" UDP:{udp_port}" if udp_port else ""
+                        print(f"[Relay] {dev.name} ({kvm_ip}:{kvm_port}) → TCP:{relay_port}{udp_info}")
 
                 # 서버에 등록
                 if relay_devices:

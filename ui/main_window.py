@@ -23,7 +23,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QUrl, QPoint, QRect, Q
 from PyQt6.QtGui import QAction, QIcon, QColor, QDesktopServices, QCursor, QPainter, QBrush, QPen, QPixmap, QShortcut, QKeySequence
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
+from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage, QWebEngineScript
 from PyQt6.QtWebChannel import QWebChannel
 
 from core import KVMManager, KVMDevice
@@ -562,6 +562,52 @@ class KVMThumbnailWidget(QFrame):
             print(f"[Thumbnail] _create_webview 오류: {e}")
             self._webview = None
 
+    def _inject_ice_patch_thumbnail(self):
+        """릴레이 접속 시 WebRTC ICE candidate 패치 (thumbnail용)"""
+        try:
+            relay_ip = self.device.ip
+            web_port = self.device.info.web_port
+            udp_port = 28000 + (web_port - 18000) if web_port >= 18000 else 28000 + int(relay_ip.split('.')[-1])
+
+            ice_js = (
+                "(function(){var R='%s',U=%d;"
+                "var O=window.RTCPeerConnection;"
+                "window.RTCPeerConnection=function(c){var p=new O(c);"
+                "var oa=p.addIceCandidate.bind(p);"
+                "p.addIceCandidate=function(cd){"
+                "if(cd&&cd.candidate){"
+                "var s=cd.candidate.replace(/(\\\\d{1,3}\\\\.\\\\d{1,3}\\\\.\\\\d{1,3}\\\\.\\\\d{1,3})\\\\s+(\\\\d+)\\\\s+typ\\\\s+host/g,"
+                "function(m,ip,pt){return ip===R?m:R+' '+U+' typ host'});"
+                "if(s!==cd.candidate)cd=new RTCIceCandidate({candidate:s,sdpMid:cd.sdpMid,sdpMLineIndex:cd.sdpMLineIndex})}"
+                "return oa(cd)};"
+                "var os=p.setRemoteDescription.bind(p);"
+                "p.setRemoteDescription=function(d){"
+                "if(d&&d.sdp){var s=d.sdp;"
+                "s=s.replace(/c=IN IP4 (\\\\d+\\\\.\\\\d+\\\\.\\\\d+\\\\.\\\\d+)/g,"
+                "function(m,ip){return ip==='0.0.0.0'||ip===R?m:'c=IN IP4 '+R});"
+                "d=new RTCSessionDescription({type:d.type,sdp:s})}"
+                "return os(d)};"
+                "return p};"
+                "window.RTCPeerConnection.prototype=O.prototype;"
+                "window.RTCPeerConnection.generateCertificate=O.generateCertificate;"
+                "})();" % (relay_ip, udp_port)
+            )
+
+            script = QWebEngineScript()
+            script.setName("wellcomland-ice-patch-thumb")
+            script.setSourceCode(ice_js)
+            script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+            script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+            script.setRunsOnSubFrames(True)
+
+            scripts = self._webview.page().scripts()
+            existing = scripts.findScript("wellcomland-ice-patch-thumb")
+            if not existing.isNull():
+                scripts.remove(existing)
+            scripts.insert(script)
+        except Exception as e:
+            print(f"[Thumbnail] ICE patch 주입 실패: {e}")
+
     def _on_permission_requested(self, origin, feature):
         """WebRTC 등 권한 자동 허용"""
         page = self.sender()
@@ -608,6 +654,9 @@ class KVMThumbnailWidget(QFrame):
                     self._webview.show()
                     url = f"http://{self.device.ip}:{self.device.info.web_port}/"
                     print(f"[Thumbnail] start_capture: {self.device.name} → {url} (crop={self._crop_region})")
+                    # 릴레이 접속 시 ICE 패치 주입
+                    if self.device.ip.startswith('10.147.'):
+                        self._inject_ice_patch_thumbnail()
                     self._webview.setUrl(QUrl(url))
                     self.status_label.hide()
             else:
@@ -2269,11 +2318,136 @@ class LiveViewDialog(QDialog):
         self.shortcut_bar.setVisible(self.control_bar_visible)
 
     def _load_kvm_url(self):
-        """KVM URL 로드 시작"""
+        """KVM URL 로드 시작
+
+        릴레이 접속(ZeroTier IP)인 경우 WebRTC ICE candidate 패치 스크립트를
+        UserScript로 주입하여 미디어 스트림이 릴레이를 통과하도록 함.
+        """
         web_port = self.device.info.web_port if hasattr(self.device.info, 'web_port') else 80
         url = f"http://{self.device.ip}:{web_port}"
         print(f"[LiveView] URL 로드: {url}")
+
+        # 릴레이 접속 감지 (ZeroTier IP로 접속하는 경우)
+        relay_ip = self.device.ip
+        is_relay = relay_ip.startswith('10.147.')
+
+        if is_relay:
+            self._inject_ice_patch(relay_ip, web_port)
+            print(f"[LiveView] 릴레이 접속 — ICE 패치 주입 완료")
+
         self.web_view.setUrl(QUrl(url))
+
+    def _inject_ice_patch(self, relay_ip: str, relay_port: int):
+        """WebRTC ICE candidate를 릴레이 IP로 교체하는 UserScript 주입
+
+        RTCPeerConnection을 래핑하여:
+        1. 원격 ICE candidate 수신 시 KVM 로컬 IP → 릴레이 IP로 교체
+        2. WebRTC signaling의 SDP에서도 IP 교체
+        이렇게 하면 브라우저가 릴레이 IP로 미디어를 전송하고,
+        관제 PC의 UDP 릴레이가 실제 KVM으로 전달함.
+        """
+        from PyQt6.QtWebEngineCore import QWebEngineScript
+
+        # UDP 릴레이 포트 계산 (TCP 릴레이 포트와 별도)
+        udp_port = 28000 + (relay_port - 18000) if relay_port >= 18000 else 28000
+
+        ice_patch_js = """
+(function() {
+    'use strict';
+
+    const RELAY_IP = '%RELAY_IP%';
+    const RELAY_UDP_PORT = %UDP_PORT%;
+
+    console.log('[WellcomLAND] ICE patch loaded — relay:', RELAY_IP, 'udp:', RELAY_UDP_PORT);
+
+    // RTCPeerConnection 래핑
+    const OriginalRTCPeerConnection = window.RTCPeerConnection;
+
+    window.RTCPeerConnection = function(config) {
+        console.log('[WellcomLAND] RTCPeerConnection intercepted', config);
+
+        // STUN 서버 제거 — 릴레이만 사용
+        const pc = new OriginalRTCPeerConnection(config);
+
+        // addIceCandidate 래핑 — 원격에서 받은 candidate의 IP를 릴레이로 교체
+        const origAddIceCandidate = pc.addIceCandidate.bind(pc);
+        pc.addIceCandidate = function(candidate) {
+            if (candidate && candidate.candidate) {
+                const orig = candidate.candidate;
+                // ICE candidate 형식: candidate:... <IP> <PORT> typ host ...
+                // 사설 IP(192.168.x.x, 10.x.x.x 등)를 릴레이 IP:포트로 교체
+                const patched = orig.replace(
+                    /(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\s+(\\d+)\\s+typ\\s+host/g,
+                    function(match, ip, port) {
+                        // 이미 릴레이 IP이면 그대로
+                        if (ip === RELAY_IP) return match;
+                        console.log('[WellcomLAND] ICE candidate IP rewrite:', ip + ':' + port, '->', RELAY_IP + ':' + RELAY_UDP_PORT);
+                        return RELAY_IP + ' ' + RELAY_UDP_PORT + ' typ host';
+                    }
+                );
+                if (patched !== orig) {
+                    candidate = new RTCIceCandidate({
+                        candidate: patched,
+                        sdpMid: candidate.sdpMid,
+                        sdpMLineIndex: candidate.sdpMLineIndex,
+                        usernameFragment: candidate.usernameFragment,
+                    });
+                }
+            }
+            return origAddIceCandidate(candidate);
+        };
+
+        // setRemoteDescription 래핑 — SDP 내의 IP도 교체
+        const origSetRemoteDesc = pc.setRemoteDescription.bind(pc);
+        pc.setRemoteDescription = function(desc) {
+            if (desc && desc.sdp) {
+                let sdp = desc.sdp;
+                // c=IN IP4 <KVM_IP> → c=IN IP4 <RELAY_IP>
+                sdp = sdp.replace(
+                    /c=IN IP4 (\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})/g,
+                    function(match, ip) {
+                        if (ip === '0.0.0.0' || ip === '127.0.0.1' || ip === RELAY_IP) return match;
+                        console.log('[WellcomLAND] SDP IP rewrite:', ip, '->', RELAY_IP);
+                        return 'c=IN IP4 ' + RELAY_IP;
+                    }
+                );
+                // a=candidate:... <IP> <PORT> typ host → 릴레이로 교체
+                sdp = sdp.replace(
+                    /a=candidate:(.*?)(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\s+(\\d+)\\s+typ\\s+host/g,
+                    function(match, prefix, ip, port) {
+                        if (ip === RELAY_IP) return match;
+                        console.log('[WellcomLAND] SDP candidate rewrite:', ip + ':' + port);
+                        return 'a=candidate:' + prefix + RELAY_IP + ' ' + RELAY_UDP_PORT + ' typ host';
+                    }
+                );
+                desc = new RTCSessionDescription({type: desc.type, sdp: sdp});
+            }
+            return origSetRemoteDesc(desc);
+        };
+
+        return pc;
+    };
+
+    // RTCPeerConnection 프로퍼티 복사
+    window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
+    window.RTCPeerConnection.generateCertificate = OriginalRTCPeerConnection.generateCertificate;
+})();
+""".replace('%RELAY_IP%', relay_ip).replace('%UDP_PORT%', str(udp_port))
+
+        # UserScript로 주입 (페이지 JS보다 먼저 실행)
+        script = QWebEngineScript()
+        script.setName("wellcomland-ice-patch")
+        script.setSourceCode(ice_patch_js)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+
+        # 기존 패치 제거 후 재등록
+        scripts = self.web_view.page().scripts()
+        existing = scripts.findScript("wellcomland-ice-patch")
+        if not existing.isNull():
+            scripts.remove(existing)
+        scripts.insert(script)
 
     def _on_page_loaded(self, ok):
         self._page_loaded = True

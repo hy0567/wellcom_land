@@ -688,7 +688,8 @@ def init_kvm_registry():
                     kvm_port INT DEFAULT 80,
                     kvm_name VARCHAR(100) DEFAULT '',
                     relay_zt_ip VARCHAR(45) NOT NULL COMMENT '관제PC의 ZeroTier IP',
-                    relay_port INT NOT NULL COMMENT '관제PC의 프록시 포트',
+                    relay_port INT NOT NULL COMMENT '관제PC의 TCP 프록시 포트',
+                    udp_relay_port INT DEFAULT NULL COMMENT 'WebRTC UDP 릴레이 포트',
                     owner_username VARCHAR(50) NOT NULL COMMENT '등록한 관제PC 사용자',
                     location VARCHAR(100) DEFAULT '' COMMENT '관제 위치명',
                     last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -696,6 +697,15 @@ def init_kvm_registry():
                     UNIQUE KEY uq_relay (relay_zt_ip, relay_port)
                 )
             """)
+            # udp_relay_port 컬럼 추가 (기존 테이블 호환)
+            try:
+                cur.execute("""
+                    ALTER TABLE kvm_registry ADD COLUMN udp_relay_port INT DEFAULT NULL
+                    COMMENT 'WebRTC UDP 릴레이 포트' AFTER relay_port
+                """)
+                print("[Init] kvm_registry: udp_relay_port 컬럼 추가")
+            except Exception:
+                pass  # 이미 존재
             print("[Init] kvm_registry 테이블 확인 완료")
 
 
@@ -731,6 +741,7 @@ def register_kvm(data: dict, user: dict = Depends(get_current_user)):
                 kvm_port = dev.get("kvm_port", 80)
                 kvm_name = dev.get("kvm_name", f"KVM-{kvm_local_ip.split('.')[-1]}")
                 relay_port = dev.get("relay_port", 0)
+                udp_relay_port = dev.get("udp_relay_port")
 
                 if not kvm_local_ip or not relay_port:
                     continue
@@ -739,18 +750,19 @@ def register_kvm(data: dict, user: dict = Depends(get_current_user)):
                 cur.execute("""
                     INSERT INTO kvm_registry
                         (kvm_local_ip, kvm_port, kvm_name, relay_zt_ip, relay_port,
-                         owner_username, location, last_seen, is_online)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), TRUE)
+                         udp_relay_port, owner_username, location, last_seen, is_online)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), TRUE)
                     ON DUPLICATE KEY UPDATE
                         kvm_local_ip = VALUES(kvm_local_ip),
                         kvm_port = VALUES(kvm_port),
                         kvm_name = VALUES(kvm_name),
+                        udp_relay_port = VALUES(udp_relay_port),
                         owner_username = VALUES(owner_username),
                         location = VALUES(location),
                         last_seen = NOW(),
                         is_online = TRUE
                 """, (kvm_local_ip, kvm_port, kvm_name, relay_zt_ip, relay_port,
-                      user["username"], location))
+                      udp_relay_port, user["username"], location))
                 registered += 1
 
     return {"status": "ok", "registered": registered}
@@ -787,6 +799,7 @@ def list_kvm_devices(user: dict = Depends(get_current_user)):
             "kvm_port": r["kvm_port"],
             "relay_zt_ip": r["relay_zt_ip"],
             "relay_port": r["relay_port"],
+            "udp_relay_port": r.get("udp_relay_port"),
             "access_url": f"http://{r['relay_zt_ip']}:{r['relay_port']}",
             "owner": r["owner_username"],
             "location": r["location"],
