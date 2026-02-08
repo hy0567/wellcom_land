@@ -81,8 +81,19 @@ class TCPProxy:
         target_sock = None
         try:
             target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            target_sock.settimeout(10)
+            target_sock.settimeout(10)  # 연결 타임아웃
             target_sock.connect((self.target_ip, self.target_port))
+
+            # 연결 성공 후 blocking 모드로 전환 (장기 연결 지원: MJPEG/WebSocket)
+            target_sock.settimeout(None)
+            client_sock.settimeout(None)
+
+            # TCP_NODELAY — 입력 지연 최소화 (키보드/마우스 이벤트)
+            for s in (client_sock, target_sock):
+                try:
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
 
             # 양방향 릴레이
             t1 = threading.Thread(
@@ -95,8 +106,8 @@ class TCPProxy:
             t2.start()
             t1.join()
             t2.join()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Relay] 릴레이 연결 실패 ({self.target_ip}:{self.target_port}): {e}")
         finally:
             try:
                 client_sock.close()
@@ -110,16 +121,21 @@ class TCPProxy:
 
     @staticmethod
     def _pipe(src: socket.socket, dst: socket.socket):
-        """한 방향 데이터 전달"""
+        """한 방향 데이터 전달 (MJPEG/WebSocket 장기 스트림 지원)"""
         try:
             while True:
                 data = src.recv(65536)
                 if not data:
                     break
                 dst.sendall(data)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass  # 정상적인 연결 종료
+        except OSError:
+            pass  # 소켓 이미 닫힘
         except Exception:
             pass
         finally:
+            # 안전하게 종료 — 상대방에게 EOF 알림
             try:
                 dst.shutdown(socket.SHUT_WR)
             except Exception:
