@@ -297,6 +297,27 @@ class APIClient:
         """내 클라우드 쿼타 조회"""
         return self._get('/api/files/quota')
 
+    # === KVM Registry (원격 장치 공유) ===
+    def register_kvm_devices(self, devices: list, relay_zt_ip: str, location: str = "") -> dict:
+        """관제 PC가 발견한 KVM을 서버에 등록"""
+        return self._post('/api/kvm/register', {
+            'devices': devices,
+            'relay_zt_ip': relay_zt_ip,
+            'location': location,
+        })
+
+    def get_remote_kvm_list(self) -> list:
+        """서버에서 원격 KVM 목록 조회 (ZeroTier 경유 접근 정보 포함)"""
+        try:
+            data = self._get('/api/kvm/list')
+            return data.get('devices', [])
+        except Exception:
+            return []
+
+    def send_kvm_heartbeat(self, relay_zt_ip: str) -> dict:
+        """관제 PC heartbeat 전송"""
+        return self._post('/api/kvm/heartbeat', {'relay_zt_ip': relay_zt_ip})
+
     # === Version ===
     def get_server_version(self) -> dict:
         return self._get('/api/version')

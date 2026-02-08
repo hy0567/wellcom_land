@@ -182,6 +182,62 @@ def main():
     window = MainWindow()
     window.show()
 
+    # KVM 릴레이 시작 (로컬 KVM을 ZeroTier로 중계 + 서버 등록)
+    try:
+        from core.kvm_relay import KVMRelayManager
+        from api_client import api_client
+        _kvm_relay = KVMRelayManager()
+
+        def _start_kvm_relay():
+            """로그인 후 백그라운드에서 KVM 릴레이 시작"""
+            import time
+            time.sleep(3)  # UI 초기화 대기
+
+            if not api_client.is_logged_in:
+                return
+
+            zt_ip = _kvm_relay.get_zt_ip()
+            if not zt_ip:
+                print("[Relay] ZeroTier IP 없음 — 릴레이 건너뜀")
+                return
+
+            print(f"[Relay] ZeroTier IP: {zt_ip}")
+
+            # 로컬 KVM 장치에 대해 TCP 프록시 시작
+            manager = window.manager if hasattr(window, 'manager') else None
+            if manager:
+                devices = manager.get_all_devices()
+                relay_devices = []
+                for dev in devices:
+                    kvm_ip = dev.ip
+                    kvm_port = dev.info.web_port if hasattr(dev.info, 'web_port') else 80
+                    relay_port = _kvm_relay.start_relay(kvm_ip, kvm_port, dev.name)
+                    if relay_port:
+                        relay_devices.append({
+                            "kvm_local_ip": kvm_ip,
+                            "kvm_port": kvm_port,
+                            "kvm_name": dev.name,
+                            "relay_port": relay_port,
+                        })
+                        print(f"[Relay] {dev.name} ({kvm_ip}:{kvm_port}) → :{relay_port}")
+
+                # 서버에 등록
+                if relay_devices:
+                    try:
+                        api_client.register_kvm_devices(relay_devices, zt_ip)
+                        print(f"[Relay] 서버에 {len(relay_devices)}개 KVM 등록 완료")
+                    except Exception as e:
+                        print(f"[Relay] 서버 등록 실패: {e}")
+
+                # heartbeat 시작
+                _kvm_relay.start_heartbeat(api_client, interval=120)
+
+        import threading
+        threading.Thread(target=_start_kvm_relay, daemon=True).start()
+
+    except Exception as e:
+        print(f"[Relay] KVM 릴레이 초기화 실패 (무시): {e}")
+
     # MCP 디버그 서버 시작 (mcp 패키지 미설치 시 자동 비활성화)
     def _mcp_log(msg):
         """MCP 로그를 파일에 기록 (EXE에서 print가 안 보일 수 있으므로)"""

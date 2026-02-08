@@ -674,11 +674,164 @@ def zerotier_list_members(admin: dict = Depends(require_admin)):
 
 
 # ===========================================================
+# KVM 레지스트리 (원격 장치 공유)
+# ===========================================================
+@app.on_event("startup")
+def init_kvm_registry():
+    """kvm_registry 테이블 생성"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS kvm_registry (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    kvm_local_ip VARCHAR(45) NOT NULL,
+                    kvm_port INT DEFAULT 80,
+                    kvm_name VARCHAR(100) DEFAULT '',
+                    relay_zt_ip VARCHAR(45) NOT NULL COMMENT '관제PC의 ZeroTier IP',
+                    relay_port INT NOT NULL COMMENT '관제PC의 프록시 포트',
+                    owner_username VARCHAR(50) NOT NULL COMMENT '등록한 관제PC 사용자',
+                    location VARCHAR(100) DEFAULT '' COMMENT '관제 위치명',
+                    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    is_online BOOLEAN DEFAULT TRUE,
+                    UNIQUE KEY uq_relay (relay_zt_ip, relay_port)
+                )
+            """)
+            print("[Init] kvm_registry 테이블 확인 완료")
+
+
+@app.post("/api/kvm/register")
+def register_kvm(data: dict, user: dict = Depends(get_current_user)):
+    """관제 PC가 발견한 KVM 장치를 서버에 등록
+
+    Body: {
+        "devices": [
+            {
+                "kvm_local_ip": "192.168.68.100",
+                "kvm_port": 80,
+                "kvm_name": "KVM-100",
+                "relay_port": 18100
+            }
+        ],
+        "relay_zt_ip": "10.147.17.133",
+        "location": "본사 관제실"
+    }
+    """
+    devices = data.get("devices", [])
+    relay_zt_ip = data.get("relay_zt_ip", "").strip()
+    location = data.get("location", "")
+
+    if not relay_zt_ip or not devices:
+        raise HTTPException(status_code=400, detail="relay_zt_ip와 devices 필수")
+
+    registered = 0
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for dev in devices:
+                kvm_local_ip = dev.get("kvm_local_ip", "")
+                kvm_port = dev.get("kvm_port", 80)
+                kvm_name = dev.get("kvm_name", f"KVM-{kvm_local_ip.split('.')[-1]}")
+                relay_port = dev.get("relay_port", 0)
+
+                if not kvm_local_ip or not relay_port:
+                    continue
+
+                # UPSERT: 이미 있으면 업데이트
+                cur.execute("""
+                    INSERT INTO kvm_registry
+                        (kvm_local_ip, kvm_port, kvm_name, relay_zt_ip, relay_port,
+                         owner_username, location, last_seen, is_online)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), TRUE)
+                    ON DUPLICATE KEY UPDATE
+                        kvm_local_ip = VALUES(kvm_local_ip),
+                        kvm_port = VALUES(kvm_port),
+                        kvm_name = VALUES(kvm_name),
+                        owner_username = VALUES(owner_username),
+                        location = VALUES(location),
+                        last_seen = NOW(),
+                        is_online = TRUE
+                """, (kvm_local_ip, kvm_port, kvm_name, relay_zt_ip, relay_port,
+                      user["username"], location))
+                registered += 1
+
+    return {"status": "ok", "registered": registered}
+
+
+@app.get("/api/kvm/list")
+def list_kvm_devices(user: dict = Depends(get_current_user)):
+    """등록된 모든 원격 KVM 장치 목록 (ZeroTier 경유 접근 정보 포함)"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # 5분 이상 미갱신 → offline 처리
+            cur.execute("""
+                UPDATE kvm_registry SET is_online = FALSE
+                WHERE last_seen < DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+            """)
+
+            if user["role"] == "admin":
+                cur.execute("SELECT * FROM kvm_registry ORDER BY location, kvm_name")
+            else:
+                cur.execute("""
+                    SELECT * FROM kvm_registry
+                    WHERE owner_username = %s
+                    ORDER BY kvm_name
+                """, (user["username"],))
+
+            rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        result.append({
+            "id": r["id"],
+            "kvm_name": r["kvm_name"],
+            "kvm_local_ip": r["kvm_local_ip"],
+            "kvm_port": r["kvm_port"],
+            "relay_zt_ip": r["relay_zt_ip"],
+            "relay_port": r["relay_port"],
+            "access_url": f"http://{r['relay_zt_ip']}:{r['relay_port']}",
+            "owner": r["owner_username"],
+            "location": r["location"],
+            "is_online": bool(r["is_online"]),
+            "last_seen": str(r["last_seen"]) if r["last_seen"] else None,
+        })
+
+    return {"devices": result}
+
+
+@app.post("/api/kvm/heartbeat")
+def kvm_heartbeat(data: dict, user: dict = Depends(get_current_user)):
+    """관제 PC가 주기적으로 온라인 상태 갱신
+
+    Body: {"relay_zt_ip": "10.147.17.133"}
+    """
+    relay_zt_ip = data.get("relay_zt_ip", "").strip()
+    if not relay_zt_ip:
+        raise HTTPException(status_code=400, detail="relay_zt_ip 필수")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE kvm_registry SET last_seen = NOW(), is_online = TRUE
+                WHERE relay_zt_ip = %s AND owner_username = %s
+            """, (relay_zt_ip, user["username"]))
+
+    return {"status": "ok"}
+
+
+@app.delete("/api/kvm/{kvm_id}")
+def delete_kvm(kvm_id: int, user: dict = Depends(require_admin)):
+    """KVM 레지스트리에서 삭제 (admin)"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM kvm_registry WHERE id = %s", (kvm_id,))
+    return {"message": "삭제되었습니다"}
+
+
+# ===========================================================
 # Version (공개)
 # ===========================================================
 @app.get("/api/version")
 def get_version():
-    return {"version": "1.7.3", "app_name": "WellcomLAND"}
+    return {"version": "1.7.4", "app_name": "WellcomLAND"}
 
 
 # ===========================================================

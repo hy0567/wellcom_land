@@ -33,6 +33,8 @@ APP_FILES = [
     'core/database.py',
     'core/discovery.py',
     'core/hid_controller.py',
+    'core/kvm_relay.py',
+    'core/network_fixer.py',
     'ui/__init__.py',
     'ui/main_window.py',
     'ui/device_control.py',
