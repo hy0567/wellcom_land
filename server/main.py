@@ -673,6 +673,50 @@ def zerotier_list_members(admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.post("/api/zerotier/route")
+def add_zt_route(data: dict, user: dict = Depends(get_current_user)):
+    """ZeroTier Managed Route 추가 (관제 PC가 자기 서브넷을 등록)
+
+    Body: {"subnet": "192.168.68.0/24", "via": "10.147.17.133"}
+    """
+    import requests as req
+
+    subnet = data.get("subnet", "").strip()
+    via = data.get("via", "").strip()
+
+    if not subnet or not via:
+        raise HTTPException(status_code=400, detail="subnet과 via 필수")
+
+    try:
+        url = f"http://127.0.0.1:9993/controller/network/{ZEROTIER_NETWORK_ID}"
+        token = open("/var/lib/zerotier-one/authtoken.secret").read().strip()
+        headers = {"X-ZT1-AUTH": token}
+
+        # 현재 routes 조회
+        r = req.get(url, headers=headers, timeout=5)
+        config = r.json()
+        routes = config.get("routes", [])
+
+        # 이미 같은 subnet/via가 있으면 스킵
+        for route in routes:
+            if route.get("target") == subnet and route.get("via") == via:
+                return {"status": "exists", "routes": routes}
+
+        # 중복 subnet 있으면 via 업데이트 (다른 관제 PC가 같은 서브넷일 수 있음)
+        routes = [r for r in routes if r.get("target") != subnet]
+        routes.append({"target": subnet, "via": via})
+
+        # routes 업데이트
+        r = req.post(url, headers=headers, json={"routes": routes}, timeout=5)
+        result = r.json()
+
+        print(f"[ZTRoute] {subnet} via {via} 등록 (by {user['username']})")
+        return {"status": "ok", "routes": result.get("routes", [])}
+
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ZeroTier route 설정 실패: {str(e)}")
+
+
 # ===========================================================
 # KVM 레지스트리 (원격 장치 공유)
 # ===========================================================
@@ -844,7 +888,7 @@ def delete_kvm(kvm_id: int, user: dict = Depends(require_admin)):
 # ===========================================================
 @app.get("/api/version")
 def get_version():
-    return {"version": "1.7.4", "app_name": "WellcomLAND"}
+    return {"version": "1.8.2", "app_name": "WellcomLAND"}
 
 
 # ===========================================================

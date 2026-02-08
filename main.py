@@ -203,6 +203,17 @@ def main():
 
             print(f"[Relay] ZeroTier IP: {zt_ip}")
 
+            # ZeroTier 서브넷 라우팅 자동 설정
+            # (관제 PC의 KVM 서브넷을 ZeroTier 네트워크에 공유)
+            try:
+                from core.discovery import NetworkScanner
+                lan_ip = NetworkScanner.get_local_ip()
+                if lan_ip and not lan_ip.startswith('10.147.'):
+                    from core.network_fixer import auto_setup_zt_forwarding
+                    auto_setup_zt_forwarding(api_client, zt_ip, lan_ip)
+            except Exception as e:
+                print(f"[Relay] ZT 서브넷 라우팅 설정 실패 (무시): {e}")
+
             # 로컬 KVM 장치에 대해 TCP 프록시 시작
             manager = window.manager if hasattr(window, 'manager') else None
             if manager:
