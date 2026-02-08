@@ -175,6 +175,70 @@ def main():
     window = MainWindow()
     window.show()
 
+    # MCP 디버그 서버 시작 (mcp 패키지 미설치 시 자동 비활성화)
+    def _mcp_log(msg):
+        """MCP 로그를 파일에 기록 (EXE에서 print가 안 보일 수 있으므로)"""
+        print(msg)
+        try:
+            mcp_log_path = os.path.join(os.environ.get('WELLCOMLAND_BASE_DIR', '.'), 'logs', 'mcp_debug.log')
+            os.makedirs(os.path.dirname(mcp_log_path), exist_ok=True)
+            with open(mcp_log_path, 'a', encoding='utf-8') as f:
+                import time as _t
+                f.write(f"[{_t.strftime('%H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
+    _mcp_log("[MCP] === MCP 서버 초기화 시작 ===")
+    _mcp_log(f"[MCP] frozen={getattr(sys, 'frozen', False)}, python={sys.version}")
+
+    try:
+        # EXE 환경에서 시스템 Python 패키지 접근
+        if getattr(sys, 'frozen', False):
+            import glob
+            added_paths = []
+            for pattern in [
+                os.path.expandvars(r'%LOCALAPPDATA%\Python\*\Lib\site-packages'),
+                os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\*\Lib\site-packages'),
+            ]:
+                for sp in glob.glob(pattern):
+                    if sp not in sys.path:
+                        sys.path.insert(0, sp)
+                        added_paths.append(sp)
+                    # pywin32 네이티브 DLL 경로 (pywintypes 등)
+                    for sub in ['pywin32_system32', 'win32', 'win32\\lib']:
+                        dll_dir = os.path.join(sp, sub)
+                        if os.path.isdir(dll_dir):
+                            if dll_dir not in sys.path:
+                                sys.path.insert(0, dll_dir)
+                            os.environ['PATH'] = dll_dir + ';' + os.environ.get('PATH', '')
+            for pattern in [
+                os.path.expandvars(r'%LOCALAPPDATA%\Python\*\Lib'),
+                os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\*\Lib'),
+            ]:
+                for sp in glob.glob(pattern):
+                    if sp not in sys.path and os.path.isdir(sp):
+                        sys.path.insert(0, sp)
+                        added_paths.append(sp)
+            _mcp_log(f"[MCP] 시스템 Python 경로 추가: {added_paths}")
+        else:
+            _mcp_log("[MCP] 개발 환경 (non-frozen)")
+
+        _mcp_log("[MCP] mcp_debug 모듈 import 시도...")
+        from mcp_debug import start_server, install_log_capture
+        _mcp_log("[MCP] mcp_debug import 성공")
+
+        install_log_capture()
+        _mcp_log("[MCP] 로그 캡처 설치 완료")
+
+        start_server(window, port=5111)
+        _mcp_log("[MCP] 디버그 서버 시작: http://localhost:5111/sse")
+    except ImportError as e:
+        _mcp_log(f"[MCP] ImportError: {e}")
+    except Exception as e:
+        _mcp_log(f"[MCP] 시작 실패: {e}")
+        import traceback
+        _mcp_log(traceback.format_exc())
+
     sys.exit(app.exec())
 
 

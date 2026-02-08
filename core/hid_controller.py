@@ -172,6 +172,18 @@ class FastHIDController:
         cmd_up = f"echo -ne '{self._bytes_to_hex(report_up)}' > /dev/hidg0"
         self._cmd_queue.put(cmd_up)
 
+    def send_hid_code(self, hid_code: int, modifiers: int = 0):
+        """HID 키코드 직접 전송 (KEY_CODES 매핑 없이)"""
+        # 키 누름
+        report_down = struct.pack('BBBBBBBB', modifiers, 0, hid_code, 0, 0, 0, 0, 0)
+        cmd_down = f"echo -ne '{self._bytes_to_hex(report_down)}' > /dev/hidg0"
+        self._cmd_queue.put(cmd_down)
+
+        # 키 놓음
+        report_up = struct.pack('BBBBBBBB', 0, 0, 0, 0, 0, 0, 0, 0)
+        cmd_up = f"echo -ne '{self._bytes_to_hex(report_up)}' > /dev/hidg0"
+        self._cmd_queue.put(cmd_up)
+
     def flush(self):
         """큐 비우기"""
         while not self._cmd_queue.empty():

@@ -361,7 +361,6 @@ class KVMThumbnailWidget(QFrame):
             });
 
             _inputBlocked = true;
-            console.log('[Thumb] Input blocked');
         }
 
         // 3. video 요소 처리
@@ -377,7 +376,6 @@ class KVMThumbnailWidget(QFrame):
                 video.play().catch(function(){});
             }
 
-            console.log('[Thumb] Video ready');
             _videoDone = true;
             return true;
         }
@@ -416,7 +414,6 @@ class KVMThumbnailWidget(QFrame):
                                     method: 'setStreamQualityFactor',
                                     params: { factor: 0.1 }
                                 }));
-                                console.log('[Thumb] Quality set to 10% (low bitrate)');
                                 _qualityDone = true;
                                 return true;
                             }
@@ -441,13 +438,40 @@ class KVMThumbnailWidget(QFrame):
             setupVideo();
             setLowQuality();
 
+            // video + CSS 준비 완료 시그널 (Python 폴링용)
+            if (_cssDone && _videoDone) {
+                window._thumbReady = true;
+            }
+
             if (attempts < 60) {
                 setTimeout(loop, 500);
             }
         }
 
         setTimeout(loop, 2000);
+
     })();
+    """
+
+    # 크롭용 JS 템플릿: video의 CSS만 변경 (DOM 이동 없음, body overflow:hidden 활용)
+    CROP_JS_TEMPLATE = """
+    (function() {{
+        var cs = document.getElementById('_cropStyle');
+        if (!cs) {{
+            cs = document.createElement('style');
+            cs.id = '_cropStyle';
+            document.head.appendChild(cs);
+        }}
+        cs.textContent = `
+            video {{
+                width: {wvw}vw !important;
+                height: {hvh}vh !important;
+                left: {lvw}vw !important;
+                top: {tvh}vh !important;
+                object-fit: fill !important;
+            }}
+        `;
+    }})();
     """
 
     def __init__(self, device: KVMDevice, parent=None):
@@ -457,6 +481,8 @@ class KVMThumbnailWidget(QFrame):
         self._is_paused = False
         self._use_preview = True
         self._webview = None
+        self._crop_region = None  # (x, y, w, h) or None
+        self._stream_status = "idle"  # idle, loading, connected, dead
         self._init_ui()
 
     def _init_ui(self):
@@ -481,9 +507,10 @@ class KVMThumbnailWidget(QFrame):
         self.status_label.setText("로딩 중...")
         layout.addWidget(self.status_label)
 
-        # 장치 이름 라벨
+        # 장치 이름 라벨 (상태 색상 점 포함)
         self.name_label = QLabel(self.device.name)
         self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.name_label.setTextFormat(Qt.TextFormat.RichText)
         self.name_label.setStyleSheet("""
             background-color: #333;
             color: white;
@@ -491,6 +518,7 @@ class KVMThumbnailWidget(QFrame):
             font-weight: bold;
             padding: 2px;
         """)
+        self._update_name_label()
         layout.addWidget(self.name_label)
 
         self._update_style()
@@ -523,6 +551,9 @@ class KVMThumbnailWidget(QFrame):
             # 로드 완료 시 JS 실행
             self._webview.loadFinished.connect(self._on_load_finished)
 
+            # 렌더 프로세스 종료 감지
+            page.renderProcessTerminated.connect(self._on_render_terminated)
+
             # 레이아웃에서 status_label 교체
             layout = self.layout()
             layout.replaceWidget(self.status_label, self._webview)
@@ -539,34 +570,62 @@ class KVMThumbnailWidget(QFrame):
 
     def _on_load_finished(self, ok):
         """WebView 로드 완료"""
+        # 비활성 상태면 무시 (stop 후 about:blank 로드 이벤트 차단)
+        if not self._is_active:
+            return
+        print(f"[Thumbnail] _on_load_finished: ok={ok}, device={self.device.name}, crop={self._crop_region}")
         if ok and self._webview:
+            self._stream_status = "connected"
+            self._update_name_label()
             self._webview.page().runJavaScript(self.THUMBNAIL_JS)
+            # 크롭 설정이 있으면 THUMBNAIL_JS 준비 완료 후 크롭 적용 (폴링)
+            if self._crop_region:
+                print(f"[Thumbnail] 크롭 폴링 시작 예약 (500ms): {self.device.name}")
+                QTimer.singleShot(500, lambda: self._poll_and_inject_crop(0))
+        elif not ok and self._webview:
+            self._stream_status = "dead"
+            self._update_name_label()
+            print(f"[Thumbnail] 로드 실패: {self.device.name}")
 
     def start_capture(self):
         """미리보기 시작"""
         try:
+            # 1:1 제어 중인 장치는 미리보기 차단 (WebRTC 단일 스트림 충돌 방지)
+            main_win = self.window()
+            if hasattr(main_win, '_live_control_device') and main_win._live_control_device == self.device.name:
+                print(f"[Thumbnail] start_capture 차단 (1:1 제어 중): {self.device.name}")
+                return
             if self._is_active:
+                print(f"[Thumbnail] start_capture 건너뜀 (이미 활성): {self.device.name}")
                 return
             self._is_active = True
+            self._stream_status = "loading"
+            self._update_name_label()
 
             if self.device.status == DeviceStatus.ONLINE and self._use_preview:
                 self._create_webview()
                 if self._webview:
                     self._webview.show()
                     url = f"http://{self.device.ip}:{self.device.info.web_port}/"
+                    print(f"[Thumbnail] start_capture: {self.device.name} → {url} (crop={self._crop_region})")
                     self._webview.setUrl(QUrl(url))
                     self.status_label.hide()
             else:
+                self._stream_status = "idle"
+                self._update_name_label()
                 self._update_status_display()
+                print(f"[Thumbnail] start_capture: {self.device.name} — 오프라인 또는 미리보기 비활성")
         except Exception as e:
             print(f"[Thumbnail] start_capture 오류: {e}")
             self._is_active = False
 
     def stop_capture(self):
-        """미리보기 완전 중지 (WebView 언로드)"""
+        """미리보기 완전 중지 (WebView 언로드 — WebRTC 연결 해제)"""
         try:
             self._is_active = False
             self._is_paused = False
+            self._stream_status = "idle"
+            self._update_name_label()
             if self._webview:
                 self._webview.setUrl(QUrl("about:blank"))
                 self._webview.hide()
@@ -598,6 +657,73 @@ class KVMThumbnailWidget(QFrame):
         except Exception as e:
             print(f"[Thumbnail] resume_capture 오류: {e}")
 
+    def set_crop_region(self, region):
+        """부분제어 크롭 영역 설정 (None이면 해제)"""
+        self._crop_region = region
+        if self._webview and self._is_active:
+            if region:
+                self._poll_and_inject_crop(0)
+            else:
+                self._clear_crop_css()
+
+    def _inject_crop_css(self):
+        """크롭 CSS 주입 (video DOM 이동 없이 CSS만 변경)"""
+        if not self._crop_region or not self._webview:
+            return
+        x, y, w, h = self._crop_region
+        # video 확대: 1/w, 1/h 배
+        wvw = (1.0 / w) * 100.0   # width in vw
+        hvh = (1.0 / h) * 100.0   # height in vh
+        # video 위치 이동: -x/w, -y/h
+        lvw = -(x / w) * 100.0    # left in vw
+        tvh = -(y / h) * 100.0    # top in vh
+        js = self.CROP_JS_TEMPLATE.format(wvw=wvw, hvh=hvh, lvw=lvw, tvh=tvh)
+        try:
+            self._webview.page().runJavaScript(js)
+        except Exception:
+            pass
+
+    def _clear_crop_css(self):
+        """크롭 CSS 제거 (원래 THUMBNAIL_JS 스타일로 복원)"""
+        if not self._webview:
+            return
+        js = """
+        (function() {
+            var cs = document.getElementById('_cropStyle');
+            if (cs) cs.remove();
+        })();
+        """
+        try:
+            self._webview.page().runJavaScript(js)
+        except Exception:
+            pass
+
+    def _poll_and_inject_crop(self, attempt):
+        """THUMBNAIL_JS 준비 완료를 폴링 후 크롭 CSS 주입 (적응형 간격)"""
+        if not self._crop_region or not self._webview or not self._is_active:
+            return
+        if attempt >= 20:
+            # 타임아웃 — 폴백으로 강제 주입
+            print(f"[Thumbnail] crop 폴링 타임아웃, 강제 주입: {self.device.name}")
+            self._inject_crop_css()
+            return
+        # 적응형 폴링: 처음 5회는 100ms, 이후 300ms
+        interval = 100 if attempt < 5 else 300
+        try:
+            def on_result(ready):
+                if not self._is_active:
+                    return
+                if ready:
+                    print(f"[Thumbnail] crop 준비 완료 (attempt={attempt}): {self.device.name}")
+                    self._inject_crop_css()
+                else:
+                    QTimer.singleShot(interval, lambda: self._poll_and_inject_crop(attempt + 1))
+            self._webview.page().runJavaScript(
+                "window._thumbReady === true", on_result
+            )
+        except Exception:
+            pass
+
     def _update_status_display(self):
         """상태 표시"""
         try:
@@ -621,6 +747,28 @@ class KVMThumbnailWidget(QFrame):
                 color: #f44336;
                 font-size: 11px;
             """)
+
+    def _update_name_label(self):
+        """name_label에 상태 색상 점 표시 (JS 없이 Qt 시그널만 사용)"""
+        name = self.device.name
+        if self._stream_status == "connected":
+            dot = '<span style="color:#4CAF50;">●</span>'
+        elif self._stream_status == "loading":
+            dot = '<span style="color:#FF9800;">●</span>'
+        elif self._stream_status == "dead":
+            dot = '<span style="color:#f44336;">●</span>'
+        else:
+            dot = ""
+        if dot:
+            self.name_label.setText(f'{dot} {name}')
+        else:
+            self.name_label.setText(name)
+
+    def _on_render_terminated(self, terminationStatus, exitCode):
+        """WebView 렌더 프로세스 종료 감지"""
+        print(f"[Thumbnail] 렌더 프로세스 종료: {self.device.name} (status={terminationStatus}, code={exitCode})")
+        self._stream_status = "dead"
+        self._update_name_label()
 
     def _update_style(self):
         if self.device.status == DeviceStatus.ONLINE:
@@ -682,6 +830,8 @@ class GridViewTab(QWidget):
         self._is_visible = False
         self._live_preview_enabled = True  # 실시간 미리보기 활성화
         self._filter_group = None  # None이면 전체, 문자열이면 해당 그룹만
+        self._crop_region = None  # 부분제어 크롭 영역
+        self._load_in_progress = False  # load_devices 중복 호출 방지
         self._init_ui()
 
     def _init_ui(self):
@@ -707,6 +857,15 @@ class GridViewTab(QWidget):
         """)
         self.btn_toggle_preview.clicked.connect(self._toggle_live_preview)
         control_layout.addWidget(self.btn_toggle_preview)
+
+        self.btn_clear_crop = QPushButton("✕ 부분제어 해제")
+        self.btn_clear_crop.setStyleSheet(
+            "QPushButton { background-color: #FF5722; color: white; padding: 5px 10px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #E64A19; }"
+        )
+        self.btn_clear_crop.clicked.connect(self._on_clear_crop_clicked)
+        self.btn_clear_crop.setVisible(False)
+        control_layout.addWidget(self.btn_clear_crop)
 
         self.btn_refresh = QPushButton("🔄 새로고침")
         self.btn_refresh.clicked.connect(self.refresh_all)
@@ -750,6 +909,10 @@ class GridViewTab(QWidget):
 
     def load_devices(self):
         """장치 목록 로드 및 그리드 구성"""
+        if self._load_in_progress:
+            print("[GridView] load_devices 건너뜀 - 이미 진행 중")
+            return
+        self._load_in_progress = True
         try:
             print("[GridView] load_devices 시작...")
             # 기존 썸네일 정리
@@ -781,22 +944,30 @@ class GridViewTab(QWidget):
             # 열 수 계산 (창 크기에 따라 조정, 최소 4개)
             cols = max(4, self.scroll_area.width() // 210)
 
-            for idx, device in enumerate(devices):
-                row = idx // cols
-                col = idx % cols
+            # 레이아웃 갱신 일시 중지 (깜빡임 방지)
+            self.setUpdatesEnabled(False)
+            try:
+                for idx, device in enumerate(devices):
+                    row = idx // cols
+                    col = idx % cols
 
-                thumb = KVMThumbnailWidget(device)
-                thumb._use_preview = self._live_preview_enabled
-                thumb.clicked.connect(self._on_thumbnail_clicked)
-                thumb.double_clicked.connect(self._on_thumbnail_double_clicked)
-                thumb.right_clicked.connect(self._on_thumbnail_right_clicked)
-                self.thumbnails.append(thumb)
-                self.grid_layout.addWidget(thumb, row, col)
+                    thumb = KVMThumbnailWidget(device)
+                    thumb._use_preview = self._live_preview_enabled
+                    # 크롭 영역이 있으면 새 썸네일에도 적용
+                    if self._crop_region:
+                        thumb._crop_region = self._crop_region
+                    thumb.clicked.connect(self._on_thumbnail_clicked)
+                    thumb.double_clicked.connect(self._on_thumbnail_double_clicked)
+                    thumb.right_clicked.connect(self._on_thumbnail_right_clicked)
+                    self.thumbnails.append(thumb)
+                    self.grid_layout.addWidget(thumb, row, col)
 
-            # 빈 공간 채우기
-            if devices:
-                self.grid_layout.setRowStretch(len(devices) // cols + 1, 1)
-                self.grid_layout.setColumnStretch(cols, 1)
+                # 빈 공간 채우기
+                if devices:
+                    self.grid_layout.setRowStretch(len(devices) // cols + 1, 1)
+                    self.grid_layout.setColumnStretch(cols, 1)
+            finally:
+                self.setUpdatesEnabled(True)
 
             print(f"[GridView] load_devices 완료 - {len(self.thumbnails)}개 썸네일 생성")
 
@@ -809,11 +980,13 @@ class GridViewTab(QWidget):
             print(f"[GridView] load_devices 오류: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            self._load_in_progress = False
 
     def _start_all_captures(self):
         """모든 썸네일 캡처 시작/재개 (순차적으로 로드하여 충돌 방지)"""
         try:
-            print(f"[GridView] _start_all_captures - preview_enabled: {self._live_preview_enabled}, thumbs: {len(self.thumbnails)}")
+            print(f"[GridView] _start_all_captures - preview_enabled: {self._live_preview_enabled}, thumbs: {len(self.thumbnails)}, crop={self._crop_region}")
             if not self._live_preview_enabled:
                 # 실시간 미리보기가 비활성화면 상태만 업데이트
                 for thumb in self.thumbnails:
@@ -823,15 +996,26 @@ class GridViewTab(QWidget):
                         pass
                 return
 
-            for i, thumb in enumerate(self.thumbnails):
+            # ★ 탭의 크롭 영역을 모든 기존 썸네일에 전파 (부분제어 핵심 수정)
+            if self._crop_region:
+                for thumb in self.thumbnails:
+                    thumb._crop_region = self._crop_region
+                print(f"[GridView] 크롭 영역 전파 완료: {self._crop_region} → {len(self.thumbnails)}개 썸네일")
+
+            current_thumbs = list(self.thumbnails)  # 스냅샷
+            for i, thumb in enumerate(current_thumbs):
                 # 일시정지 상태면 즉시 재개, 아니면 지연 시작
                 if thumb._is_paused:
                     print(f"[GridView] thumb[{i}] resume_capture")
                     thumb.resume_capture()
                 else:
-                    # 각 썸네일을 300ms 간격으로 로드 (WebView 동시 생성 방지)
-                    print(f"[GridView] thumb[{i}] start_capture 예약 ({i * 300}ms)")
-                    QTimer.singleShot(i * 300, thumb.start_capture)
+                    # 각 썸네일을 100ms 간격으로 로드 (WebView 동시 생성 방지)
+                    # 삭제된 썸네일에 실행 방지: 콜백 시점에 목록 확인
+                    def start_if_valid(t=thumb):
+                        if t in self.thumbnails:
+                            t.start_capture()
+                    print(f"[GridView] thumb[{i}] start_capture 예약 ({i * 100}ms)")
+                    QTimer.singleShot(i * 100, start_if_valid)
         except Exception as e:
             print(f"[GridView] _start_all_captures 오류: {e}")
 
@@ -886,28 +1070,43 @@ class GridViewTab(QWidget):
         return len(all_devices)
 
     def on_tab_activated(self):
-        """탭이 활성화될 때 호출 (외부에서 호출)"""
+        """탭이 활성화될 때 호출 (외부에서 호출)
+
+        탭 전환 시 이전 탭은 stop_capture(WebRTC 해제)되므로,
+        재활성화 시 항상 새로 캡처를 시작해야 함.
+        """
         try:
             expected = self._get_filtered_device_count()
             print(f"[GridView] on_tab_activated - thumbnails: {len(self.thumbnails)}, expected: {expected}, filter: {self._filter_group}")
             self._is_visible = True
-            # 처음 로드 또는 장치 수 변경 시 로드
+
+            if self._load_in_progress:
+                print("[GridView] on_tab_activated 건너뜀 - load 진행 중")
+                return
+
+            # 장치 수 변경 시 전체 리로드
             if len(self.thumbnails) != expected:
                 print("[GridView] load_devices 예약...")
-                QTimer.singleShot(500, self.load_devices)
+                QTimer.singleShot(150, self.load_devices)
             else:
-                # 이미 로드된 상태면 캡처만 재개 (pause → resume)
-                print("[GridView] _resume_all_captures 예약...")
-                QTimer.singleShot(100, self._resume_all_captures)
+                # 이미 썸네일 위젯이 있으면 캡처만 재시작
+                # (stop 상태이므로 start_capture 필요)
+                print("[GridView] _start_all_captures 예약...")
+                QTimer.singleShot(100, self._start_all_captures)
         except Exception as e:
             print(f"[GridView] on_tab_activated 오류: {e}")
 
     def on_tab_deactivated(self):
-        """탭이 비활성화될 때 호출 - pause만 (WebView 유지, 비트레이트만 중지)"""
+        """탭이 비활성화될 때 호출 - stop (WebRTC 연결 해제)
+
+        KVM은 동시에 1개 연결만 지원하므로, 비활성 탭에서
+        WebRTC 연결을 유지하면 다른 탭에서 같은 KVM에 접속 불가.
+        → 완전 중지하여 WebRTC 연결 해제.
+        """
         try:
-            print(f"[GridView] on_tab_deactivated - pause (filter: {self._filter_group})")
+            print(f"[GridView] on_tab_deactivated - stop (filter: {self._filter_group})")
             self._is_visible = False
-            self._pause_all_captures()
+            self._stop_all_captures()
         except Exception as e:
             print(f"[GridView] on_tab_deactivated 오류: {e}")
 
@@ -944,6 +1143,65 @@ class GridViewTab(QWidget):
             self.thumbnails.clear()
         except Exception as e:
             print(f"[GridView] cleanup 오류: {e}")
+
+    # ─── 부분제어 크롭 ──────────────────────────────────────
+
+    def apply_partial_crop(self, region: tuple):
+        """모든 썸네일에 영역 크롭 적용
+        Args:
+            region: (x, y, w, h) 0~1 비율
+        """
+        self._crop_region = region
+        for thumb in self.thumbnails:
+            thumb.set_crop_region(region)
+
+        # 상단 타이틀 변경
+        self._update_title_for_crop(region)
+
+    def clear_partial_crop(self):
+        """크롭 해제 — 원래 전체 화면으로 복귀"""
+        self._crop_region = None
+        for thumb in self.thumbnails:
+            thumb.set_crop_region(None)
+
+        # 타이틀 복원
+        self._update_title_for_crop(None)
+
+    def _on_clear_crop_clicked(self):
+        """부분제어 해제 버튼 클릭 — 크롭 해제 후 전체 화면 복구"""
+        print("[부분제어] 해제 버튼 클릭")
+        self._stop_all_captures()
+        self.clear_partial_crop()
+        self.btn_clear_crop.setVisible(False)
+        QTimer.singleShot(300, self.on_tab_activated)
+
+    def _update_title_for_crop(self, region):
+        """부분제어 상태에 따라 타이틀 변경"""
+        # _init_ui에서 생성한 title_label 찾기
+        layout = self.layout()
+        if layout and layout.count() > 0:
+            ctrl_layout = layout.itemAt(0)
+            if ctrl_layout and ctrl_layout.layout():
+                title_item = ctrl_layout.layout().itemAt(0)
+                if title_item and title_item.widget():
+                    label = title_item.widget()
+                    if region:
+                        x, y, w, h = region
+                        label.setText(
+                            f"전체 KVM 미리보기  [부분제어: "
+                            f"({x:.0%},{y:.0%})~({x+w:.0%},{y+h:.0%})]"
+                        )
+                        label.setStyleSheet(
+                            "font-weight:bold; font-size:14px; color:#00BCD4;"
+                        )
+                    else:
+                        label.setText("전체 KVM 미리보기")
+                        label.setStyleSheet(
+                            "font-weight:bold; font-size:14px;"
+                        )
+        # 부분제어 해제 버튼 표시/숨김
+        if hasattr(self, 'btn_clear_crop'):
+            self.btn_clear_crop.setVisible(region is not None)
 
 
 class RegionSelectOverlay(QWidget):
@@ -1686,7 +1944,8 @@ class LiveViewDialog(QDialog):
         self._previous_quality = 80  # 저지연 모드 해제 시 복원할 품질
         self._page_loaded = False
         self._init_ui()
-        self.show()  # 즉시 표시 (로딩 오버레이와 함께)
+        # URL 로드 (WebView 생성 후 바로 시작)
+        self._load_kvm_url()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -1742,6 +2001,12 @@ class LiveViewDialog(QDialog):
         self.btn_game_mode.setStyleSheet(f"{_btn_style} background-color:#FF5722; color:white; font-weight:bold;")
         self.btn_game_mode.clicked.connect(self._toggle_game_mode)
         control_bar.addWidget(self.btn_game_mode)
+
+        btn_hangul = QPushButton("한/영")
+        btn_hangul.setToolTip("한/영 전환 (Right Alt)\n단축키: Ctrl+Space")
+        btn_hangul.setStyleSheet(f"{_btn_style} background-color:#795548; color:white;")
+        btn_hangul.clicked.connect(self._send_hangul_toggle)
+        control_bar.addWidget(btn_hangul)
 
         sep1 = QLabel("|"); sep1.setStyleSheet(_sep_style)
         control_bar.addWidget(sep1)
@@ -1812,12 +2077,18 @@ class LiveViewDialog(QDialog):
         self.btn_usb_eject.clicked.connect(self._on_usb_eject)
         func_bar.addWidget(self.btn_usb_eject)
 
+        self.btn_kb_reset = QPushButton("⌨ 리셋")
+        self.btn_kb_reset.setToolTip("키보드 HID 리셋\n키보드가 안 먹힐 때 사용\n(stuck key 해제 + HID 장치 재연결)")
+        self.btn_kb_reset.setStyleSheet(f"{_btn_style} background-color:#E91E63; color:white;")
+        self.btn_kb_reset.clicked.connect(self._on_keyboard_reset)
+        func_bar.addWidget(self.btn_kb_reset)
+
         sep_pc = QLabel("|"); sep_pc.setStyleSheet(_sep_style)
         func_bar.addWidget(sep_pc)
 
         # ── 부분제어 ──
         self.btn_partial_control = QPushButton("부분제어")
-        self.btn_partial_control.setToolTip("그룹 KVM 동일 영역 동시 표시 + 입력 브로드캐스트")
+        self.btn_partial_control.setToolTip("그룹 KVM 미리보기에 선택 영역만 크롭 표시")
         self.btn_partial_control.setStyleSheet(f"{_btn_style} background-color:#00BCD4; color:white; font-weight:bold;")
         self.btn_partial_control.clicked.connect(self._start_partial_control)
         func_bar.addWidget(self.btn_partial_control)
@@ -1910,11 +2181,6 @@ class LiveViewDialog(QDialog):
             }
         """)
 
-        # URL 로드
-        web_port = self.device.info.web_port if hasattr(self.device.info, 'web_port') else 80
-        url = f"http://{self.device.ip}:{web_port}"
-        self.web_view.setUrl(QUrl(url))
-
         # Vision 오버레이 (WebView 위에 투명하게 표시)
         self.vision_controller = None
         if VISION_AVAILABLE:
@@ -1959,11 +2225,55 @@ class LiveViewDialog(QDialog):
         sc_stop.setContext(Qt.ShortcutContext.WindowShortcut)
         sc_stop.activated.connect(lambda: self._stop_game_mode() if self.game_mode_active else None)
 
+        sc_hangul = QShortcut(QKeySequence("Ctrl+Space"), self)
+        sc_hangul.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_hangul.activated.connect(self._send_hangul_toggle)
+
+    def _send_hangul_toggle(self):
+        """한/영 전환 — Right Alt (독립 SSH exec_command로 전송)"""
+        import threading
+
+        def _do_send():
+            try:
+                import paramiko
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(self.device.ip, port=self.device.info.port,
+                            username=self.device.info.username,
+                            password=self.device.info.password, timeout=5)
+
+                # Right Alt (modifier 0x40) press → release
+                script = (
+                    "echo -ne '\\x40\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > /dev/hidg0; "
+                    "usleep 150000; "
+                    "echo -ne '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > /dev/hidg0; "
+                    "echo HANGUL_OK"
+                )
+                stdin, stdout, stderr = ssh.exec_command(script, timeout=5)
+                result = stdout.read().decode('utf-8', errors='replace').strip()
+                ssh.close()
+
+                if 'HANGUL_OK' in result:
+                    print("[HID] 한/영 전환 완료 (Right Alt)")
+                else:
+                    print(f"[HID] 한/영 전환 결과 불명: {result}")
+            except Exception as e:
+                print(f"[HID] 한/영 전환 오류: {e}")
+
+        threading.Thread(target=_do_send, daemon=True).start()
+
     def _toggle_control_bar(self):
         """상단 바 + 단축키 바 토글"""
         self.control_bar_visible = not self.control_bar_visible
         self.control_widget.setVisible(self.control_bar_visible)
         self.shortcut_bar.setVisible(self.control_bar_visible)
+
+    def _load_kvm_url(self):
+        """KVM URL 로드 시작"""
+        web_port = self.device.info.web_port if hasattr(self.device.info, 'web_port') else 80
+        url = f"http://{self.device.ip}:{web_port}"
+        print(f"[LiveView] URL 로드: {url}")
+        self.web_view.setUrl(QUrl(url))
 
     def _on_page_loaded(self, ok):
         self._page_loaded = True
@@ -2693,6 +3003,62 @@ class LiveViewDialog(QDialog):
             self.btn_usb_eject.setEnabled(True)
             print(f"[클라우드 마운트 오류] {e}")
 
+    def _on_keyboard_reset(self):
+        """키보드 HID 리셋 — kvm_app 재시작으로 /dev/hidg0 fd 갱신"""
+        import threading
+
+        def _do_reset():
+            try:
+                import paramiko, time
+
+                print("[HID] 키보드 리셋 시작 (kvm_app 재시작)...")
+
+                # 별도 SSH 연결 (exec_command 사용)
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(
+                    self.device.ip,
+                    port=self.device.info.port,
+                    username=self.device.info.username,
+                    password=self.device.info.password,
+                    timeout=5
+                )
+
+                shell = ssh.invoke_shell()
+                time.sleep(0.3)
+                if shell.recv_ready():
+                    shell.recv(4096)
+
+                # 1. kvm_app 종료
+                shell.send("killall kvm_app 2>/dev/null && echo KVM_APP_KILLED\n")
+                time.sleep(1.0)
+
+                # 2. kvm_app 재시작
+                shell.send("/userdata/picokvm/bin/kvm_app > /tmp/kvm_app.log 2>&1 &\n")
+                time.sleep(0.5)
+                shell.send("echo KVM_APP_RESTARTED\n")
+                time.sleep(1.0)
+
+                out = ''
+                while shell.recv_ready():
+                    out += shell.recv(4096).decode('utf-8', errors='replace')
+                print(f"[HID] 리셋 결과: {out.strip()}")
+
+                shell.close()
+                ssh.close()
+                print("[HID] 키보드 HID 리셋 완료 (kvm_app 재시작)")
+            except Exception as e:
+                print(f"[HID] 키보드 리셋 오류: {e}")
+
+        self.btn_kb_reset.setEnabled(False)
+        self.btn_kb_reset.setText("리셋 중...")
+        threading.Thread(target=_do_reset, daemon=True).start()
+        # kvm_app 재시작 + WebRTC 재연결 시간 고려하여 5초 후 버튼 복원
+        QTimer.singleShot(5000, lambda: (
+            self.btn_kb_reset.setEnabled(True),
+            self.btn_kb_reset.setText("⌨ 리셋")
+        ))
+
     def _on_usb_eject(self):
         """USB Mass Storage 해제 (백그라운드)"""
         try:
@@ -2773,21 +3139,6 @@ class LiveViewDialog(QDialog):
 
     def _start_partial_control(self):
         """부분제어 시작 — 영역 선택 오버레이 표시"""
-        group = self.device.info.group or 'default'
-
-        # MainWindow(parent)에서 manager 가져오기
-        main_win = self.parent()
-        if not hasattr(main_win, 'manager'):
-            QMessageBox.warning(self, "오류", "KVM 매니저를 찾을 수 없습니다.")
-            return
-
-        group_devices = main_win.manager.get_devices_by_group(group)
-        if len(group_devices) < 1:
-            QMessageBox.warning(self, "부분제어", "그룹에 기기가 없습니다.")
-            return
-
-        self._partial_devices = group_devices
-
         # 영역 선택 오버레이
         if not hasattr(self, '_region_overlay') or self._region_overlay is None:
             self._region_overlay = RegionSelectOverlay(self.web_view)
@@ -2797,13 +3148,23 @@ class LiveViewDialog(QDialog):
         self._region_overlay.show()
 
     def _on_region_selected(self, x, y, w, h):
-        """영역 선택 완료 → PartialControlDialog 열기"""
-        devices = getattr(self, '_partial_devices', [])
-        if not devices:
-            return
+        """영역 선택 완료 → LiveViewDialog 닫고 GridViewTab에 크롭 적용"""
+        main_win = self.parent()
+        group = self.device.info.group or 'default'
+        print(f"[부분제어] 영역 선택: ({x}, {y}, {w}, {h}), group={group}, device={self.device.name}")
 
-        dialog = PartialControlDialog(devices, (x, y, w, h), self)
-        dialog.exec()
+        # 부분제어 플래그 설정 (close 후 _restart_device_preview 방지)
+        self._partial_control_closing = True
+
+        # LiveViewDialog 닫기
+        self.close()
+
+        # MainWindow의 GridViewTab들에 크롭 적용
+        if hasattr(main_win, '_apply_partial_crop'):
+            print(f"[부분제어] _apply_partial_crop 호출: group={group}, region=({x},{y},{w},{h})")
+            main_win._apply_partial_crop(group, (x, y, w, h))
+        else:
+            print("[부분제어] 경고: MainWindow에 _apply_partial_crop 없음")
 
     # ─── Vision 기능 ─────────────────────────────────────
 
@@ -3027,6 +3388,13 @@ class LiveViewDialog(QDialog):
             self._stop_recording()
         if self.vision_controller:
             self.vision_controller.cleanup()
+        # WebView 정리 (WebRTC 연결 해제 + 포커스 반환)
+        try:
+            self.web_view.setUrl(QUrl("about:blank"))
+            self.web_view.setParent(None)
+            self.web_view.deleteLater()
+        except Exception:
+            pass
         self.hid.disconnect()
         super().closeEvent(event)
 
@@ -3185,6 +3553,7 @@ class MainWindow(QMainWindow):
 
         self.status_thread: StatusUpdateThread = None
         self.current_device: KVMDevice = None
+        self._live_control_device: str = None  # 1:1 제어 중인 장치 이름 (WebRTC 충돌 방지)
         self._initializing = True  # 초기화 중 플래그
         self._upload_progress = None
         self._upload_thread = None
@@ -3527,22 +3896,28 @@ class MainWindow(QMainWindow):
         return widget
 
     def _on_tab_changed(self, index):
-        """메인 탭 변경 시 호출 - 현재 탭만 활성화, 나머지는 pause"""
+        """메인 탭 변경 시 호출 — 이전 탭 stop → 현재 탭 start
+
+        KVM은 동시 1개 연결만 지원하므로:
+        1) 이전 탭의 모든 WebView를 완전 중지 (WebRTC 해제)
+        2) 약간의 지연 후 현재 탭 활성화 (WebRTC 해제 대기)
+        """
         try:
             if hasattr(self, '_initializing') and self._initializing:
                 return
 
             current_widget = self.tab_widget.widget(index)
 
-            # 모든 GridViewTab pause (현재 탭 제외)
+            # 1. 모든 다른 GridViewTab 완전 중지 (WebRTC 연결 해제)
             all_tabs = [self.grid_view_tab] + list(self.group_grid_tabs.values())
             for tab in all_tabs:
                 if tab is not current_widget and tab._is_visible:
                     tab.on_tab_deactivated()
 
-            # 현재 탭이 GridViewTab이면 활성화
+            # 2. 현재 탭이 GridViewTab이면 지연 후 활성화
+            #    (이전 탭의 WebRTC 해제가 완료될 시간 확보)
             if isinstance(current_widget, GridViewTab):
-                current_widget.on_tab_activated()
+                QTimer.singleShot(300, current_widget.on_tab_activated)
         except Exception as e:
             print(f"[MainWindow] _on_tab_changed 오류: {e}")
 
@@ -4250,38 +4625,109 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "경고", "장치를 먼저 선택해주세요.")
             return
 
-        # 1:1 제어 시작 전: 해당 장치의 미리보기 중지
+        # 1:1 제어 시작 전: 해당 장치의 미리보기 중지 + 플래그 설정
+        self._live_control_device = self.current_device.name
         self._stop_device_preview(self.current_device)
 
-        # 즉시 커서 변경으로 피드백 제공
-        self.setCursor(Qt.CursorShape.WaitCursor)
-        QApplication.processEvents()
-
+        # 다이얼로그 생성 (URL은 __init__에서 로드)
         dialog = LiveViewDialog(self.current_device, self)
-        self.setCursor(Qt.CursorShape.ArrowCursor)
         dialog.exec()
+
+        # 1:1 제어 종료 — 플래그 해제 + 메인 윈도우 활성화
+        self._live_control_device = None
+        self.activateWindow()
+        self.raise_()
+
+        # 부분제어로 닫힌 경우 → 미리보기 재시작 하지 않음 (탭 전환에서 처리)
+        if getattr(dialog, '_partial_control_closing', False):
+            return
 
         # 1:1 제어 종료 후: 해당 장치의 미리보기 재시작
         self._restart_device_preview(self.current_device)
 
+    def _apply_partial_crop(self, group: str, region: tuple):
+        """부분제어 — 해당 그룹 탭으로 전환하고 크롭 적용
+
+        1) 모든 탭의 WebView를 완전 중지 (KVM 단일 스트림 해제)
+        2) 크롭 영역 저장
+        3) 대상 탭으로 전환 → 새로 start_capture → _on_load_finished → 크롭 자동 적용
+        """
+        print(f"[부분제어] _apply_partial_crop 시작: group={group}, region={region}")
+
+        # 해당 그룹 탭 찾기
+        target_tab = self.group_grid_tabs.get(group)
+        if not target_tab:
+            target_tab = self.grid_view_tab
+            print(f"[부분제어] 그룹 '{group}' 탭 없음 → 전체 목록 탭 사용")
+        else:
+            print(f"[부분제어] 그룹 '{group}' 탭 찾음")
+
+        # 1. 모든 탭의 WebView 완전 중지 (WebRTC 해제)
+        all_tabs = [self.grid_view_tab] + list(self.group_grid_tabs.values())
+        stopped = 0
+        for tab in all_tabs:
+            if tab._is_visible:
+                tab.on_tab_deactivated()
+                stopped += 1
+        print(f"[부분제어] {stopped}개 탭 중지 완료")
+
+        # 2. 크롭 영역 저장 (새 썸네일 생성 시 자동 적용)
+        target_tab._crop_region = region
+        target_tab._update_title_for_crop(region)
+        print(f"[부분제어] 크롭 영역 저장: {region}")
+
+        # 3. 대상 탭으로 전환
+        idx = self.tab_widget.indexOf(target_tab)
+        if idx >= 0:
+            current_idx = self.tab_widget.currentIndex()
+            print(f"[부분제어] 탭 전환: current={current_idx} → target={idx}")
+            if current_idx == idx:
+                # 이미 같은 탭 — currentChanged가 발생하지 않으므로 수동 활성화
+                print("[부분제어] 같은 탭 — 수동 on_tab_activated (300ms)")
+                QTimer.singleShot(300, target_tab.on_tab_activated)
+            else:
+                # 다른 탭 — setCurrentIndex → _on_tab_changed에서 처리
+                print("[부분제어] 다른 탭 — setCurrentIndex")
+                self.tab_widget.setCurrentIndex(idx)
+        else:
+            print(f"[부분제어] 경고: target_tab의 인덱스를 찾을 수 없음")
+
     def _stop_device_preview(self, device: KVMDevice):
-        """특정 장치의 미리보기 중지"""
+        """특정 장치의 미리보기 중지 (전체 탭 + 그룹 탭 모두 처리)"""
+        all_tabs = []
         if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
-            for thumb in self.grid_view_tab.thumbnails:
+            all_tabs.append(self.grid_view_tab)
+        if hasattr(self, 'group_grid_tabs'):
+            all_tabs.extend(self.group_grid_tabs.values())
+
+        for tab in all_tabs:
+            for thumb in tab.thumbnails:
                 if thumb.device.name == device.name:
                     thumb.stop_capture()
                     break
 
     def _restart_device_preview(self, device: KVMDevice):
-        """특정 장치의 미리보기 재시작"""
+        """특정 장치의 미리보기 재시작 (전체 탭 + 그룹 탭 모두 처리)"""
+        # 모든 탭에서 해당 장치의 썸네일을 찾아 재시작
+        all_tabs = []
         if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
-            # 전체 목록 탭이 활성화되어 있고 미리보기가 켜져 있을 때만
-            if self.grid_view_tab._is_visible and self.grid_view_tab._live_preview_enabled:
-                for thumb in self.grid_view_tab.thumbnails:
+            all_tabs.append(self.grid_view_tab)
+        if hasattr(self, 'group_grid_tabs'):
+            all_tabs.extend(self.group_grid_tabs.values())
+
+        restarted = False
+        for tab in all_tabs:
+            if tab._is_visible and tab._live_preview_enabled:
+                for thumb in tab.thumbnails:
                     if thumb.device.name == device.name:
                         # 약간의 지연 후 재시작 (WebRTC 연결 정리 대기)
                         QTimer.singleShot(500, thumb.start_capture)
+                        restarted = True
                         break
+        if restarted:
+            print(f"[MainWindow] 미리보기 재시작 예약: {device.name}")
+        else:
+            print(f"[MainWindow] 미리보기 재시작 건너뜀 (활성 탭 없음): {device.name}")
 
     def _on_open_web_browser(self):
         if not self.current_device:
