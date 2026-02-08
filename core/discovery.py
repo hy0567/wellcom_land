@@ -36,7 +36,51 @@ class NetworkScanner:
 
     @staticmethod
     def get_local_ip() -> str:
-        """로컬 IP 주소 가져오기"""
+        """로컬 IP 주소 가져오기 (실제 LAN IP 우선)
+
+        우선순위:
+        1. 192.168.x.x, 10.x.x.x (일반 LAN)
+        2. 172.16-31.x.x (사설 네트워크)
+        3. 기타 (Tailscale 100.x, APIPA 169.254.x 등은 후순위)
+        """
+        try:
+            # 모든 인터페이스의 IP 수집
+            import subprocess
+            result = subprocess.run(
+                ['powershell', '-Command',
+                 "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' } | Select-Object -ExpandProperty IPAddress"],
+                capture_output=True, text=True, timeout=5
+            )
+            all_ips = [ip.strip() for ip in result.stdout.strip().split('\n') if ip.strip()]
+
+            if all_ips:
+                # 우선순위별 분류
+                lan_ips = []      # 192.168.x.x, 10.x.x.x
+                private_ips = []  # 172.16-31.x.x
+                other_ips = []    # 나머지
+
+                for ip in all_ips:
+                    if ip.startswith('192.168.') or ip.startswith('10.'):
+                        lan_ips.append(ip)
+                    elif ip.startswith('172.'):
+                        parts = ip.split('.')
+                        if 16 <= int(parts[1]) <= 31:
+                            private_ips.append(ip)
+                        else:
+                            other_ips.append(ip)
+                    elif ip.startswith('169.254.') or ip.startswith('100.'):
+                        other_ips.append(ip)  # APIPA, Tailscale → 후순위
+                    else:
+                        other_ips.append(ip)
+
+                # 우선순위 순서대로 반환
+                for ip_list in [lan_ips, private_ips, other_ips]:
+                    if ip_list:
+                        return ip_list[0]
+        except Exception:
+            pass
+
+        # 폴백: 기존 방식
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
