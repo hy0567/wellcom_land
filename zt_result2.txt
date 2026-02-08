@@ -1,0 +1,43 @@
+=== ZeroTier Status ===
+200 info 89d98c50b5 1.16.1 ONLINE
+
+
+=== ZeroTier Networks ===
+200 listnetworks <nwid> <name> <mac> <status> <type> <dev> <ZT assigned ips>
+
+200 listnetworks 4cadbb9187000001 WellcomLAND 02:89:d9:0b:c1:0e OK PRIVATE ethernet_32774 10.147.17.204/24
+
+
+=== ZeroTier Peers ===
+200 listpeers <ztaddr> <path> <latency> <version> <role>
+
+200 listpeers 0501445ce5 125.138.135.172/61110;8630;8624 4 1.16.1 LEAF
+
+200 listpeers 4cadbb9187 125.138.135.172/33556;1476;1476 11 1.16.1 LEAF
+
+200 listpeers 778cde7190 103.195.103.66/9993;2744;105302 -1 - PLANET
+
+200 listpeers cafe04eba9 84.17.53.155/9993;2744;105120 -446 - PLANET
+
+200 listpeers cafe80ed74 185.152.67.145/9993;2744;100404 -734 - PLANET
+
+200 listpeers cafefd6717 79.127.159.187/9993;2744;82244 61 - PLANET
+
+
+=== IPv4 Addresses ===
+이더넷 어댑터 ZeroTier One [4cadbb9187000001]:
+   IPv4 주소 . . . . . . . . . : 10.147.17.204
+   IPv4 주소 . . . . . . . . . : 192.168.0.198
+
+=== Ping 10.147.17.94 (ZT Server) ===
+Ping 10.147.17.94 32바이트 데이터 사용:
+10.147.17.94의 응답: 바이트=32 시간=16ms TTL=64
+10.147.17.94의 응답: 바이트=32 시간=2ms TTL=64
+
+10.147.17.94에 대한 Ping 통계:
+    패킷: 보냄 = 2, 받음 = 2, 손실 = 0 (0% 손실),
+왕복 시간(밀리초):
+    최소 = 2ms, 최대 = 16ms, 평균 = 9ms
+
+=== Socket IPs ===
+['192.168.0.198', '10.147.17.204']

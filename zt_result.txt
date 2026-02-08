@@ -1,0 +1,2 @@
+=== ZeroTier Status === 
+200 info 89d98c50b5 1.16.1 ONLINE
