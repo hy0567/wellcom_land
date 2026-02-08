@@ -559,11 +559,126 @@ def get_my_quota(user: dict = Depends(get_current_user)):
 
 
 # ===========================================================
+# ZeroTier 네트워크 관리
+# ===========================================================
+ZEROTIER_NETWORK_ID = "4cadbb9187000001"
+ZEROTIER_API = "http://127.0.0.1:9993"
+
+
+def _zt_auth_token():
+    """ZeroTier 컨트롤러 인증 토큰"""
+    try:
+        with open("/var/lib/zerotier-one/authtoken.secret", "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+@app.post("/api/zerotier/authorize")
+def zerotier_authorize(user: dict = Depends(get_current_user)):
+    """로그인한 사용자의 ZeroTier 노드 자동 승인
+
+    클라이언트가 body로 {"node_id": "abcdef1234"} 전송
+    """
+    import json
+    from fastapi import Request
+
+    # node_id는 body에서 가져옴
+    # FastAPI에서 직접 받기 위해 별도 모델 없이 처리
+    return {"error": "use POST with node_id"}
+
+
+@app.post("/api/zerotier/join")
+def zerotier_join(data: dict, user: dict = Depends(get_current_user)):
+    """ZeroTier 노드 승인 요청
+
+    Body: {"node_id": "89d98c50b5"}
+    - 로그인한 사용자만 자신의 노드를 승인 요청 가능
+    - 서버가 컨트롤러 API로 해당 노드를 authorize
+    """
+    import requests as req
+
+    node_id = data.get("node_id", "").strip()
+    if not node_id or len(node_id) != 10:
+        raise HTTPException(status_code=400, detail="유효하지 않은 ZeroTier 노드 ID")
+
+    token = _zt_auth_token()
+    if not token:
+        raise HTTPException(status_code=500, detail="ZeroTier 컨트롤러 접근 불가")
+
+    # 컨트롤러에 멤버 승인
+    url = f"{ZEROTIER_API}/controller/network/{ZEROTIER_NETWORK_ID}/member/{node_id}"
+    headers = {"X-ZT1-Auth": token}
+    payload = {
+        "authorized": True,
+        "name": f"user-{user['username']}-{node_id[:6]}",
+    }
+
+    try:
+        resp = req.post(url, json=payload, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            member = resp.json()
+            return {
+                "status": "ok",
+                "authorized": member.get("authorized"),
+                "ip_assignments": member.get("ipAssignments", []),
+                "network_id": ZEROTIER_NETWORK_ID,
+            }
+        else:
+            raise HTTPException(status_code=502, detail=f"ZeroTier 컨트롤러 오류: {resp.status_code}")
+    except req.exceptions.ConnectionError:
+        raise HTTPException(status_code=502, detail="ZeroTier 컨트롤러 연결 실패")
+
+
+@app.get("/api/zerotier/network")
+def zerotier_network_info(user: dict = Depends(get_current_user)):
+    """ZeroTier 네트워크 정보 (클라이언트가 join할 네트워크 ID 제공)"""
+    return {
+        "network_id": ZEROTIER_NETWORK_ID,
+        "name": "WellcomLAND",
+    }
+
+
+@app.get("/api/admin/zerotier/members")
+def zerotier_list_members(admin: dict = Depends(require_admin)):
+    """ZeroTier 네트워크 멤버 목록 (관리자 전용)"""
+    import requests as req
+
+    token = _zt_auth_token()
+    if not token:
+        raise HTTPException(status_code=500, detail="ZeroTier 컨트롤러 접근 불가")
+
+    url = f"{ZEROTIER_API}/controller/network/{ZEROTIER_NETWORK_ID}/member"
+    headers = {"X-ZT1-Auth": token}
+
+    try:
+        resp = req.get(url, headers=headers, timeout=10)
+        member_ids = resp.json()
+
+        members = []
+        for mid, revision in member_ids.items():
+            detail_resp = req.get(f"{url}/{mid}", headers=headers, timeout=5)
+            if detail_resp.status_code == 200:
+                m = detail_resp.json()
+                members.append({
+                    "node_id": mid,
+                    "name": m.get("name", ""),
+                    "authorized": m.get("authorized", False),
+                    "ip_assignments": m.get("ipAssignments", []),
+                    "last_seen": m.get("lastSeen", 0),
+                })
+
+        return {"network_id": ZEROTIER_NETWORK_ID, "members": members}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ===========================================================
 # Version (공개)
 # ===========================================================
 @app.get("/api/version")
 def get_version():
-    return {"version": "1.5.0", "app_name": "WellcomLAND"}
+    return {"version": "1.7.3", "app_name": "WellcomLAND"}
 
 
 # ===========================================================

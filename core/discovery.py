@@ -35,8 +35,98 @@ class NetworkScanner:
     TIMEOUT = 1.5
 
     @staticmethod
-    def get_local_ip() -> str:
+    def _get_all_ipv4_addresses() -> List[str]:
+        """모든 IPv4 주소 수집 (순수 Python - PowerShell/cmd 불필요)
+
+        방법 1: socket.getaddrinfo (크로스 플랫폼)
+        방법 2: ctypes Windows API (경량 Windows 대응)
+        방법 3: PowerShell 폴백 (가능한 경우)
+        """
+        all_ips = []
+
+        # 방법 1: socket.getaddrinfo + hostname
+        try:
+            hostname = socket.gethostname()
+            addr_infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+            for info in addr_infos:
+                ip = info[4][0]
+                if ip != '127.0.0.1' and ip not in all_ips:
+                    all_ips.append(ip)
+        except Exception:
+            pass
+
+        # 방법 2: 여러 대상에 UDP 연결하여 각 인터페이스 IP 수집
+        test_targets = [
+            ("192.168.0.1", 80),    # 일반 LAN 게이트웨이
+            ("192.168.1.1", 80),    # 일반 LAN 게이트웨이
+            ("192.168.68.1", 80),   # 일부 LAN 게이트웨이
+            ("10.0.0.1", 80),       # 10.x 대역
+            ("172.16.0.1", 80),     # 172 사설 대역
+            ("8.8.8.8", 80),        # 인터넷 (기본 라우트)
+        ]
+        for target_ip, target_port in test_targets:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.1)
+                s.connect((target_ip, target_port))
+                ip = s.getsockname()[0]
+                s.close()
+                if ip != '127.0.0.1' and ip not in all_ips:
+                    all_ips.append(ip)
+            except Exception:
+                pass
+
+        # 방법 3: PowerShell 폴백 (가능한 경우에만)
+        if not all_ips:
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['powershell', '-Command',
+                     "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' } | Select-Object -ExpandProperty IPAddress"],
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=0x08000000  # CREATE_NO_WINDOW
+                )
+                for ip in result.stdout.strip().split('\n'):
+                    ip = ip.strip()
+                    if ip and ip != '127.0.0.1' and ip not in all_ips:
+                        all_ips.append(ip)
+            except Exception:
+                pass
+
+        return all_ips
+
+    @staticmethod
+    def _classify_ip(ip: str) -> int:
+        """IP 주소 우선순위 분류 (낮을수록 우선)
+
+        Returns:
+            0: 192.168.x.x, 10.x.x.x (일반 LAN) - 최우선
+            1: 172.16-31.x.x (사설 네트워크)
+            2: 기타 사설
+            3: 100.x (Tailscale/CGNAT)
+            4: 169.254.x (APIPA/링크로컬)
+        """
+        if ip.startswith('192.168.') or ip.startswith('10.'):
+            return 0
+        elif ip.startswith('172.'):
+            parts = ip.split('.')
+            try:
+                if 16 <= int(parts[1]) <= 31:
+                    return 1
+            except (IndexError, ValueError):
+                pass
+            return 2
+        elif ip.startswith('100.'):
+            return 3  # Tailscale / CGNAT
+        elif ip.startswith('169.254.'):
+            return 4  # APIPA
+        return 2
+
+    @classmethod
+    def get_local_ip(cls) -> str:
         """로컬 IP 주소 가져오기 (실제 LAN IP 우선)
+
+        순수 Python 방식 - PowerShell/cmd 없이 동작 (경량 Windows 대응)
 
         우선순위:
         1. 192.168.x.x, 10.x.x.x (일반 LAN)
@@ -44,43 +134,19 @@ class NetworkScanner:
         3. 기타 (Tailscale 100.x, APIPA 169.254.x 등은 후순위)
         """
         try:
-            # 모든 인터페이스의 IP 수집
-            import subprocess
-            result = subprocess.run(
-                ['powershell', '-Command',
-                 "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' } | Select-Object -ExpandProperty IPAddress"],
-                capture_output=True, text=True, timeout=5
-            )
-            all_ips = [ip.strip() for ip in result.stdout.strip().split('\n') if ip.strip()]
+            all_ips = cls._get_all_ipv4_addresses()
 
             if all_ips:
-                # 우선순위별 분류
-                lan_ips = []      # 192.168.x.x, 10.x.x.x
-                private_ips = []  # 172.16-31.x.x
-                other_ips = []    # 나머지
+                # 우선순위별 정렬
+                all_ips.sort(key=cls._classify_ip)
+                best_ip = all_ips[0]
+                print(f"[Network] IP 감지: {best_ip} (전체: {all_ips})")
+                return best_ip
 
-                for ip in all_ips:
-                    if ip.startswith('192.168.') or ip.startswith('10.'):
-                        lan_ips.append(ip)
-                    elif ip.startswith('172.'):
-                        parts = ip.split('.')
-                        if 16 <= int(parts[1]) <= 31:
-                            private_ips.append(ip)
-                        else:
-                            other_ips.append(ip)
-                    elif ip.startswith('169.254.') or ip.startswith('100.'):
-                        other_ips.append(ip)  # APIPA, Tailscale → 후순위
-                    else:
-                        other_ips.append(ip)
+        except Exception as e:
+            print(f"[Network] IP 감지 오류: {e}")
 
-                # 우선순위 순서대로 반환
-                for ip_list in [lan_ips, private_ips, other_ips]:
-                    if ip_list:
-                        return ip_list[0]
-        except Exception:
-            pass
-
-        # 폴백: 기존 방식
+        # 최종 폴백: 기존 방식
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))

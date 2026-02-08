@@ -161,6 +161,13 @@ def main():
     # OpenGL 소프트웨어 렌더링 비활성화 (하드웨어 가속 강제)
     app.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, False)
 
+    # 네트워크 우선순위 자동 조정 (Tailscale/APIPA가 기본인 경우)
+    try:
+        from core.network_fixer import auto_fix_network
+        auto_fix_network()
+    except Exception as e:
+        print(f"[App] 네트워크 자동 조정 건너뜀: {e}")
+
     # 업데이트 확인 (업데이트 적용 시 재시작)
     if not check_for_updates(app):
         return

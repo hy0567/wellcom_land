@@ -4,7 +4,7 @@
 ; 출력: dist/WellcomLAND_Setup.exe
 
 #define MyAppName "WellcomLAND"
-#define MyAppVersion "1.7.2"
+#define MyAppVersion "1.7.3"
 #define MyAppPublisher "Wellcom"
 #define MyAppExeName "WellcomLAND.exe"
 
@@ -57,8 +57,14 @@ Source: "..\dist\WellcomLAND\_internal\*"; DestDir: "{app}\_internal"; Flags: ig
 ; app/ 코드 - .pyc 파일 — ★ 항상 덮어쓰기 (업그레이드 시에도 최신 코드 반영)
 Source: "..\dist\WellcomLAND\_internal\app\*"; DestDir: "{app}\app"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-; Tailscale 설치 파일 (임시 폴더에 복사, 설치 후 삭제)
-Source: "tailscale-setup.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; 네트워크 우선순위 수정 도구
+Source: "fix_network_priority.bat"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "fix_network_priority.py"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "fix_network_priority.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "..\dist\tools\fix_network_priority.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
+
+; ZeroTier VPN (임시 폴더에 복사, 설치 후 삭제)
+Source: "ZeroTierOne.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 ; data/ 빈 폴더 생성 (기존 데이터 보존)
 [Dirs]
@@ -73,11 +79,13 @@ Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: 
 
 [Tasks]
 Name: "desktopicon"; Description: "바탕화면에 바로가기 생성"; GroupDescription: "추가 옵션:"
-Name: "installtailscale"; Description: "Tailscale VPN 설치 (네트워크 연결용)"; GroupDescription: "추가 옵션:"; Flags: unchecked
+Name: "installzerotier"; Description: "ZeroTier VPN 설치 (원격 네트워크 연결용 - 권장)"; GroupDescription: "추가 옵션:"
 
 [Run]
-; Tailscale 자동 설치 (사용자 선택 시)
-Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\tailscale-setup.msi"" /quiet /norestart"; StatusMsg: "Tailscale VPN 설치 중..."; Flags: shellexec waituntilterminated; Tasks: installtailscale
+; ZeroTier 설치 (사용자 선택 시)
+Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\ZeroTierOne.msi"" /quiet /norestart"; StatusMsg: "ZeroTier VPN 설치 중..."; Flags: shellexec waituntilterminated; Tasks: installzerotier
+; ZeroTier 네트워크 자동 참가 (설치 후 5초 대기 → join)
+Filename: "cmd.exe"; Parameters: "/c timeout /t 5 /nobreak >nul & ""C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat"" join 4cadbb9187000001"; StatusMsg: "ZeroTier 네트워크 연결 중..."; Flags: shellexec waituntilterminated runhidden; Tasks: installzerotier
 ; WellcomLAND 실행
 Filename: "{app}\{#MyAppExeName}"; Description: "WellcomLAND 실행"; Flags: nowait postinstall skipifsilent
 

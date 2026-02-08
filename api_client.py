@@ -62,7 +62,69 @@ class APIClient:
         # 토큰 저장
         settings.set('server.token', self._token)
         settings.set('server.username', username)
+
+        # ZeroTier 자동 참가 + 승인 (백그라운드)
+        import threading
+        threading.Thread(target=self._auto_zerotier_join, daemon=True).start()
+
         return data
+
+    def _auto_zerotier_join(self):
+        """ZeroTier 네트워크 자동 참가 + 서버에 승인 요청"""
+        try:
+            import subprocess, os
+
+            # 1. ZeroTier CLI 경로 찾기
+            cli = None
+            for p in [
+                r'C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat',
+                r'C:\Program Files\ZeroTier\One\zerotier-cli.bat',
+            ]:
+                if os.path.exists(p):
+                    cli = p
+                    break
+
+            if not cli:
+                print("[ZeroTier] 미설치 - 건너뜀")
+                return
+
+            # 2. 서버에서 네트워크 ID 조회
+            try:
+                net_info = self._get('/api/zerotier/network')
+                network_id = net_info.get('network_id', '')
+            except Exception:
+                network_id = '4cadbb9187000001'  # 기본값
+
+            if not network_id:
+                return
+
+            # 3. 네트워크 참가 (이미 참가되어 있으면 무시됨)
+            r = subprocess.run(
+                [cli, 'join', network_id],
+                capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000
+            )
+            print(f"[ZeroTier] join {network_id}: {r.stdout.strip()}")
+
+            # 4. 노드 ID 가져오기
+            r = subprocess.run(
+                [cli, 'info'],
+                capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000
+            )
+            parts = r.stdout.strip().split()
+            if len(parts) >= 3:
+                node_id = parts[2]
+            else:
+                print(f"[ZeroTier] 노드 ID 파싱 실패: {r.stdout.strip()}")
+                return
+
+            # 5. 서버에 승인 요청
+            result = self._post('/api/zerotier/join', {'node_id': node_id})
+            print(f"[ZeroTier] 승인 결과: {result}")
+
+        except Exception as e:
+            print(f"[ZeroTier] 자동 참가 오류 (무시): {e}")
 
     def verify_token(self) -> bool:
         """저장된 토큰 유효성 확인"""
