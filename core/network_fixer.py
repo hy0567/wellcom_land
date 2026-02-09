@@ -163,12 +163,15 @@ def enable_ip_forwarding() -> bool:
 
     ZeroTier Managed Route를 통해 원격 PC가 관제 PC의 KVM 서브넷에 접근하려면
     관제 PC의 Windows에서 IP Forwarding이 활성화되어야 합니다.
+
+    1단계: 레지스트리 (재부팅 후 영구 적용)
+    2단계: netsh interface forwarding=enabled (즉시 적용, 재부팅 불필요)
     """
     if not is_admin():
         return False
 
     try:
-        # 현재 상태 확인
+        # 현재 레지스트리 상태 확인
         result = subprocess.run(
             ['reg', 'query',
              r'HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters',
@@ -177,21 +180,21 @@ def enable_ip_forwarding() -> bool:
             creationflags=0x08000000
         )
 
-        if '0x1' in result.stdout:
-            print("[IPForward] 이미 활성화됨")
-            return True
+        registry_ok = '0x1' in result.stdout
 
-        # 레지스트리 설정
-        result = subprocess.run(
-            ['reg', 'add',
-             r'HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters',
-             '/v', 'IPEnableRouter', '/t', 'REG_DWORD', '/d', '1', '/f'],
-            capture_output=True, text=True, timeout=5,
-            creationflags=0x08000000
-        )
+        if not registry_ok:
+            # 레지스트리 설정 (재부팅 후 영구 적용)
+            result = subprocess.run(
+                ['reg', 'add',
+                 r'HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters',
+                 '/v', 'IPEnableRouter', '/t', 'REG_DWORD', '/d', '1', '/f'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000
+            )
+            if result.returncode == 0:
+                print("[IPForward] 레지스트리 IP Forwarding 설정 완료")
+                registry_ok = True
 
-        if result.returncode == 0:
-            print("[IPForward] IP Forwarding 활성화 완료")
             # RemoteAccess 서비스 시작 시도
             subprocess.run(
                 ['sc', 'config', 'RemoteAccess', 'start=', 'auto'],
@@ -203,12 +206,65 @@ def enable_ip_forwarding() -> bool:
                 capture_output=True, timeout=5,
                 creationflags=0x08000000
             )
-            return True
+        else:
+            print("[IPForward] 레지스트리 이미 활성화됨")
+
+        # 런타임 forwarding 활성화 (즉시 적용, 재부팅 불필요)
+        _enable_runtime_forwarding()
+
+        return registry_ok
 
     except Exception as e:
         print(f"[IPForward] 오류: {e}")
 
     return False
+
+
+def _enable_runtime_forwarding():
+    """netsh로 인터페이스별 IP forwarding 즉시 활성화
+
+    레지스트리만으로는 재부팅이 필요하지만,
+    netsh interface ipv4 set interface <idx> forwarding=enabled 는 즉시 적용됨.
+    """
+    try:
+        # 인터페이스 목록 조회
+        result = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'show', 'interfaces'],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000
+        )
+        if result.returncode != 0:
+            return
+
+        # 활성 인터페이스의 Idx 추출 (connected 상태)
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if not line or 'connected' not in line.lower():
+                continue
+
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+
+            try:
+                idx = int(parts[0])
+            except ValueError:
+                continue
+
+            # 각 인터페이스에 forwarding 활성화
+            r = subprocess.run(
+                ['netsh', 'interface', 'ipv4', 'set', 'interface',
+                 str(idx), 'forwarding=enabled'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000
+            )
+            if r.returncode == 0:
+                # 인터페이스 이름 추출 (마지막 컬럼)
+                name = parts[-1] if len(parts) > 4 else str(idx)
+                print(f"[IPForward] interface {idx} ({name}) forwarding=enabled")
+
+    except Exception as e:
+        print(f"[IPForward] 런타임 forwarding 설정 오류: {e}")
 
 
 def setup_zt_subnet_route(api_client, zt_ip: str, lan_ip: str):
@@ -236,12 +292,49 @@ def setup_zt_subnet_route(api_client, zt_ip: str, lan_ip: str):
         print(f"[ZTRoute] route 등록 실패 (무시): {e}")
 
 
+def setup_relay_firewall_rules():
+    """KVM 릴레이 포트에 대한 Windows 방화벽 규칙 추가
+
+    TCP 18000-19999 (KVM TCP 프록시)
+    UDP 28000-29999 (WebRTC 미디어 릴레이)
+    """
+    if not is_admin():
+        return
+
+    rules = [
+        ('WellcomLAND-Relay-TCP', 'TCP', '18000-19999'),
+        ('WellcomLAND-Relay-UDP', 'UDP', '28000-29999'),
+    ]
+
+    for name, proto, ports in rules:
+        try:
+            # 기존 규칙 제거 후 재생성
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                 f'name={name}'],
+                capture_output=True, timeout=5,
+                creationflags=0x08000000
+            )
+            result = subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                 f'name={name}', 'dir=in', 'action=allow',
+                 f'protocol={proto}', f'localport={ports}'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000
+            )
+            if result.returncode == 0:
+                print(f"[Firewall] {name} ({proto} {ports}) 규칙 추가")
+        except Exception as e:
+            print(f"[Firewall] {name} 규칙 추가 실패: {e}")
+
+
 def auto_setup_zt_forwarding(api_client=None, zt_ip: str = "", lan_ip: str = ""):
     """관제 PC에서 ZeroTier 서브넷 라우팅 자동 설정
 
-    1. IP Forwarding 활성화
+    1. IP Forwarding 활성화 (레지스트리 + 런타임)
     2. ZeroTier 인터페이스에서 allowGlobal 설정
-    3. 서버에 subnet route 등록
+    3. 방화벽 규칙 추가 (릴레이 포트)
+    4. 서버에 subnet route 등록
     """
     if not zt_ip or not lan_ip:
         return
@@ -252,7 +345,7 @@ def auto_setup_zt_forwarding(api_client=None, zt_ip: str = "", lan_ip: str = "")
 
     print(f"[ZTForward] 관제 PC 서브넷 라우팅 설정: LAN={lan_ip} ZT={zt_ip}")
 
-    # 1. IP Forwarding 활성화
+    # 1. IP Forwarding 활성화 (레지스트리 + 런타임 netsh)
     enable_ip_forwarding()
 
     # 2. ZeroTier allowGlobal 설정
@@ -286,7 +379,10 @@ def auto_setup_zt_forwarding(api_client=None, zt_ip: str = "", lan_ip: str = "")
     except Exception as e:
         print(f"[ZTForward] allowGlobal 설정 오류 (무시): {e}")
 
-    # 3. 서버에 subnet route 등록
+    # 3. 방화벽 규칙 추가
+    setup_relay_firewall_rules()
+
+    # 4. 서버에 subnet route 등록
     if api_client:
         setup_zt_subnet_route(api_client, zt_ip, lan_ip)
 

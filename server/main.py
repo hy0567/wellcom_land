@@ -888,7 +888,7 @@ def delete_kvm(kvm_id: int, user: dict = Depends(require_admin)):
 # ===========================================================
 @app.get("/api/version")
 def get_version():
-    return {"version": "1.8.2", "app_name": "WellcomLAND"}
+    return {"version": "1.8.4", "app_name": "WellcomLAND"}
 
 
 # ===========================================================

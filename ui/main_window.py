@@ -567,17 +567,24 @@ class KVMThumbnailWidget(QFrame):
         try:
             relay_ip = self.device.ip
             web_port = self.device.info.web_port
-            udp_port = 28000 + (web_port - 18000) if web_port >= 18000 else 28000 + int(relay_ip.split('.')[-1])
+            # UDP 릴레이 포트
+            udp_port = getattr(self.device.info, '_udp_relay_port', None)
+            if not udp_port:
+                udp_port = 28000 + (web_port - 18000) if web_port >= 18000 else 28000 + int(relay_ip.split('.')[-1])
+            tcp_port = web_port
 
             ice_js = (
-                "(function(){var R='%s',U=%d;"
+                "(function(){var R='%s',U=%d,T=%d,_n=0;"
+                # notifyUdpPort function
+                "function N(p){if(_n===p)return;_n=p;"
+                "fetch('http://'+R+':'+T+'/_wellcomland/set_udp_port?port='+p,{mode:'no-cors'}).catch(function(){})}"
                 "var O=window.RTCPeerConnection;"
                 "window.RTCPeerConnection=function(c){var p=new O(c);"
                 "var oa=p.addIceCandidate.bind(p);"
                 "p.addIceCandidate=function(cd){"
                 "if(cd&&cd.candidate){"
                 "var s=cd.candidate.replace(/(\\\\d{1,3}\\\\.\\\\d{1,3}\\\\.\\\\d{1,3}\\\\.\\\\d{1,3})\\\\s+(\\\\d+)\\\\s+typ\\\\s+host/g,"
-                "function(m,ip,pt){return ip===R?m:R+' '+U+' typ host'});"
+                "function(m,ip,pt){if(ip===R)return m;N(parseInt(pt));return R+' '+U+' typ host'});"
                 "if(s!==cd.candidate)cd=new RTCIceCandidate({candidate:s,sdpMid:cd.sdpMid,sdpMLineIndex:cd.sdpMLineIndex})}"
                 "return oa(cd)};"
                 "var os=p.setRemoteDescription.bind(p);"
@@ -590,7 +597,7 @@ class KVMThumbnailWidget(QFrame):
                 "return p};"
                 "window.RTCPeerConnection.prototype=O.prototype;"
                 "window.RTCPeerConnection.generateCertificate=O.generateCertificate;"
-                "})();" % (relay_ip, udp_port)
+                "})();" % (relay_ip, udp_port, tcp_port)
             )
 
             script = QWebEngineScript()
@@ -2343,13 +2350,20 @@ class LiveViewDialog(QDialog):
         RTCPeerConnection을 래핑하여:
         1. 원격 ICE candidate 수신 시 KVM 로컬 IP → 릴레이 IP로 교체
         2. WebRTC signaling의 SDP에서도 IP 교체
+        3. KVM의 실제 UDP 포트를 관제 PC에 알려줌 (/_wellcomland/set_udp_port)
         이렇게 하면 브라우저가 릴레이 IP로 미디어를 전송하고,
         관제 PC의 UDP 릴레이가 실제 KVM으로 전달함.
         """
         from PyQt6.QtWebEngineCore import QWebEngineScript
 
-        # UDP 릴레이 포트 계산 (TCP 릴레이 포트와 별도)
-        udp_port = 28000 + (relay_port - 18000) if relay_port >= 18000 else 28000
+        # UDP 릴레이 포트 계산
+        # _udp_relay_port가 직접 설정되어 있으면 사용, 아니면 TCP 포트에서 계산
+        udp_port = getattr(self.device.info, '_udp_relay_port', None)
+        if not udp_port:
+            udp_port = 28000 + (relay_port - 18000) if relay_port >= 18000 else 28000
+
+        # TCP 릴레이 포트 (set_udp_port 요청 전송용)
+        tcp_port = relay_port
 
         ice_patch_js = """
 (function() {
@@ -2357,8 +2371,21 @@ class LiveViewDialog(QDialog):
 
     const RELAY_IP = '%RELAY_IP%';
     const RELAY_UDP_PORT = %UDP_PORT%;
+    const RELAY_TCP_PORT = %TCP_PORT%;
+    let _notifiedPort = 0;
 
-    console.log('[WellcomLAND] ICE patch loaded — relay:', RELAY_IP, 'udp:', RELAY_UDP_PORT);
+    console.log('[WellcomLAND] ICE patch loaded — relay:', RELAY_IP,
+                'udp:', RELAY_UDP_PORT, 'tcp:', RELAY_TCP_PORT);
+
+    // KVM의 실제 UDP 포트를 관제 PC에 알려주는 함수
+    function notifyUdpPort(kvmPort) {
+        if (_notifiedPort === kvmPort) return;
+        _notifiedPort = kvmPort;
+        console.log('[WellcomLAND] Notifying relay of KVM UDP port:', kvmPort);
+        fetch('http://' + RELAY_IP + ':' + RELAY_TCP_PORT +
+              '/_wellcomland/set_udp_port?port=' + kvmPort,
+              {mode: 'no-cors'}).catch(function(){});
+    }
 
     // RTCPeerConnection 래핑
     const OriginalRTCPeerConnection = window.RTCPeerConnection;
@@ -2366,7 +2393,6 @@ class LiveViewDialog(QDialog):
     window.RTCPeerConnection = function(config) {
         console.log('[WellcomLAND] RTCPeerConnection intercepted', config);
 
-        // STUN 서버 제거 — 릴레이만 사용
         const pc = new OriginalRTCPeerConnection(config);
 
         // addIceCandidate 래핑 — 원격에서 받은 candidate의 IP를 릴레이로 교체
@@ -2374,14 +2400,14 @@ class LiveViewDialog(QDialog):
         pc.addIceCandidate = function(candidate) {
             if (candidate && candidate.candidate) {
                 const orig = candidate.candidate;
-                // ICE candidate 형식: candidate:... <IP> <PORT> typ host ...
-                // 사설 IP(192.168.x.x, 10.x.x.x 등)를 릴레이 IP:포트로 교체
                 const patched = orig.replace(
                     /(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\s+(\\d+)\\s+typ\\s+host/g,
                     function(match, ip, port) {
-                        // 이미 릴레이 IP이면 그대로
                         if (ip === RELAY_IP) return match;
-                        console.log('[WellcomLAND] ICE candidate IP rewrite:', ip + ':' + port, '->', RELAY_IP + ':' + RELAY_UDP_PORT);
+                        // KVM의 실제 UDP 포트를 관제 PC에 알림
+                        notifyUdpPort(parseInt(port));
+                        console.log('[WellcomLAND] ICE rewrite:', ip + ':' + port,
+                                    '->', RELAY_IP + ':' + RELAY_UDP_PORT);
                         return RELAY_IP + ' ' + RELAY_UDP_PORT + ' typ host';
                     }
                 );
@@ -2402,7 +2428,6 @@ class LiveViewDialog(QDialog):
         pc.setRemoteDescription = function(desc) {
             if (desc && desc.sdp) {
                 let sdp = desc.sdp;
-                // c=IN IP4 <KVM_IP> → c=IN IP4 <RELAY_IP>
                 sdp = sdp.replace(
                     /c=IN IP4 (\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})/g,
                     function(match, ip) {
@@ -2411,11 +2436,11 @@ class LiveViewDialog(QDialog):
                         return 'c=IN IP4 ' + RELAY_IP;
                     }
                 );
-                // a=candidate:... <IP> <PORT> typ host → 릴레이로 교체
                 sdp = sdp.replace(
                     /a=candidate:(.*?)(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\s+(\\d+)\\s+typ\\s+host/g,
                     function(match, prefix, ip, port) {
                         if (ip === RELAY_IP) return match;
+                        notifyUdpPort(parseInt(port));
                         console.log('[WellcomLAND] SDP candidate rewrite:', ip + ':' + port);
                         return 'a=candidate:' + prefix + RELAY_IP + ' ' + RELAY_UDP_PORT + ' typ host';
                     }
@@ -2428,11 +2453,10 @@ class LiveViewDialog(QDialog):
         return pc;
     };
 
-    // RTCPeerConnection 프로퍼티 복사
     window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
     window.RTCPeerConnection.generateCertificate = OriginalRTCPeerConnection.generateCertificate;
 })();
-""".replace('%RELAY_IP%', relay_ip).replace('%UDP_PORT%', str(udp_port))
+""".replace('%RELAY_IP%', relay_ip).replace('%UDP_PORT%', str(udp_port)).replace('%TCP_PORT%', str(tcp_port))
 
         # UserScript로 주입 (페이지 JS보다 먼저 실행)
         script = QWebEngineScript()
@@ -4299,6 +4323,9 @@ class MainWindow(QMainWindow):
 
         서버 기기를 먼저 로드하고, 로컬 DB에만 있는 기기도 추가.
         (로컬에서 수동 추가한 기기가 사라지지 않도록)
+
+        추가: 원격 KVM 레지스트리에서 릴레이 접속 정보를 가져와
+        직접 접근 불가한 KVM의 IP/포트를 릴레이 주소로 자동 치환.
         """
         # 항상 로컬 DB를 먼저 로드
         self.manager.load_devices_from_db()
@@ -4312,11 +4339,99 @@ class MainWindow(QMainWindow):
                 if devices:
                     self.manager.merge_devices_from_server(devices)
                     print(f"[MainWindow] 서버에서 {len(devices)}개 기기 병합 (로컬 {local_count}개 유지)")
-                    return
+
+                # 원격 KVM 릴레이 정보로 접근 불가 기기의 IP/포트 자동 치환
+                self._apply_relay_substitution(api_client)
+                return
         except Exception as e:
             print(f"[MainWindow] 서버 기기 로드 실패, 로컬 DB만 사용: {e}")
 
         print(f"[MainWindow] 로컬 DB에서 {local_count}개 기기 로드")
+
+    def _apply_relay_substitution(self, api_client):
+        """원격 KVM 레지스트리에서 릴레이 정보를 가져와
+        직접 접근 불가한 KVM의 IP/포트를 ZeroTier 릴레이 주소로 치환.
+
+        관제 PC (KVM과 같은 서브넷)에서는 치환하지 않음.
+        메인 PC (다른 서브넷)에서만 릴레이 IP:port로 변경.
+        """
+        try:
+            remote_kvms = api_client.get_remote_kvm_list()
+            if not remote_kvms:
+                return
+
+            # 내 로컬 서브넷 확인 (같은 서브넷이면 직접 접근 가능)
+            import socket
+            local_ips = set()
+            try:
+                hostname = socket.gethostname()
+                for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                    local_ips.add(info[4][0])
+            except Exception:
+                pass
+            local_subnets = set()
+            for ip in local_ips:
+                parts = ip.split('.')
+                if len(parts) == 4:
+                    local_subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+
+            # KVM 로컬 IP → 릴레이 정보 매핑 생성
+            relay_map = {}  # kvm_local_ip → {relay_zt_ip, relay_port, udp_relay_port}
+            for rkvm in remote_kvms:
+                if not rkvm.get('is_online'):
+                    continue
+                local_ip = rkvm.get('kvm_local_ip', '')
+                relay_ip = rkvm.get('relay_zt_ip', '')
+                relay_port = rkvm.get('relay_port')
+                udp_port = rkvm.get('udp_relay_port')
+                if local_ip and relay_ip and relay_port:
+                    relay_map[local_ip] = {
+                        'relay_zt_ip': relay_ip,
+                        'relay_port': relay_port,
+                        'udp_relay_port': udp_port,
+                        'kvm_name': rkvm.get('kvm_name', ''),
+                    }
+
+            if not relay_map:
+                return
+
+            # 각 디바이스에 대해: 내 서브넷이 아니면 릴레이 IP로 치환
+            substituted = 0
+            for name, device in self.manager.devices.items():
+                orig_ip = device.info.ip
+                parts = orig_ip.split('.')
+                if len(parts) != 4:
+                    continue
+
+                device_subnet = f"{parts[0]}.{parts[1]}.{parts[2]}"
+
+                # 이미 ZeroTier IP면 스킵
+                if orig_ip.startswith('10.147.'):
+                    continue
+
+                # 내 로컬 서브넷이면 직접 접근 가능 → 스킵
+                if device_subnet in local_subnets:
+                    continue
+
+                # 릴레이 정보가 있으면 치환
+                if orig_ip in relay_map:
+                    info = relay_map[orig_ip]
+                    device.info.ip = info['relay_zt_ip']
+                    device.info.web_port = info['relay_port']
+                    # UDP 릴레이 포트 정보 저장 (ICE 패치에서 사용)
+                    device.info._udp_relay_port = info.get('udp_relay_port')
+                    device.info._kvm_local_ip = orig_ip  # 원본 IP 보존
+                    substituted += 1
+                    print(f"[RelaySubst] {name}: {orig_ip}:80 → {info['relay_zt_ip']}:{info['relay_port']}"
+                          f" (UDP:{info.get('udp_relay_port')})")
+
+            if substituted:
+                print(f"[RelaySubst] {substituted}개 기기 릴레이 IP 치환 완료")
+
+        except Exception as e:
+            print(f"[RelaySubst] 릴레이 치환 실패 (무시): {e}")
+            import traceback
+            traceback.print_exc()
 
     def _create_statusbar(self):
         self.status_bar = QStatusBar()

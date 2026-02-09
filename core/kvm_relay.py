@@ -20,13 +20,16 @@ logger = logging.getLogger(__name__)
 class TCPProxy:
     """단일 KVM에 대한 TCP 프록시 (ZT → 로컬 KVM)"""
 
-    def __init__(self, listen_port: int, target_ip: str, target_port: int = 80):
+    def __init__(self, listen_port: int, target_ip: str, target_port: int = 80,
+                 on_udp_port_detected: Optional[callable] = None):
         self.listen_port = listen_port
         self.target_ip = target_ip
         self.target_port = target_port
         self._server: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # 콜백: ICE candidate에서 UDP 포트 추출 시 호출
+        self._on_udp_port_detected = on_udp_port_detected
 
     def start(self):
         """프록시 서버 시작"""
@@ -81,9 +84,22 @@ class TCPProxy:
         """양방향 데이터 릴레이"""
         target_sock = None
         try:
+            # 첫 번째 데이터를 먼저 읽어서 특수 경로 확인
+            client_sock.settimeout(10)
+            first_data = client_sock.recv(4096)
+            if not first_data:
+                return
+
+            # /_wellcomland/ 특수 경로 처리 (UDP 포트 알림 등)
+            if self._handle_special_request(client_sock, first_data):
+                return
+
             target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             target_sock.settimeout(10)  # 연결 타임아웃
             target_sock.connect((self.target_ip, self.target_port))
+
+            # 첫 번째 데이터를 KVM에 전달
+            target_sock.sendall(first_data)
 
             # 연결 성공 후 blocking 모드로 전환 (장기 연결 지원: MJPEG/WebSocket)
             target_sock.settimeout(None)
@@ -119,6 +135,53 @@ class TCPProxy:
                     target_sock.close()
                 except Exception:
                     pass
+
+    def _handle_special_request(self, client_sock: socket.socket, data: bytes) -> bool:
+        """/_wellcomland/ 특수 경로 처리
+
+        ICE 패치 JS에서 KVM의 WebRTC UDP 포트를 알려주는 요청 처리.
+        Returns: True면 특수 요청으로 처리 완료 (KVM에 전달하지 않음)
+        """
+        try:
+            text = data.decode('utf-8', errors='ignore')
+
+            # HTTP GET /_wellcomland/set_udp_port?port=55234
+            if '/_wellcomland/set_udp_port' in text:
+                import re
+                m = re.search(r'port=(\d+)', text)
+                if m and self._on_udp_port_detected:
+                    udp_port = int(m.group(1))
+                    logger.info(f"[Relay] ICE candidate에서 KVM UDP 포트 수신: {self.target_ip}:{udp_port}")
+                    self._on_udp_port_detected(self.target_ip, udp_port)
+
+                # HTTP 응답
+                resp = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 15\r\n"
+                    "Connection: close\r\n\r\n"
+                    '{"status":"ok"}'
+                )
+                client_sock.sendall(resp.encode())
+                return True
+
+            # OPTIONS (CORS preflight)
+            if text.startswith('OPTIONS') and '/_wellcomland/' in text:
+                resp = (
+                    "HTTP/1.1 204 No Content\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                    "Access-Control-Allow-Headers: *\r\n"
+                    "Connection: close\r\n\r\n"
+                )
+                client_sock.sendall(resp.encode())
+                return True
+
+        except Exception as e:
+            logger.debug(f"[Relay] 특수 요청 처리 오류: {e}")
+
+        return False
 
     @staticmethod
     def _pipe(src: socket.socket, dst: socket.socket):
@@ -312,7 +375,8 @@ class KVMRelayManager:
         # TCP 프록시 — 포트 충돌 시 +1000 시도
         for offset in [0, 1000, 2000]:
             port = relay_port + offset
-            proxy = TCPProxy(port, kvm_ip, kvm_port)
+            proxy = TCPProxy(port, kvm_ip, kvm_port,
+                             on_udp_port_detected=self.set_udp_target_port)
             proxy.start()
             if proxy._running:
                 self._proxies[key] = proxy
