@@ -1984,13 +1984,22 @@ class LiveViewDialog(QDialog):
         self.setWindowTitle(f"{device.name} ({device.ip})")
         self.resize(1920, 1080)
 
-        # HID 컨트롤러 (백업용)
-        self.hid = FastHIDController(
-            device.ip,
-            device.info.port,
-            device.info.username,
-            device.info.password
-        )
+        # HID 컨트롤러 (SSH 직접 접속 — 릴레이 접속 시 사용 불가)
+        self._is_relay = device.ip.startswith('10.147.')
+        if self._is_relay:
+            # 릴레이 접속: SSH HID 사용 불가 → 웹 기반 입력만 사용
+            hid_ip = getattr(device.info, '_kvm_local_ip', device.ip)
+            self.hid = FastHIDController(hid_ip, device.info.port,
+                                         device.info.username, device.info.password)
+            # SSH 연결은 시도하지 않음 (접근 불가)
+            print(f"[LiveView] 릴레이 접속 — SSH HID 비활성 (웹 입력만 사용)")
+        else:
+            self.hid = FastHIDController(
+                device.ip,
+                device.info.port,
+                device.info.username,
+                device.info.password
+            )
 
         self.game_mode_active = False
         self.sensitivity = 0.5
