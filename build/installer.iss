@@ -7,7 +7,7 @@
 #define MyAppVersion "1.9.0"
 #define MyAppPublisher "Wellcom"
 #define MyAppExeName "WellcomLAND.exe"
-#define TailscaleAuthKey "tskey-auth-kyaZwNxLUa11CNTRL-pFBEvigZ5m2REQRrSiE4m211EnJ4JxbJ"
+; TailscaleAuthKey는 앱에서 서버 API로 받아서 처리 (인스톨러 불필요)
 
 [Setup]
 AppId={{B5E7F3A2-1234-4C5D-9A8B-7E6F5D4C3B2A}
@@ -84,12 +84,8 @@ Name: "desktopicon"; Description: "바탕화면에 바로가기 생성"; GroupDe
 [Run]
 ; ★ Tailscale 필수 설치 (미설치 시만) — MSI 무인 설치
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\tailscale-setup.msi"" /quiet /norestart"; StatusMsg: "Tailscale VPN 설치 중..."; Flags: shellexec waituntilterminated; Check: not IsTailscaleInstalled
-; Tailscale 서비스 시작 대기 (10초 — MSI 설치 직후 서비스 초기화 시간)
-Filename: "cmd.exe"; Parameters: "/c timeout /t 10 /nobreak >nul"; StatusMsg: "Tailscale 서비스 시작 대기..."; Flags: shellexec waituntilterminated runhidden
-; ★ authkey로 회사 tailnet 자동 참여 (tailscale.exe 직접 실행 — cmd.exe 따옴표 문제 회피)
-Filename: "{code:GetTailscaleExePath}"; Parameters: "{code:GetTailscaleUpArgs}"; StatusMsg: "Tailscale 네트워크 연결 중..."; Flags: runhidden waituntilterminated
-; 재시도 (첫 시도 실패 시 — 서비스 시작 지연 대응)
-Filename: "{code:GetTailscaleExePath}"; Parameters: "{code:GetTailscaleUpArgs}"; StatusMsg: "Tailscale 연결 확인 중..."; Flags: runhidden waituntilterminated
+; ★ Tailscale authkey 등록은 WellcomLAND 앱 시작 시 자동 처리 (api_client._check_tailscale)
+; 인스톨러에서는 MSI 설치만 담당 — 앱에서 안정적으로 서비스 대기 후 등록
 ; Tailscale 네트워크 인터페이스 메트릭 올리기 (LAN이 기본 라우트 유지)
 ; ★ 인터페이스 이름 자동 감지 — 'Tailscale', 'Tailscale 2' 등 모두 대응
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -like '*Tailscale*' }} | ForEach-Object {{ netsh interface ipv4 set interface $_.Name metric=1000 }}"""; Flags: shellexec waituntilterminated runhidden
@@ -130,88 +126,9 @@ begin
          or FileExists(ExpandConstant('{commonpf64}\Tailscale\tailscale.exe'));
 end;
 
-// LAN 서브넷 감지 (192.168.x.0/24, 10.x.x.0/24 등)
-// Tailscale(100.x), APIPA(169.254.x), loopback(127.x) 제외
-function GetLanSubnets(Param: String): String;
-var
-  ResultCode: Integer;
-  TmpFile: String;
-  Lines: TArrayOfString;
-  I, DotPos, DotCount: Integer;
-  Line, Subnet, IP: String;
-begin
-  Result := '';
-  TmpFile := ExpandConstant('{tmp}\lan_detect.txt');
-
-  // ipconfig로 IPv4 주소 추출
-  Exec('cmd.exe', '/c ipconfig | findstr /C:"IPv4" > "' + TmpFile + '"',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  if LoadStringsFromFile(TmpFile, Lines) then
-  begin
-    for I := 0 to GetArrayLength(Lines) - 1 do
-    begin
-      Line := Trim(Lines[I]);
-      // "IPv4 주소 . . . . . . . . . : 192.168.0.198" 에서 IP 추출
-      if Pos(':', Line) > 0 then
-      begin
-        IP := Trim(Copy(Line, Pos(':', Line) + 1, Length(Line)));
-        // Tailscale(100.), APIPA(169.254.), loopback(127.) 제외
-        if (Pos('100.', IP) <> 1) and (Pos('169.254.', IP) <> 1) and (Pos('127.', IP) <> 1) and (Pos('.', IP) > 0) then
-        begin
-          // IP에서 마지막 '.' 위치 찾기 → 서브넷으로 변환
-          DotCount := 0;
-          DotPos := 0;
-          for DotCount := Length(IP) downto 1 do
-          begin
-            if IP[DotCount] = '.' then
-            begin
-              DotPos := DotCount;
-              Break;
-            end;
-          end;
-          if DotPos > 0 then
-          begin
-            Subnet := Copy(IP, 1, DotPos) + '0/24';
-            if Result = '' then
-              Result := Subnet
-            else if Pos(Subnet, Result) = 0 then
-              Result := Result + ',' + Subnet;
-          end;
-        end;
-      end;
-    end;
-  end;
-
-  DeleteFile(TmpFile);
-
-  // 서브넷이 없으면 빈 문자열
-  Log('GetLanSubnets: ' + Result);
-end;
-
-// Tailscale CLI 풀 경로 반환 (PATH에 없어도 동작)
-function GetTailscaleExePath(Param: String): String;
-begin
-  Result := ExpandConstant('{commonpf64}\Tailscale\tailscale.exe');
-  if not FileExists(Result) then
-    Result := ExpandConstant('{commonpf}\Tailscale\tailscale.exe');
-  if not FileExists(Result) then
-    Result := 'tailscale';  // 폴백
-  Log('TailscaleExePath: ' + Result);
-end;
-
-// tailscale up 인수만 반환 (Filename에서 직접 실행하므로 경로 불필요)
-function GetTailscaleUpArgs(Param: String): String;
-var
-  Subnets: String;
-begin
-  Subnets := GetLanSubnets('');
-  if Subnets <> '' then
-    Result := 'up --authkey={#TailscaleAuthKey} --accept-routes --advertise-routes=' + Subnets + ' --reset'
-  else
-    Result := 'up --authkey={#TailscaleAuthKey} --accept-routes --reset';
-  Log('TailscaleUpArgs: ' + Result);
-end;
+// ★ Tailscale authkey 등록 + 서브넷 라우팅은 WellcomLAND 앱 시작 시 자동 처리
+// (api_client._check_tailscale → main.py auto_fix_network 직후)
+// 인스톨러는 MSI 설치 + 메트릭 설정만 담당
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
