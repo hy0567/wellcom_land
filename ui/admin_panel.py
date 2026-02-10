@@ -130,8 +130,11 @@ class AdminPanel(QWidget):
                     cloud_item.setForeground(Qt.GlobalColor.darkYellow)
             self.user_table.setItem(row, 5, cloud_item)
 
-            # 기기 할당 버튼
-            assign_btn = QPushButton("기기 할당")
+            # 기기 할당 버튼 (할당 수 표시)
+            device_count = user.get('device_count', 0)
+            assign_btn = QPushButton(f"기기 할당 ({device_count})")
+            if device_count == 0:
+                assign_btn.setStyleSheet("color: #888;")
             assign_btn.clicked.connect(lambda checked, uid=user['id'], uname=user['username']: self._on_assign_devices(uid, uname))
             self.user_table.setCellWidget(row, 6, assign_btn)
 
@@ -560,31 +563,34 @@ class DeviceFormDialog(QDialog):
 
 
 class DeviceAssignDialog(QDialog):
-    """기기 할당 다이얼로그"""
+    """기기 할당 다이얼로그 — 그룹별 분류 + 검색"""
 
     def __init__(self, parent, username: str, all_devices: list, assigned_ids: set):
         super().__init__(parent)
         self._all_devices = all_devices
         self._assigned_ids = assigned_ids
         self.setWindowTitle(f"'{username}' 기기 할당")
-        self.setFixedSize(400, 450)
+        self.setFixedSize(420, 500)
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        info = QLabel("할당할 기기를 선택하세요:")
-        layout.addWidget(info)
+        # 검색
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("기기 검색...")
+        self.search_input.textChanged.connect(self._on_search)
+        layout.addWidget(self.search_input)
 
+        # 선택 카운트
+        self.count_label = QLabel()
+        self.count_label.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.count_label)
+
+        # 기기 목록 (그룹별)
         self.device_list = QListWidget()
-        for dev in self._all_devices:
-            item = QListWidgetItem(f"{dev['name']} ({dev['ip']})")
-            item.setData(Qt.ItemDataRole.UserRole, dev['id'])
-            item.setCheckState(
-                Qt.CheckState.Checked if dev['id'] in self._assigned_ids
-                else Qt.CheckState.Unchecked
-            )
-            self.device_list.addItem(item)
+        self._populate_list()
+        self.device_list.itemChanged.connect(self._update_count)
         layout.addWidget(self.device_list)
 
         # 전체 선택/해제
@@ -603,15 +609,69 @@ class DeviceAssignDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._update_count()
+
+    def _populate_list(self):
+        """그룹별로 기기 목록 생성"""
+        self.device_list.clear()
+
+        # 그룹별 분류
+        groups = {}
+        for dev in self._all_devices:
+            group = dev.get('group_name') or 'default'
+            if group not in groups:
+                groups[group] = []
+            groups[group].append(dev)
+
+        for group_name in sorted(groups.keys(), key=lambda x: (x != 'default', x)):
+            # 그룹 헤더
+            header = QListWidgetItem(f"── {group_name} ({len(groups[group_name])}) ──")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            header.setForeground(Qt.GlobalColor.darkCyan)
+            self.device_list.addItem(header)
+
+            # 기기 항목
+            for dev in groups[group_name]:
+                item = QListWidgetItem(f"  {dev['name']}  ({dev['ip']})")
+                item.setData(Qt.ItemDataRole.UserRole, dev['id'])
+                item.setData(Qt.ItemDataRole.UserRole + 1, dev['name'])  # 검색용
+                item.setCheckState(
+                    Qt.CheckState.Checked if dev['id'] in self._assigned_ids
+                    else Qt.CheckState.Unchecked
+                )
+                self.device_list.addItem(item)
+
+    def _on_search(self, text: str):
+        text = text.lower()
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            device_id = item.data(Qt.ItemDataRole.UserRole)
+            if device_id is None:
+                # 그룹 헤더 — 하위에 매칭 있으면 표시
+                item.setHidden(False)
+                continue
+            name = (item.data(Qt.ItemDataRole.UserRole + 1) or '').lower()
+            display = item.text().lower()
+            item.setHidden(text not in name and text not in display)
+
     def _set_all(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for i in range(self.device_list.count()):
-            self.device_list.item(i).setCheckState(state)
+            item = self.device_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) is not None and not item.isHidden():
+                item.setCheckState(state)
+        self._update_count()
+
+    def _update_count(self):
+        selected = len(self.get_selected_ids())
+        total = sum(1 for i in range(self.device_list.count())
+                    if self.device_list.item(i).data(Qt.ItemDataRole.UserRole) is not None)
+        self.count_label.setText(f"선택: {selected} / {total}")
 
     def get_selected_ids(self) -> list:
         ids = []
         for i in range(self.device_list.count()):
             item = self.device_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
+            if item.data(Qt.ItemDataRole.UserRole) is not None and item.checkState() == Qt.CheckState.Checked:
                 ids.append(item.data(Qt.ItemDataRole.UserRole))
         return ids

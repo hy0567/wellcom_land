@@ -243,7 +243,8 @@ def admin_get_users(user: dict = Depends(require_admin)):
             cur.execute("""
                 SELECT u.id, u.username, u.role, u.display_name, u.is_active,
                        u.created_at, u.last_login, u.cloud_quota,
-                       COALESCE((SELECT SUM(f.size) FROM files f WHERE f.user_id = u.id), 0) AS cloud_used
+                       COALESCE((SELECT SUM(f.size) FROM files f WHERE f.user_id = u.id), 0) AS cloud_used,
+                       (SELECT COUNT(*) FROM user_devices ud WHERE ud.user_id = u.id) AS device_count
                 FROM users u ORDER BY u.id
             """)
             users = cur.fetchall()
@@ -259,6 +260,7 @@ def admin_get_users(user: dict = Depends(require_admin)):
             last_login=str(u["last_login"]) if u["last_login"] else None,
             cloud_quota=u["cloud_quota"],
             cloud_used=u["cloud_used"],
+            device_count=u.get("device_count", 0),
         ))
     return result
 

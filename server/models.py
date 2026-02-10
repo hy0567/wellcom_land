@@ -50,6 +50,7 @@ class UserResponse(BaseModel):
     last_login: Optional[str] = None
     cloud_quota: Optional[int] = None  # None=무제한, 0=비활성
     cloud_used: int = 0  # 사용 중인 용량 (bytes)
+    device_count: int = 0  # 할당된 기기 수
 
 
 # === Devices ===
