@@ -46,70 +46,38 @@ from config import WINDOW_TITLE, ICON_PATH
 
 
 def check_for_updates(app: QApplication) -> bool:
-    """시작 시 업데이트 확인
-
-    Returns:
-        True: 정상 진행 (업데이트 없음 또는 스킵)
-        False: 업데이트 완료 → 재시작 필요
-    """
+    """시작 시 업데이트 확인. True=정상진행, False=재시작필요"""
     try:
         from pathlib import Path
         from config import settings, BASE_DIR
         from updater import UpdateChecker
         from updater.update_dialog import UpdateNotifyDialog, UpdateDialog
 
-        # 자동 업데이트 체크 비활성화 시 스킵
         if not settings.get('update.auto_check', True):
             return True
 
         token = settings.get('update.github_token', '')
-
-        base_dir = Path(BASE_DIR)
-        checker = UpdateChecker(base_dir, __github_repo__, token or None)
-
-        print(f"[Update] 현재 버전: v{checker.get_current_version()}")
-        print(f"[Update] 업데이트 확인 중... ({__github_repo__})")
+        checker = UpdateChecker(Path(BASE_DIR), __github_repo__, token or None)
 
         has_update, release_info = checker.check_update()
-
         if not has_update or not release_info:
-            print("[Update] 최신 버전입니다.")
             return True
 
-        # 건너뛰기 버전 체크
-        skip_version = settings.get('update.skip_version', '')
-        if skip_version == release_info.version:
-            print(f"[Update] v{release_info.version} 스킵 설정됨")
+        # 알림 (버전만 표시)
+        if UpdateNotifyDialog(checker.get_current_version(), release_info).exec() == 0:
             return True
 
-        # 업데이트 알림 다이얼로그
-        notify = UpdateNotifyDialog(
-            checker.get_current_version(), release_info
-        )
-        result = notify.exec()
+        # 업데이트 진행
+        dlg = UpdateDialog(release_info)
+        dlg.start_update(checker)
+        dlg.exec()
 
-        if result == 0:
-            # "나중에" 선택
-            print("[Update] 사용자가 업데이트를 건너뛰었습니다.")
-            return True
-
-        # 업데이트 진행 다이얼로그
-        progress_dialog = UpdateDialog(release_info)
-        progress_dialog.start_update(checker)
-        progress_dialog.exec()
-
-        if progress_dialog.is_success:
-            print("[Update] 업데이트 완료 - 재시작...")
+        if dlg.is_success:
             _restart_application()
             return False
 
         return True
-
-    except ImportError as e:
-        print(f"[Update] updater 모듈 로드 실패 (무시): {e}")
-        return True
-    except Exception as e:
-        print(f"[Update] 업데이트 확인 실패 (무시): {e}")
+    except Exception:
         return True
 
 
