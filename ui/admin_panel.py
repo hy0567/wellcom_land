@@ -229,9 +229,9 @@ class AdminPanel(QWidget):
         layout.addLayout(btn_layout)
 
         self.device_table = QTableWidget()
-        self.device_table.setColumnCount(7)
+        self.device_table.setColumnCount(8)
         self.device_table.setHorizontalHeaderLabels(
-            ["ID", "이름", "IP", "웹 포트", "그룹", "상태", "작업"]
+            ["ID", "이름", "IP", "MAC", "그룹", "상태", "웹 포트", "작업"]
         )
         self.device_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -255,13 +255,21 @@ class AdminPanel(QWidget):
             self.device_table.setItem(row, 0, QTableWidgetItem(str(dev['id'])))
             self.device_table.setItem(row, 1, QTableWidgetItem(dev['name']))
             self.device_table.setItem(row, 2, QTableWidgetItem(dev['ip']))
-            self.device_table.setItem(row, 3, QTableWidgetItem(str(dev['web_port'])))
+
+            mac = dev.get('serial_id') or '-'
+            mac_item = QTableWidgetItem(mac)
+            if mac == '-':
+                mac_item.setForeground(Qt.GlobalColor.gray)
+            self.device_table.setItem(row, 3, mac_item)
+
             self.device_table.setItem(row, 4, QTableWidgetItem(dev.get('group_name') or 'default'))
 
             status_item = QTableWidgetItem("활성" if dev['is_active'] else "비활성")
             if not dev['is_active']:
                 status_item.setForeground(Qt.GlobalColor.red)
             self.device_table.setItem(row, 5, status_item)
+
+            self.device_table.setItem(row, 6, QTableWidgetItem(str(dev['web_port'])))
 
             # 작업 버튼
             action_widget = QWidget()
@@ -277,7 +285,7 @@ class AdminPanel(QWidget):
             del_btn.clicked.connect(lambda checked, did=dev['id'], dname=dev['name']: self._on_delete_device(did, dname))
             action_layout.addWidget(del_btn)
 
-            self.device_table.setCellWidget(row, 6, action_widget)
+            self.device_table.setCellWidget(row, 7, action_widget)
 
     def _on_add_device(self):
         dlg = DeviceFormDialog(self)
@@ -332,7 +340,7 @@ class AdminPanel(QWidget):
                 QMessageBox.warning(self, "오류", f"삭제 실패: {e}")
 
     def _on_sync_local_devices(self):
-        """로컬 DB 기기를 서버에 동기화"""
+        """로컬 DB 기기를 서버에 동기화 (MAC 수집 포함)"""
         try:
             from core.database import Database
             db = Database()
@@ -350,8 +358,13 @@ class AdminPanel(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-            result = api_client.sync_devices_to_server([
-                {
+            # 온라인 기기의 MAC 주소 수집
+            main_win = self.window()
+            manager = getattr(main_win, 'manager', None)
+
+            sync_list = []
+            for d in local_devices:
+                item = {
                     'name': d['name'],
                     'ip': d['ip'],
                     'port': d.get('port', 22),
@@ -359,8 +372,14 @@ class AdminPanel(QWidget):
                     'username': d.get('username', 'root'),
                     'password': d.get('password', 'luckfox'),
                 }
-                for d in local_devices
-            ])
+                # MAC 주소 수집
+                if manager:
+                    device = manager.get_device(d['name'])
+                    if device and device.mac_address:
+                        item['serial_id'] = device.mac_address
+                sync_list.append(item)
+
+            result = api_client.sync_devices_to_server(sync_list)
 
             msg = f"동기화 완료!\n추가: {result['synced']}개\n건너뜀(중복): {result['skipped']}개"
             if result['failed'] > 0:

@@ -72,6 +72,8 @@ class KVMDevice:
         self.usb_status = USBStatus.DISCONNECTED
         self.version = ""
         self.system_version = ""
+        self.mac_address = ""
+        self.hostname = ""
         self._lock = threading.Lock()
         self._connected = False
 
@@ -140,7 +142,7 @@ class KVMDevice:
                 return "", str(e)
 
     def _update_device_info(self):
-        """Update device version info"""
+        """Update device version info + MAC/hostname"""
         out, _ = self._exec_command("cat /version")
         self.system_version = out
 
@@ -152,6 +154,16 @@ class KVMDevice:
                 self.version = data.get("app", "")
         except:
             pass
+
+        # MAC address (eth0)
+        out, _ = self._exec_command("cat /sys/class/net/eth0/address 2>/dev/null")
+        if out and ':' in out:
+            self.mac_address = out.strip().upper()
+
+        # Hostname
+        out, _ = self._exec_command("hostname 2>/dev/null")
+        if out:
+            self.hostname = out.strip()
 
     def get_usb_status(self) -> USBStatus:
         """Get USB connection status"""
@@ -194,6 +206,10 @@ class KVMDevice:
 
         # USB Status
         info['usb_status'] = self.get_usb_status().value
+
+        # MAC / Hostname
+        info['mac_address'] = self.mac_address
+        info['hostname'] = self.hostname
 
         return info
 

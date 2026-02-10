@@ -63,6 +63,7 @@ class DeviceCreate(BaseModel):
     password: str = "luckfox"
     group_id: Optional[int] = None
     description: Optional[str] = None
+    serial_id: Optional[str] = None  # MAC 주소 (기기 고유 식별)
 
 
 class DeviceUpdate(BaseModel):
@@ -75,6 +76,7 @@ class DeviceUpdate(BaseModel):
     group_id: Optional[int] = None
     description: Optional[str] = None
     is_active: Optional[bool] = None
+    serial_id: Optional[str] = None
 
 
 class DeviceResponse(BaseModel):
@@ -89,6 +91,7 @@ class DeviceResponse(BaseModel):
     group_name: Optional[str] = None
     description: Optional[str] = None
     is_active: bool
+    serial_id: Optional[str] = None  # MAC 주소
 
 
 # === Groups ===

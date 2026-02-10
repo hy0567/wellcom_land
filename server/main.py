@@ -81,6 +81,13 @@ def startup_init():
             # admin 사용자에게 무제한 쿼타 설정
             cur.execute("UPDATE users SET cloud_quota = NULL WHERE role = 'admin' AND cloud_quota = 0")
 
+            # devices.serial_id 컬럼 자동 마이그레이션
+            try:
+                cur.execute("ALTER TABLE devices ADD COLUMN serial_id VARCHAR(50) DEFAULT NULL")
+                print("[Init] devices.serial_id 컬럼 추가 완료")
+            except Exception:
+                pass  # 이미 존재
+
     # 업로드 디렉토리 생성
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     print(f"[Init] 업로드 디렉토리: {UPLOAD_DIR}")
@@ -177,18 +184,24 @@ def admin_get_all_devices(user: dict = Depends(require_admin)):
 def admin_create_device(req: DeviceCreate, user: dict = Depends(require_admin)):
     with get_db() as conn:
         with conn.cursor() as cur:
-            # 중복 체크 (이름 또는 IP)
-            cur.execute(
-                "SELECT id FROM devices WHERE name = %s OR ip = %s",
-                (req.name, req.ip),
-            )
+            # 중복 체크 (이름, IP, 또는 MAC)
+            if req.serial_id:
+                cur.execute(
+                    "SELECT id FROM devices WHERE name = %s OR ip = %s OR serial_id = %s",
+                    (req.name, req.ip, req.serial_id),
+                )
+            else:
+                cur.execute(
+                    "SELECT id FROM devices WHERE name = %s OR ip = %s",
+                    (req.name, req.ip),
+                )
             if cur.fetchone():
-                raise HTTPException(status_code=409, detail="이미 존재하는 기기입니다 (이름 또는 IP 중복)")
+                raise HTTPException(status_code=409, detail="이미 존재하는 기기입니다 (이름/IP/MAC 중복)")
 
             cur.execute(
-                """INSERT INTO devices (name, ip, port, web_port, username, password, group_id, description)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                (req.name, req.ip, req.port, req.web_port, req.username, req.password, req.group_id, req.description),
+                """INSERT INTO devices (name, ip, port, web_port, username, password, group_id, description, serial_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (req.name, req.ip, req.port, req.web_port, req.username, req.password, req.group_id, req.description, req.serial_id),
             )
             device_id = cur.lastrowid
             cur.execute("""
