@@ -25,3 +25,5 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
 
 # Tailscale (회사 공용 계정)
 TAILSCALE_AUTHKEY = os.getenv("TAILSCALE_AUTHKEY", "")
+TAILSCALE_API_TOKEN = os.getenv("TAILSCALE_API_TOKEN", "")
+TAILSCALE_TAILNET = os.getenv("TAILSCALE_TAILNET", "-")  # "-" = 기본 tailnet

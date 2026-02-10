@@ -14,7 +14,7 @@ from auth import (
     get_current_user, require_admin,
 )
 from database import get_db
-from config import UPLOAD_DIR, MAX_FILE_SIZE, TAILSCALE_AUTHKEY
+from config import UPLOAD_DIR, MAX_FILE_SIZE, TAILSCALE_AUTHKEY, TAILSCALE_API_TOKEN, TAILSCALE_TAILNET
 from models import (
     LoginRequest, LoginResponse, UserInfo,
     UserCreate, UserUpdate, UserResponse,
@@ -24,7 +24,7 @@ from models import (
     FileResponse, QuotaResponse,
 )
 
-app = FastAPI(title="WellcomLAND API", version="1.0.0")
+app = FastAPI(title="WellcomLAND API", version="1.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -582,7 +582,120 @@ def init_tailscale_config():
                     ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)
                 """, (TAILSCALE_AUTHKEY,))
                 print(f"[Init] Tailscale authkey 환경변수에서 로드됨")
+            # API 토큰도 DB에 저장
+            if TAILSCALE_API_TOKEN:
+                cur.execute("""
+                    INSERT INTO tailscale_config (`key`, `value`)
+                    VALUES ('api_token', %s)
+                    ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)
+                """, (TAILSCALE_API_TOKEN,))
             print("[Init] tailscale_config 테이블 확인 완료")
+
+    # API 토큰이 있으면 authkey 자동 갱신 확인
+    _auto_refresh_tailscale_authkey()
+
+
+def _auto_refresh_tailscale_authkey():
+    """Tailscale API로 authkey 만료 확인 및 자동 갱신
+
+    API 토큰이 DB에 있으면:
+    1. 현재 authkey 목록 조회
+    2. 만료 30일 이내이면 새 authkey 자동 생성
+    3. DB에 새 authkey 저장
+    """
+    import requests as _req
+    from datetime import timedelta
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT `value` FROM tailscale_config WHERE `key` = 'api_token'")
+                row = cur.fetchone()
+                if not row or not row["value"]:
+                    return
+                api_token = row["value"]
+
+        # Tailscale API: authkey 목록 조회
+        headers = {"Authorization": f"Bearer {api_token}"}
+        tailnet = TAILSCALE_TAILNET
+
+        resp = _req.get(
+            f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/keys",
+            headers=headers, timeout=10
+        )
+        if resp.status_code != 200:
+            print(f"[Tailscale API] authkey 목록 조회 실패: {resp.status_code}")
+            return
+
+        keys = resp.json().get("keys", [])
+        now = datetime.now(timezone.utc)
+
+        # Reusable authkey 중 유효한 것 찾기
+        valid_key = None
+        needs_refresh = True
+        for k in keys:
+            if not k.get("capabilities", {}).get("devices", {}).get("create", {}).get("reusable", False):
+                continue
+            expires = k.get("expires", "")
+            if expires:
+                try:
+                    # ISO 8601 파싱 (표준 라이브러리만 사용)
+                    # Tailscale API: "2026-05-11T06:23:45Z" 형식
+                    exp_str = expires.replace("Z", "+00:00")
+                    exp_dt = datetime.fromisoformat(exp_str)
+                    remaining = (exp_dt - now).days
+                    if remaining > 30:
+                        needs_refresh = False
+                        valid_key = k
+                        print(f"[Tailscale API] 유효한 authkey 있음 (만료까지 {remaining}일)")
+                    else:
+                        print(f"[Tailscale API] authkey 만료 임박 ({remaining}일 남음) → 갱신 필요")
+                except Exception:
+                    pass
+
+        if not needs_refresh:
+            return
+
+        # 새 authkey 생성
+        print("[Tailscale API] 새 Reusable authkey 생성 중...")
+        create_resp = _req.post(
+            f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/keys",
+            headers=headers,
+            json={
+                "capabilities": {
+                    "devices": {
+                        "create": {
+                            "reusable": True,
+                            "ephemeral": False,
+                        }
+                    }
+                },
+                "expirySeconds": 7776000,  # 90일
+                "description": "WellcomLAND-auto",
+            },
+            timeout=10
+        )
+
+        if create_resp.status_code in (200, 201):
+            new_key_data = create_resp.json()
+            new_authkey = new_key_data.get("key", "")
+            if new_authkey:
+                # DB에 새 authkey 저장
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO tailscale_config (`key`, `value`)
+                            VALUES ('authkey', %s)
+                            ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)
+                        """, (new_authkey,))
+                print(f"[Tailscale API] 새 authkey 생성 및 DB 저장 완료")
+            else:
+                print("[Tailscale API] 응답에 key 없음")
+        else:
+            print(f"[Tailscale API] authkey 생성 실패: {create_resp.status_code} {create_resp.text}")
+
+    except Exception as e:
+        print(f"[Tailscale API] authkey 자동 갱신 오류 (무시): {e}")
 
 
 @app.get("/api/tailscale/status")
