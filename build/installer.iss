@@ -86,8 +86,8 @@ Name: "desktopicon"; Description: "바탕화면에 바로가기 생성"; GroupDe
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\tailscale-setup.msi"" /quiet /norestart"; StatusMsg: "Tailscale VPN 설치 중..."; Flags: shellexec waituntilterminated; Check: not IsTailscaleInstalled
 ; Tailscale 서비스 시작 대기
 Filename: "cmd.exe"; Parameters: "/c timeout /t 5 /nobreak >nul"; StatusMsg: "Tailscale 서비스 시작 대기..."; Flags: shellexec waituntilterminated runhidden
-; ★ authkey로 회사 tailnet 자동 참여 + accept-routes
-Filename: "cmd.exe"; Parameters: "/c tailscale up --authkey={#TailscaleAuthKey} --accept-routes --reset"; StatusMsg: "Tailscale 네트워크 연결 중..."; Flags: shellexec waituntilterminated runhidden
+; ★ authkey로 회사 tailnet 자동 참여 + accept-routes + advertise-routes (LAN 서브넷 자동 감지)
+Filename: "cmd.exe"; Parameters: "/c ""{code:GetTailscaleUpCmd}"""; StatusMsg: "Tailscale 네트워크 연결 중..."; Flags: shellexec waituntilterminated runhidden
 ; Tailscale 네트워크 인터페이스 메트릭 올리기 (LAN이 기본 라우트 유지)
 Filename: "netsh.exe"; Parameters: "interface ipv4 set interface ""Tailscale"" metric=1000"; Flags: shellexec waituntilterminated runhidden
 ; WellcomLAND 실행
@@ -125,6 +125,70 @@ function IsTailscaleInstalled(): Boolean;
 begin
   Result := FileExists(ExpandConstant('{commonpf}\Tailscale\tailscale.exe'))
          or FileExists(ExpandConstant('{commonpf64}\Tailscale\tailscale.exe'));
+end;
+
+// LAN 서브넷 감지 (192.168.x.0/24, 10.x.x.0/24 등)
+// Tailscale(100.x), APIPA(169.254.x), loopback(127.x) 제외
+function GetLanSubnets(Param: String): String;
+var
+  ResultCode: Integer;
+  TmpFile: String;
+  Lines: TArrayOfString;
+  I: Integer;
+  Line, Subnet: String;
+  Parts: TArrayOfString;
+begin
+  Result := '';
+  TmpFile := ExpandConstant('{tmp}\lan_detect.txt');
+
+  // ipconfig로 IPv4 주소 추출
+  Exec('cmd.exe', '/c ipconfig | findstr /C:"IPv4" > "' + TmpFile + '"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  if LoadStringsFromFile(TmpFile, Lines) then
+  begin
+    for I := 0 to GetArrayLength(Lines) - 1 do
+    begin
+      Line := Trim(Lines[I]);
+      // "IPv4 주소 . . . . . . . . . : 192.168.0.198" 에서 IP 추출
+      if Pos(':', Line) > 0 then
+      begin
+        Line := Trim(Copy(Line, Pos(':', Line) + 1, Length(Line)));
+        // Tailscale(100.), APIPA(169.254.), loopback(127.) 제외
+        if (Pos('100.', Line) <> 1) and (Pos('169.254.', Line) <> 1) and (Pos('127.', Line) <> 1) and (Pos('.', Line) > 0) then
+        begin
+          // IP를 서브넷으로 변환 (마지막 옥텟 → 0/24)
+          Parts := SplitString(Line, '.');
+          if GetArrayLength(Parts) = 4 then
+          begin
+            Subnet := Parts[0] + '.' + Parts[1] + '.' + Parts[2] + '.0/24';
+            if Result = '' then
+              Result := Subnet
+            else if Pos(Subnet, Result) = 0 then
+              Result := Result + ',' + Subnet;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  DeleteFile(TmpFile);
+
+  // 서브넷이 없으면 빈 문자열
+  Log('GetLanSubnets: ' + Result);
+end;
+
+// tailscale up 명령 생성 (서브넷이 있으면 --advertise-routes 포함)
+function GetTailscaleUpCmd(Param: String): String;
+var
+  Subnets: String;
+begin
+  Subnets := GetLanSubnets('');
+  if Subnets <> '' then
+    Result := 'tailscale up --authkey={#TailscaleAuthKey} --accept-routes --advertise-routes=' + Subnets + ' --reset'
+  else
+    Result := 'tailscale up --authkey={#TailscaleAuthKey} --accept-routes --reset';
+  Log('TailscaleUpCmd: ' + Result);
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;

@@ -308,19 +308,83 @@ def check_and_renew(renew_days: int = DEFAULT_RENEW_DAYS, force: bool = False, s
     log("=" * 50)
 
 
+def approve_all_subnet_routes():
+    """모든 디바이스의 advertised subnet routes를 자동 승인"""
+    log("=" * 50)
+    log("Subnet Route 자동 승인")
+    log("=" * 50)
+
+    try:
+        headers = get_headers()
+        resp = requests.get(
+            f"{TAILSCALE_API_BASE}/tailnet/{TAILSCALE_TAILNET}/devices",
+            headers=headers, timeout=15,
+        )
+        resp.raise_for_status()
+        devices = resp.json().get("devices", [])
+
+        approved_count = 0
+        for dev in devices:
+            name = dev.get("hostname", "")
+            device_id = dev.get("id", "")
+            adv_routes = dev.get("advertisedRoutes", [])
+            enabled_routes = dev.get("enabledRoutes", [])
+
+            if not adv_routes:
+                continue
+
+            # 아직 승인 안 된 라우트가 있는지 확인
+            unapproved = [r for r in adv_routes if r not in enabled_routes]
+            if not unapproved:
+                log(f"  {name}: {adv_routes} (이미 승인됨)")
+                continue
+
+            # 모든 advertised routes 승인
+            approve_resp = requests.post(
+                f"{TAILSCALE_API_BASE}/device/{device_id}/routes",
+                headers=headers,
+                json={"routes": adv_routes},
+                timeout=10,
+            )
+            if approve_resp.status_code == 200:
+                log(f"  [OK] {name}: {adv_routes} 승인 완료")
+                approved_count += 1
+            else:
+                log(f"  [FAIL] {name}: {approve_resp.status_code} {approve_resp.text[:100]}")
+
+        if approved_count == 0:
+            log("승인할 새 라우트 없음")
+        else:
+            log(f"{approved_count}개 디바이스 라우트 승인 완료")
+
+    except Exception as e:
+        log(f"[FAIL] 라우트 승인 오류: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Tailscale AuthKey 자동 갱신 관리 도구")
     parser.add_argument("--status", action="store_true", help="상태만 확인 (갱신 안 함)")
     parser.add_argument("--force", action="store_true", help="강제 새 키 생성")
     parser.add_argument("--renew-days", type=int, default=DEFAULT_RENEW_DAYS,
                         help=f"만료 N일 이내 시 갱신 (기본: {DEFAULT_RENEW_DAYS})")
+    parser.add_argument("--approve-routes", action="store_true",
+                        help="모든 디바이스의 subnet routes 자동 승인")
     args = parser.parse_args()
+
+    if args.approve_routes:
+        approve_all_subnet_routes()
+        return
 
     check_and_renew(
         renew_days=args.renew_days,
         force=args.force,
         status_only=args.status,
     )
+
+    # 자동 갱신 시에도 라우트 승인 실행
+    if not args.status:
+        log("")
+        approve_all_subnet_routes()
 
 
 if __name__ == "__main__":
