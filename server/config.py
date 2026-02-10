@@ -2,6 +2,17 @@
 WellcomLAND API 서버 설정
 """
 import os
+from pathlib import Path
+
+# .env 파일 로드 (python-dotenv가 있으면 사용, 없으면 무시)
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+        print(f"[Config] .env 로드: {_env_path}")
+except ImportError:
+    pass  # dotenv 미설치 시 시스템 환경변수만 사용
 
 # MySQL
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")

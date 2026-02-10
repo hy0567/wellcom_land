@@ -32,6 +32,10 @@ Thumbs.db
 .DS_Store
 nul
 
+# Secrets
+.env
+server/.env
+
 # Temp
 temp/
 logs/
