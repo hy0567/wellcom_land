@@ -2,9 +2,22 @@
 WellcomLAND API 클라이언트
 서버와 통신하여 인증 및 기기 목록을 관리
 """
+import os
 import requests
 from typing import Optional
 from config import settings
+
+
+def _tailscale_exe() -> str:
+    """Tailscale CLI 경로 반환 (PATH에 없어도 동작)"""
+    for path in [
+        os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'Tailscale', 'tailscale.exe'),
+        os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'), 'Tailscale', 'tailscale.exe'),
+        r'C:\Program Files\Tailscale\tailscale.exe',
+    ]:
+        if os.path.isfile(path):
+            return path
+    return 'tailscale'  # PATH에서 찾기 폴백
 
 
 class APIClient:
@@ -78,9 +91,9 @@ class APIClient:
 
             # 1. Tailscale 설치 확인
             r = subprocess.run(
-                ['tailscale', 'version'],
-                capture_output=True, text=True, timeout=5,
-                creationflags=0x08000000
+                [_tailscale_exe(), 'version'],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=5, creationflags=0x08000000
             )
             if r.returncode != 0:
                 print("[Tailscale] 미설치 — 건너뜀")
@@ -88,16 +101,18 @@ class APIClient:
 
             # 2. Tailscale 상태 확인
             r = subprocess.run(
-                ['tailscale', 'status', '--json'],
-                capture_output=True, text=True, timeout=10,
-                creationflags=0x08000000
+                [_tailscale_exe(), 'status', '--json'],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=10, creationflags=0x08000000
             )
 
             backend_state = ''
             self_ip = ''
-            if r.returncode == 0:
+            # stdout 또는 stderr에서 JSON 파싱 (Tailscale 버전에 따라 다름)
+            json_text = r.stdout.strip() or r.stderr.strip()
+            if json_text:
                 try:
-                    status = _json.loads(r.stdout)
+                    status = _json.loads(json_text)
                     self_ip = status.get('Self', {}).get('TailscaleIPs', [''])[0]
                     backend_state = status.get('BackendState', '')
                 except Exception:
@@ -115,15 +130,15 @@ class APIClient:
                 if authkey:
                     # LAN 서브넷 감지 → advertise-routes 포함
                     lan_subnet = self._detect_lan_subnet()
-                    cmd = ['tailscale', 'up', f'--authkey={authkey}',
+                    cmd = [_tailscale_exe(), 'up', f'--authkey={authkey}',
                            '--accept-routes', '--reset']
                     if lan_subnet:
                         cmd.append(f'--advertise-routes={lan_subnet}')
                         print(f"[Tailscale] 서브넷 광고 예정: {lan_subnet}")
 
                     r = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=30,
-                        creationflags=0x08000000
+                        cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                        timeout=30, creationflags=0x08000000
                     )
                     if r.returncode == 0:
                         print("[Tailscale] authkey로 tailnet 참여 완료!")
@@ -138,13 +153,13 @@ class APIClient:
             else:
                 # 4. 이미 참여 중이면 accept-routes + advertise-routes
                 lan_subnet = self._detect_lan_subnet()
-                cmd = ['tailscale', 'up', '--accept-routes']
+                cmd = [_tailscale_exe(), 'up', '--accept-routes']
                 if lan_subnet:
                     cmd.append(f'--advertise-routes={lan_subnet}')
 
                 subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=15,
-                    creationflags=0x08000000
+                    cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                    timeout=15, creationflags=0x08000000
                 )
                 print(f"[Tailscale] accept-routes 활성화 완료" +
                       (f", advertise-routes={lan_subnet}" if lan_subnet else ""))
@@ -183,7 +198,11 @@ class APIClient:
             return ''
 
     def _auto_approve_subnet_routes(self):
-        """Tailscale API로 이 디바이스의 서브넷 라우트 자동 승인"""
+        """Tailscale API로 이 디바이스의 서브넷 라우트 자동 승인
+
+        ★ tailscale up --advertise-routes 후 API에 전파되기까지 지연이 있으므로
+           API의 advertisedRoutes 대신 로컬에서 감지한 서브넷을 직접 승인.
+        """
         try:
             import subprocess
             import json as _json
@@ -191,27 +210,38 @@ class APIClient:
 
             # 현재 디바이스의 Tailscale 호스트명
             r = subprocess.run(
-                ['tailscale', 'status', '--json'],
-                capture_output=True, text=True, timeout=10,
-                creationflags=0x08000000
+                [_tailscale_exe(), 'status', '--json'],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=10, creationflags=0x08000000
             )
-            if r.returncode != 0:
+            # tailscale status --json은 stdout 또는 stderr로 출력될 수 있음
+            json_text = r.stdout.strip() or r.stderr.strip()
+            if not json_text:
+                print("[Tailscale] status --json 출력 없음")
                 return
 
-            status = _json.loads(r.stdout)
-            self_node_id = status.get('Self', {}).get('ID', '')
+            status = _json.loads(json_text)
             self_hostname = status.get('Self', {}).get('HostName', '')
 
-            if not self_node_id:
+            if not self_hostname:
                 return
 
-            # Tailscale API로 디바이스 목록에서 내 device ID 찾기
+            # 로컬에서 감지한 서브넷 (API 전파 지연 문제 우회)
+            local_subnets = self._detect_lan_subnet()
+            if not local_subnets:
+                print("[Tailscale] 서브넷 없음 — 라우트 승인 건너뜀")
+                return
+
+            routes_to_approve = [s.strip() for s in local_subnets.split(',') if s.strip()]
+
+            # Tailscale API 토큰
             api_token = settings.get('tailscale.api_token', '')
             if not api_token:
-                # tailscale_key_manager.py의 토큰 사용
                 api_token = 'tskey-api-kTCQDpaFUc11CNTRL-6wCCgT14oTWuBsEi4eeoTWCwZ4nztF8L'
 
             headers = {'Authorization': f'Bearer {api_token}'}
+
+            # 디바이스 목록에서 내 device ID 찾기
             resp = _req.get(
                 'https://api.tailscale.com/api/v2/tailnet/-/devices',
                 headers=headers, timeout=10
@@ -224,20 +254,28 @@ class APIClient:
             for dev in devices:
                 if dev.get('hostname', '').upper() == self_hostname.upper():
                     device_id = dev.get('id', '')
-                    adv_routes = dev.get('advertisedRoutes', [])
+                    if not device_id:
+                        break
 
-                    if adv_routes and device_id:
-                        # advertised routes를 모두 enabled로 설정
-                        approve_resp = _req.post(
-                            f'https://api.tailscale.com/api/v2/device/{device_id}/routes',
-                            headers=headers,
-                            json={'routes': adv_routes},
-                            timeout=10
-                        )
-                        if approve_resp.status_code == 200:
-                            print(f"[Tailscale] 서브넷 라우트 자동 승인 완료: {adv_routes}")
-                        else:
-                            print(f"[Tailscale] 라우트 승인 실패: {approve_resp.status_code}")
+                    # API의 advertisedRoutes와 로컬 서브넷 합치기
+                    adv_routes = dev.get('advertisedRoutes', [])
+                    all_routes = list(set(adv_routes + routes_to_approve))
+
+                    # 라우트 승인 요청 (advertise + enable 동시)
+                    approve_resp = _req.post(
+                        f'https://api.tailscale.com/api/v2/device/{device_id}/routes',
+                        headers=headers,
+                        json={'routes': all_routes},
+                        timeout=10
+                    )
+                    if approve_resp.status_code == 200:
+                        result = approve_resp.json()
+                        print(f"[Tailscale] 서브넷 라우트 승인 완료: "
+                              f"advertised={result.get('advertisedRoutes')}, "
+                              f"enabled={result.get('enabledRoutes')}")
+                    else:
+                        print(f"[Tailscale] 라우트 승인 실패: {approve_resp.status_code} "
+                              f"{approve_resp.text[:200]}")
                     break
 
         except Exception as e:

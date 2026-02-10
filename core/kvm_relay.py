@@ -8,11 +8,23 @@ KVM Relay — 관제 PC에서 로컬 KVM을 Tailscale로 중계
 4. 주기적으로 heartbeat 전송
 """
 
+import os
 import socket
 import threading
 import time
 import logging
 from typing import Dict, List, Optional, Tuple
+
+
+def _tailscale_exe() -> str:
+    """Tailscale CLI 경로 반환 (PATH에 없어도 동작)"""
+    for path in [
+        os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'Tailscale', 'tailscale.exe'),
+        os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'), 'Tailscale', 'tailscale.exe'),
+    ]:
+        if os.path.isfile(path):
+            return path
+    return 'tailscale'
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +326,7 @@ class KVMRelayManager:
         try:
             import subprocess
             r = subprocess.run(
-                ['tailscale', 'ip', '-4'],
+                [_tailscale_exe(), 'ip', '-4'],
                 capture_output=True, text=True, timeout=5,
                 creationflags=0x08000000
             )

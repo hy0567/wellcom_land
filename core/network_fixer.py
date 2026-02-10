@@ -12,6 +12,17 @@ import os
 import ctypes
 
 
+def _tailscale_exe() -> str:
+    """Tailscale CLI 경로 반환 (PATH에 없어도 동작)"""
+    for path in [
+        os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'Tailscale', 'tailscale.exe'),
+        os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'), 'Tailscale', 'tailscale.exe'),
+    ]:
+        if os.path.isfile(path):
+            return path
+    return 'tailscale'
+
+
 def is_admin() -> bool:
     """관리자 권한 확인"""
     try:
@@ -396,7 +407,7 @@ def setup_tailscale_subnet_route(tailscale_ip: str, lan_ip: str):
         import subprocess
         # Tailscale에 서브넷 라우팅 광고
         r = subprocess.run(
-            ['tailscale', 'up', f'--advertise-routes={subnet}', '--accept-routes'],
+            [_tailscale_exe(), 'up', f'--advertise-routes={subnet}', '--accept-routes'],
             capture_output=True, text=True, timeout=15,
             creationflags=0x08000000
         )
@@ -473,7 +484,7 @@ def auto_setup_tailscale_forwarding(tailscale_ip: str = "", lan_ip: str = ""):
     try:
         import subprocess
         subprocess.run(
-            ['tailscale', 'up', '--accept-routes'],
+            [_tailscale_exe(), 'up', '--accept-routes'],
             capture_output=True, text=True, timeout=15,
             creationflags=0x08000000
         )
