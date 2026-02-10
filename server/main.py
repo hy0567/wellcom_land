@@ -141,27 +141,17 @@ def get_me(user: dict = Depends(get_current_user)):
 # ===========================================================
 @app.get("/api/devices", response_model=list[DeviceResponse])
 def get_my_devices(user: dict = Depends(get_current_user)):
+    """로그인 사용자에게 할당된 기기만 반환 (admin 포함)"""
     with get_db() as conn:
         with conn.cursor() as cur:
-            if user["role"] == "admin":
-                # admin은 전체 기기 조회
-                cur.execute("""
-                    SELECT d.*, g.name AS group_name
-                    FROM devices d
-                    LEFT JOIN device_groups g ON d.group_id = g.id
-                    WHERE d.is_active = TRUE
-                    ORDER BY d.name
-                """)
-            else:
-                # 일반 사용자는 할당된 기기만
-                cur.execute("""
-                    SELECT d.*, g.name AS group_name
-                    FROM devices d
-                    JOIN user_devices ud ON d.id = ud.device_id
-                    LEFT JOIN device_groups g ON d.group_id = g.id
-                    WHERE ud.user_id = %s AND d.is_active = TRUE
-                    ORDER BY d.name
-                """, (user["id"],))
+            cur.execute("""
+                SELECT d.*, g.name AS group_name
+                FROM devices d
+                JOIN user_devices ud ON d.id = ud.device_id
+                LEFT JOIN device_groups g ON d.group_id = g.id
+                WHERE ud.user_id = %s AND d.is_active = TRUE
+                ORDER BY d.name
+            """, (user["id"],))
             devices = cur.fetchall()
     return [DeviceResponse(**d) for d in devices]
 

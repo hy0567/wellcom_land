@@ -5333,10 +5333,25 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(self, "삭제 확인", f"'{self.current_device.name}' 삭제?",
                                  QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-            self.manager.remove_device(self.current_device.name)
+            device_name = self.current_device.name
+
+            # 서버에서도 삭제 (admin인 경우)
+            try:
+                from api_client import api_client
+                if api_client.is_logged_in and api_client.is_admin:
+                    devices = api_client.admin_get_all_devices()
+                    for d in devices:
+                        if d.get('name') == device_name:
+                            api_client.admin_delete_device(d['id'])
+                            print(f"[Delete] 서버에서 삭제: {device_name}")
+                            break
+            except Exception as e:
+                print(f"[Delete] 서버 삭제 실패 (로컬만 삭제): {e}")
+
+            self.manager.remove_device(device_name)
             self.current_device = None
             self._load_device_list()
-            self.grid_view_tab.load_devices()  # 그리드 뷰 새로고침
+            self.grid_view_tab.load_devices()
             self._update_live_tab()
 
     def _on_device_settings(self):
