@@ -64,7 +64,7 @@ Source: "fix_network_priority.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "..\dist\tools\fix_network_priority.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 
 ; Tailscale VPN 설치파일 (임시 폴더에 복사, 설치 후 삭제)
-Source: "tailscale-setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "tailscale-setup.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 ; data/ 빈 폴더 생성 (기존 데이터 보존)
 [Dirs]
@@ -82,8 +82,8 @@ Name: "desktopicon"; Description: "바탕화면에 바로가기 생성"; GroupDe
 Name: "installtailscale"; Description: "Tailscale VPN 설치 (원격 네트워크 연결용 - 권장)"; GroupDescription: "추가 옵션:"; Flags: checkedonce; Check: not IsTailscaleInstalled
 
 [Run]
-; Tailscale 설치 (사용자 선택 시) — 무인 설치
-Filename: "{tmp}\tailscale-setup.exe"; Parameters: "/S"; StatusMsg: "Tailscale VPN 설치 중..."; Flags: shellexec waituntilterminated; Tasks: installtailscale
+; Tailscale 설치 (사용자 선택 시) — MSI 무인 설치
+Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\tailscale-setup.msi"" /quiet /norestart"; StatusMsg: "Tailscale VPN 설치 중..."; Flags: shellexec waituntilterminated; Tasks: installtailscale
 ; Tailscale 서비스 시작 대기 후 accept-routes 활성화
 Filename: "cmd.exe"; Parameters: "/c timeout /t 5 /nobreak >nul & tailscale up --accept-routes --reset"; StatusMsg: "Tailscale 네트워크 설정 중..."; Flags: shellexec waituntilterminated runhidden; Tasks: installtailscale
 ; Tailscale 네트워크 인터페이스 메트릭 올리기 (LAN이 기본 라우트 유지)
