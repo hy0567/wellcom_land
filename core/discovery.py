@@ -95,8 +95,8 @@ class NetworkScanner:
 
         return all_ips
 
-    # ZeroTier 대역 (컨트롤러가 할당하는 IP 범위)
-    ZEROTIER_SUBNETS = ['10.147.']
+    # Tailscale 대역 (100.x.x.x CGNAT 범위)
+    TAILSCALE_SUBNETS = ['100.']
 
     @staticmethod
     def _classify_ip(ip: str) -> int:
@@ -104,22 +104,16 @@ class NetworkScanner:
 
         Returns:
             0: 192.168.x.x (일반 LAN) - 최우선
-            1: 10.x.x.x (ZeroTier 제외한 일반 LAN)
+            1: 10.x.x.x (일반 LAN)
             2: 172.16-31.x.x (사설 네트워크)
             3: 기타 사설
-            4: 100.x (Tailscale/CGNAT)
-            5: 10.147.x.x (ZeroTier VPN)
-            6: 169.254.x (APIPA/링크로컬)
+            4: 100.x (Tailscale VPN)
+            5: 169.254.x (APIPA/링크로컬)
         """
-        # ZeroTier VPN 대역 (LAN보다 후순위)
-        for zt_prefix in NetworkScanner.ZEROTIER_SUBNETS:
-            if ip.startswith(zt_prefix):
-                return 5  # ZeroTier VPN
-
         if ip.startswith('192.168.'):
             return 0  # 일반 LAN 최우선
         elif ip.startswith('10.'):
-            return 1  # 10.x LAN (ZeroTier 제외)
+            return 1  # 10.x LAN
         elif ip.startswith('172.'):
             parts = ip.split('.')
             try:
@@ -129,9 +123,9 @@ class NetworkScanner:
                 pass
             return 3
         elif ip.startswith('100.'):
-            return 4  # Tailscale / CGNAT
+            return 4  # Tailscale VPN
         elif ip.startswith('169.254.'):
-            return 6  # APIPA
+            return 5  # APIPA
         return 3
 
     @classmethod

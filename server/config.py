@@ -22,3 +22,6 @@ API_PORT = int(os.getenv("API_PORT", "8000"))
 # File Storage
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/opt/wellcomland/uploads")
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+
+# Tailscale (회사 공용 계정)
+TAILSCALE_AUTHKEY = os.getenv("TAILSCALE_AUTHKEY", "")

@@ -63,68 +63,93 @@ class APIClient:
         settings.set('server.token', self._token)
         settings.set('server.username', username)
 
-        # ZeroTier 자동 참가 + 승인 (백그라운드)
+        # Tailscale 상태 확인 (백그라운드)
         import threading
-        threading.Thread(target=self._auto_zerotier_join, daemon=True).start()
+        threading.Thread(target=self._check_tailscale, daemon=True).start()
 
         return data
 
-    def _auto_zerotier_join(self):
-        """ZeroTier 네트워크 자동 참가 + 서버에 승인 요청"""
+    def _check_tailscale(self):
+        """Tailscale 연결 상태 확인 + authkey로 자동 참여 + accept-routes 활성화"""
         try:
-            import subprocess, os
+            import subprocess
+            import json as _json
 
-            # 1. ZeroTier CLI 경로 찾기
-            cli = None
-            for p in [
-                r'C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat',
-                r'C:\Program Files\ZeroTier\One\zerotier-cli.bat',
-            ]:
-                if os.path.exists(p):
-                    cli = p
-                    break
-
-            if not cli:
-                print("[ZeroTier] 미설치 - 건너뜀")
-                return
-
-            # 2. 서버에서 네트워크 ID 조회
-            try:
-                net_info = self._get('/api/zerotier/network')
-                network_id = net_info.get('network_id', '')
-            except Exception:
-                network_id = '4cadbb9187000001'  # 기본값
-
-            if not network_id:
-                return
-
-            # 3. 네트워크 참가 (이미 참가되어 있으면 무시됨)
+            # 1. Tailscale 설치 확인
             r = subprocess.run(
-                [cli, 'join', network_id],
+                ['tailscale', 'version'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000
+            )
+            if r.returncode != 0:
+                print("[Tailscale] 미설치 — 건너뜀")
+                return
+
+            # 2. Tailscale 상태 확인
+            r = subprocess.run(
+                ['tailscale', 'status', '--json'],
                 capture_output=True, text=True, timeout=10,
                 creationflags=0x08000000
             )
-            print(f"[ZeroTier] join {network_id}: {r.stdout.strip()}")
 
-            # 4. 노드 ID 가져오기
-            r = subprocess.run(
-                [cli, 'info'],
-                capture_output=True, text=True, timeout=10,
-                creationflags=0x08000000
-            )
-            parts = r.stdout.strip().split()
-            if len(parts) >= 3:
-                node_id = parts[2]
+            backend_state = ''
+            self_ip = ''
+            if r.returncode == 0:
+                try:
+                    status = _json.loads(r.stdout)
+                    self_ip = status.get('Self', {}).get('TailscaleIPs', [''])[0]
+                    backend_state = status.get('BackendState', '')
+                except Exception:
+                    pass
+
+            print(f"[Tailscale] 상태: {backend_state}, IP: {self_ip}")
+
+            # 3. tailnet 미참여 시 authkey로 자동 참여
+            needs_join = backend_state in ('NeedsLogin', 'NoState', 'Stopped', '')
+
+            if needs_join:
+                print("[Tailscale] tailnet 미참여 — authkey로 자동 참여 시도")
+                authkey = self._get_tailscale_authkey()
+
+                if authkey:
+                    r = subprocess.run(
+                        ['tailscale', 'up', f'--authkey={authkey}',
+                         '--accept-routes', '--reset'],
+                        capture_output=True, text=True, timeout=30,
+                        creationflags=0x08000000
+                    )
+                    if r.returncode == 0:
+                        print("[Tailscale] authkey로 tailnet 참여 완료!")
+                        settings.set('tailscale.joined', True)
+                    else:
+                        print(f"[Tailscale] authkey 참여 실패: {r.stderr.strip()}")
+                else:
+                    print("[Tailscale] 서버에 authkey 미설정 — 수동 로그인 필요")
             else:
-                print(f"[ZeroTier] 노드 ID 파싱 실패: {r.stdout.strip()}")
-                return
-
-            # 5. 서버에 승인 요청
-            result = self._post('/api/zerotier/join', {'node_id': node_id})
-            print(f"[ZeroTier] 승인 결과: {result}")
+                # 4. 이미 참여 중이면 accept-routes만 활성화
+                subprocess.run(
+                    ['tailscale', 'up', '--accept-routes'],
+                    capture_output=True, text=True, timeout=15,
+                    creationflags=0x08000000
+                )
+                print("[Tailscale] accept-routes 활성화 완료")
 
         except Exception as e:
-            print(f"[ZeroTier] 자동 참가 오류 (무시): {e}")
+            print(f"[Tailscale] 상태 확인 오류 (무시): {e}")
+
+    def _get_tailscale_authkey(self) -> str:
+        """서버에서 Tailscale authkey 조회"""
+        try:
+            data = self._get('/api/tailscale/authkey')
+            authkey = data.get('authkey', '')
+            if authkey:
+                # 로컬에도 캐시
+                settings.set('tailscale.authkey', authkey)
+            return authkey
+        except Exception as e:
+            print(f"[Tailscale] authkey 조회 실패: {e}")
+            # 로컬 캐시에서 폴백
+            return settings.get('tailscale.authkey', '')
 
     def verify_token(self) -> bool:
         """저장된 토큰 유효성 확인"""
@@ -298,25 +323,38 @@ class APIClient:
         return self._get('/api/files/quota')
 
     # === KVM Registry (원격 장치 공유) ===
-    def register_kvm_devices(self, devices: list, relay_zt_ip: str, location: str = "") -> dict:
+    def register_kvm_devices(self, devices: list, relay_ip: str, location: str = "") -> dict:
         """관제 PC가 발견한 KVM을 서버에 등록"""
         return self._post('/api/kvm/register', {
             'devices': devices,
-            'relay_zt_ip': relay_zt_ip,
+            'relay_ip': relay_ip,
             'location': location,
         })
 
     def get_remote_kvm_list(self) -> list:
-        """서버에서 원격 KVM 목록 조회 (ZeroTier 경유 접근 정보 포함)"""
+        """서버에서 원격 KVM 목록 조회 (Tailscale 경유 접근 정보 포함)"""
         try:
             data = self._get('/api/kvm/list')
             return data.get('devices', [])
         except Exception:
             return []
 
-    def send_kvm_heartbeat(self, relay_zt_ip: str) -> dict:
+    def send_kvm_heartbeat(self, relay_ip: str) -> dict:
         """관제 PC heartbeat 전송"""
-        return self._post('/api/kvm/heartbeat', {'relay_zt_ip': relay_zt_ip})
+        return self._post('/api/kvm/heartbeat', {'relay_ip': relay_ip})
+
+    # === Tailscale (admin) ===
+    def admin_set_tailscale_authkey(self, authkey: str) -> dict:
+        """Tailscale authkey 설정 (admin 전용)"""
+        return self._put('/api/admin/tailscale/authkey', {'authkey': authkey})
+
+    def get_tailscale_authkey(self) -> str:
+        """서버에서 Tailscale authkey 조회"""
+        try:
+            data = self._get('/api/tailscale/authkey')
+            return data.get('authkey', '')
+        except Exception:
+            return ''
 
     # === Version ===
     def get_server_version(self) -> dict:

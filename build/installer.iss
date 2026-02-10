@@ -4,7 +4,7 @@
 ; 출력: dist/WellcomLAND_Setup.exe
 
 #define MyAppName "WellcomLAND"
-#define MyAppVersion "1.7.3"
+#define MyAppVersion "1.9.0"
 #define MyAppPublisher "Wellcom"
 #define MyAppExeName "WellcomLAND.exe"
 
@@ -63,8 +63,8 @@ Source: "fix_network_priority.py"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "fix_network_priority.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "..\dist\tools\fix_network_priority.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 
-; ZeroTier VPN (임시 폴더에 복사, 설치 후 삭제)
-Source: "ZeroTierOne.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; Tailscale VPN 설치파일 (임시 폴더에 복사, 설치 후 삭제)
+Source: "tailscale-setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 ; data/ 빈 폴더 생성 (기존 데이터 보존)
 [Dirs]
@@ -79,13 +79,15 @@ Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: 
 
 [Tasks]
 Name: "desktopicon"; Description: "바탕화면에 바로가기 생성"; GroupDescription: "추가 옵션:"
-Name: "installzerotier"; Description: "ZeroTier VPN 설치 (원격 네트워크 연결용 - 권장)"; GroupDescription: "추가 옵션:"
+Name: "installtailscale"; Description: "Tailscale VPN 설치 (원격 네트워크 연결용 - 권장)"; GroupDescription: "추가 옵션:"; Flags: checkedonce; Check: not IsTailscaleInstalled
 
 [Run]
-; ZeroTier 설치 (사용자 선택 시)
-Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\ZeroTierOne.msi"" /quiet /norestart"; StatusMsg: "ZeroTier VPN 설치 중..."; Flags: shellexec waituntilterminated; Tasks: installzerotier
-; ZeroTier 네트워크 자동 참가 (설치 후 5초 대기 → join)
-Filename: "cmd.exe"; Parameters: "/c timeout /t 5 /nobreak >nul & ""C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat"" join 4cadbb9187000001"; StatusMsg: "ZeroTier 네트워크 연결 중..."; Flags: shellexec waituntilterminated runhidden; Tasks: installzerotier
+; Tailscale 설치 (사용자 선택 시) — 무인 설치
+Filename: "{tmp}\tailscale-setup.exe"; Parameters: "/S"; StatusMsg: "Tailscale VPN 설치 중..."; Flags: shellexec waituntilterminated; Tasks: installtailscale
+; Tailscale 서비스 시작 대기 후 accept-routes 활성화
+Filename: "cmd.exe"; Parameters: "/c timeout /t 5 /nobreak >nul & tailscale up --accept-routes --reset"; StatusMsg: "Tailscale 네트워크 설정 중..."; Flags: shellexec waituntilterminated runhidden; Tasks: installtailscale
+; Tailscale 네트워크 인터페이스 메트릭 올리기 (LAN이 기본 라우트 유지)
+Filename: "netsh.exe"; Parameters: "interface ipv4 set interface ""Tailscale"" metric=1000"; Flags: shellexec waituntilterminated runhidden; Tasks: installtailscale
 ; WellcomLAND 실행
 Filename: "{app}\{#MyAppExeName}"; Description: "WellcomLAND 실행"; Flags: nowait postinstall skipifsilent
 
@@ -114,6 +116,18 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   NeedsRestart := False;
+end;
+
+// Tailscale 이미 설치 확인
+function IsTailscaleInstalled(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{commonpf}\Tailscale\tailscale.exe'))
+         or FileExists(ExpandConstant('{commonpf64}\Tailscale\tailscale.exe'));
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
 end;
 
 // 제거 시 data/ 보존 안내

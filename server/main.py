@@ -14,7 +14,7 @@ from auth import (
     get_current_user, require_admin,
 )
 from database import get_db
-from config import UPLOAD_DIR, MAX_FILE_SIZE
+from config import UPLOAD_DIR, MAX_FILE_SIZE, TAILSCALE_AUTHKEY
 from models import (
     LoginRequest, LoginResponse, UserInfo,
     UserCreate, UserUpdate, UserResponse,
@@ -559,162 +559,82 @@ def get_my_quota(user: dict = Depends(get_current_user)):
 
 
 # ===========================================================
-# ZeroTier 네트워크 관리
+# Tailscale 네트워크 관리 (VPN 연결은 Tailscale이 자동 처리)
 # ===========================================================
-ZEROTIER_NETWORK_ID = "4cadbb9187000001"
-ZEROTIER_API = "http://127.0.0.1:9993"
+
+@app.on_event("startup")
+def init_tailscale_config():
+    """tailscale_config 테이블 생성 (authkey 등 저장)"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tailscale_config (
+                    `key` VARCHAR(50) PRIMARY KEY,
+                    `value` TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            """)
+            # 환경변수 TAILSCALE_AUTHKEY가 있으면 DB에 반영
+            if TAILSCALE_AUTHKEY:
+                cur.execute("""
+                    INSERT INTO tailscale_config (`key`, `value`)
+                    VALUES ('authkey', %s)
+                    ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)
+                """, (TAILSCALE_AUTHKEY,))
+                print(f"[Init] Tailscale authkey 환경변수에서 로드됨")
+            print("[Init] tailscale_config 테이블 확인 완료")
 
 
-def _zt_auth_token():
-    """ZeroTier 컨트롤러 인증 토큰"""
-    try:
-        with open("/var/lib/zerotier-one/authtoken.secret", "r") as f:
-            return f.read().strip()
-    except Exception:
-        return None
-
-
-@app.post("/api/zerotier/authorize")
-def zerotier_authorize(user: dict = Depends(get_current_user)):
-    """로그인한 사용자의 ZeroTier 노드 자동 승인
-
-    클라이언트가 body로 {"node_id": "abcdef1234"} 전송
-    """
-    import json
-    from fastapi import Request
-
-    # node_id는 body에서 가져옴
-    # FastAPI에서 직접 받기 위해 별도 모델 없이 처리
-    return {"error": "use POST with node_id"}
-
-
-@app.post("/api/zerotier/join")
-def zerotier_join(data: dict, user: dict = Depends(get_current_user)):
-    """ZeroTier 노드 승인 요청
-
-    Body: {"node_id": "89d98c50b5"}
-    - 로그인한 사용자만 자신의 노드를 승인 요청 가능
-    - 서버가 컨트롤러 API로 해당 노드를 authorize
-    """
-    import requests as req
-
-    node_id = data.get("node_id", "").strip()
-    if not node_id or len(node_id) != 10:
-        raise HTTPException(status_code=400, detail="유효하지 않은 ZeroTier 노드 ID")
-
-    token = _zt_auth_token()
-    if not token:
-        raise HTTPException(status_code=500, detail="ZeroTier 컨트롤러 접근 불가")
-
-    # 컨트롤러에 멤버 승인
-    url = f"{ZEROTIER_API}/controller/network/{ZEROTIER_NETWORK_ID}/member/{node_id}"
-    headers = {"X-ZT1-Auth": token}
-    payload = {
-        "authorized": True,
-        "name": f"user-{user['username']}-{node_id[:6]}",
-    }
-
-    try:
-        resp = req.post(url, json=payload, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            member = resp.json()
-            return {
-                "status": "ok",
-                "authorized": member.get("authorized"),
-                "ip_assignments": member.get("ipAssignments", []),
-                "network_id": ZEROTIER_NETWORK_ID,
-            }
-        else:
-            raise HTTPException(status_code=502, detail=f"ZeroTier 컨트롤러 오류: {resp.status_code}")
-    except req.exceptions.ConnectionError:
-        raise HTTPException(status_code=502, detail="ZeroTier 컨트롤러 연결 실패")
-
-
-@app.get("/api/zerotier/network")
-def zerotier_network_info(user: dict = Depends(get_current_user)):
-    """ZeroTier 네트워크 정보 (클라이언트가 join할 네트워크 ID 제공)"""
+@app.get("/api/tailscale/status")
+def tailscale_status(user: dict = Depends(get_current_user)):
+    """Tailscale 네트워크 상태 조회"""
     return {
-        "network_id": ZEROTIER_NETWORK_ID,
+        "vpn": "tailscale",
         "name": "WellcomLAND",
+        "status": "Tailscale manages connections automatically",
     }
 
 
-@app.get("/api/admin/zerotier/members")
-def zerotier_list_members(admin: dict = Depends(require_admin)):
-    """ZeroTier 네트워크 멤버 목록 (관리자 전용)"""
-    import requests as req
+@app.get("/api/tailscale/authkey")
+def get_tailscale_authkey(user: dict = Depends(get_current_user)):
+    """Tailscale authkey 조회 (로그인된 사용자만)
 
-    token = _zt_auth_token()
-    if not token:
-        raise HTTPException(status_code=500, detail="ZeroTier 컨트롤러 접근 불가")
-
-    url = f"{ZEROTIER_API}/controller/network/{ZEROTIER_NETWORK_ID}/member"
-    headers = {"X-ZT1-Auth": token}
-
-    try:
-        resp = req.get(url, headers=headers, timeout=10)
-        member_ids = resp.json()
-
-        members = []
-        for mid, revision in member_ids.items():
-            detail_resp = req.get(f"{url}/{mid}", headers=headers, timeout=5)
-            if detail_resp.status_code == 200:
-                m = detail_resp.json()
-                members.append({
-                    "node_id": mid,
-                    "name": m.get("name", ""),
-                    "authorized": m.get("authorized", False),
-                    "ip_assignments": m.get("ipAssignments", []),
-                    "last_seen": m.get("lastSeen", 0),
-                })
-
-        return {"network_id": ZEROTIER_NETWORK_ID, "members": members}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@app.post("/api/zerotier/route")
-def add_zt_route(data: dict, user: dict = Depends(get_current_user)):
-    """ZeroTier Managed Route 추가 (관제 PC가 자기 서브넷을 등록)
-
-    Body: {"subnet": "192.168.68.0/24", "via": "10.147.17.133"}
+    클라이언트가 이 키로 tailscale up --authkey=<key> 실행하여
+    회사 공용 tailnet에 자동 참여.
     """
-    import requests as req
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `value` FROM tailscale_config WHERE `key` = 'authkey'")
+            row = cur.fetchone()
 
-    subnet = data.get("subnet", "").strip()
-    via = data.get("via", "").strip()
+    if not row or not row["value"]:
+        return {"authkey": "", "message": "authkey 미설정"}
 
-    if not subnet or not via:
-        raise HTTPException(status_code=400, detail="subnet과 via 필수")
+    return {"authkey": row["value"]}
 
-    try:
-        url = f"http://127.0.0.1:9993/controller/network/{ZEROTIER_NETWORK_ID}"
-        token = open("/var/lib/zerotier-one/authtoken.secret").read().strip()
-        headers = {"X-ZT1-AUTH": token}
 
-        # 현재 routes 조회
-        r = req.get(url, headers=headers, timeout=5)
-        config = r.json()
-        routes = config.get("routes", [])
+@app.put("/api/admin/tailscale/authkey")
+def set_tailscale_authkey(data: dict, user: dict = Depends(require_admin)):
+    """Tailscale authkey 설정 (admin 전용)
 
-        # 이미 같은 subnet/via가 있으면 스킵
-        for route in routes:
-            if route.get("target") == subnet and route.get("via") == via:
-                return {"status": "exists", "routes": routes}
+    Body: {"authkey": "tskey-auth-xxx"}
 
-        # 중복 subnet 있으면 via 업데이트 (다른 관제 PC가 같은 서브넷일 수 있음)
-        routes = [r for r in routes if r.get("target") != subnet]
-        routes.append({"target": subnet, "via": via})
+    Tailscale 관리 콘솔에서 생성한 Reusable authkey를 등록.
+    모든 클라이언트가 이 키로 회사 tailnet에 자동 참여.
+    """
+    authkey = data.get("authkey", "").strip()
+    if not authkey:
+        raise HTTPException(status_code=400, detail="authkey 필수")
 
-        # routes 업데이트
-        r = req.post(url, headers=headers, json={"routes": routes}, timeout=5)
-        result = r.json()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tailscale_config (`key`, `value`)
+                VALUES ('authkey', %s)
+                ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)
+            """, (authkey,))
 
-        print(f"[ZTRoute] {subnet} via {via} 등록 (by {user['username']})")
-        return {"status": "ok", "routes": result.get("routes", [])}
-
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ZeroTier route 설정 실패: {str(e)}")
+    return {"status": "ok", "message": "Tailscale authkey 설정 완료"}
 
 
 # ===========================================================
@@ -731,14 +651,14 @@ def init_kvm_registry():
                     kvm_local_ip VARCHAR(45) NOT NULL,
                     kvm_port INT DEFAULT 80,
                     kvm_name VARCHAR(100) DEFAULT '',
-                    relay_zt_ip VARCHAR(45) NOT NULL COMMENT '관제PC의 ZeroTier IP',
+                    relay_ip VARCHAR(45) NOT NULL COMMENT '관제PC의 Tailscale IP',
                     relay_port INT NOT NULL COMMENT '관제PC의 TCP 프록시 포트',
                     udp_relay_port INT DEFAULT NULL COMMENT 'WebRTC UDP 릴레이 포트',
                     owner_username VARCHAR(50) NOT NULL COMMENT '등록한 관제PC 사용자',
                     location VARCHAR(100) DEFAULT '' COMMENT '관제 위치명',
                     last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
                     is_online BOOLEAN DEFAULT TRUE,
-                    UNIQUE KEY uq_relay (relay_zt_ip, relay_port)
+                    UNIQUE KEY uq_relay (relay_ip, relay_port)
                 )
             """)
             # udp_relay_port 컬럼 추가 (기존 테이블 호환)
@@ -766,16 +686,16 @@ def register_kvm(data: dict, user: dict = Depends(get_current_user)):
                 "relay_port": 18100
             }
         ],
-        "relay_zt_ip": "10.147.17.133",
+        "relay_ip": "100.64.0.2",
         "location": "본사 관제실"
     }
     """
     devices = data.get("devices", [])
-    relay_zt_ip = data.get("relay_zt_ip", "").strip()
+    relay_ip = data.get("relay_ip", "").strip() or data.get("relay_zt_ip", "").strip()
     location = data.get("location", "")
 
-    if not relay_zt_ip or not devices:
-        raise HTTPException(status_code=400, detail="relay_zt_ip와 devices 필수")
+    if not relay_ip or not devices:
+        raise HTTPException(status_code=400, detail="relay_ip와 devices 필수")
 
     registered = 0
     with get_db() as conn:
@@ -793,7 +713,7 @@ def register_kvm(data: dict, user: dict = Depends(get_current_user)):
                 # UPSERT: 이미 있으면 업데이트
                 cur.execute("""
                     INSERT INTO kvm_registry
-                        (kvm_local_ip, kvm_port, kvm_name, relay_zt_ip, relay_port,
+                        (kvm_local_ip, kvm_port, kvm_name, relay_ip, relay_port,
                          udp_relay_port, owner_username, location, last_seen, is_online)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), TRUE)
                     ON DUPLICATE KEY UPDATE
@@ -805,7 +725,7 @@ def register_kvm(data: dict, user: dict = Depends(get_current_user)):
                         location = VALUES(location),
                         last_seen = NOW(),
                         is_online = TRUE
-                """, (kvm_local_ip, kvm_port, kvm_name, relay_zt_ip, relay_port,
+                """, (kvm_local_ip, kvm_port, kvm_name, relay_ip, relay_port,
                       udp_relay_port, user["username"], location))
                 registered += 1
 
@@ -814,7 +734,7 @@ def register_kvm(data: dict, user: dict = Depends(get_current_user)):
 
 @app.get("/api/kvm/list")
 def list_kvm_devices(user: dict = Depends(get_current_user)):
-    """등록된 모든 원격 KVM 장치 목록 (ZeroTier 경유 접근 정보 포함)"""
+    """등록된 모든 원격 KVM 장치 목록 (Tailscale 경유 접근 정보 포함)"""
     with get_db() as conn:
         with conn.cursor() as cur:
             # 5분 이상 미갱신 → offline 처리
@@ -841,10 +761,10 @@ def list_kvm_devices(user: dict = Depends(get_current_user)):
             "kvm_name": r["kvm_name"],
             "kvm_local_ip": r["kvm_local_ip"],
             "kvm_port": r["kvm_port"],
-            "relay_zt_ip": r["relay_zt_ip"],
+            "relay_ip": r.get("relay_ip", r.get("relay_zt_ip", "")),
             "relay_port": r["relay_port"],
             "udp_relay_port": r.get("udp_relay_port"),
-            "access_url": f"http://{r['relay_zt_ip']}:{r['relay_port']}",
+            "access_url": f"http://{r.get('relay_ip', r.get('relay_zt_ip', ''))}:{r['relay_port']}",
             "owner": r["owner_username"],
             "location": r["location"],
             "is_online": bool(r["is_online"]),
@@ -858,18 +778,18 @@ def list_kvm_devices(user: dict = Depends(get_current_user)):
 def kvm_heartbeat(data: dict, user: dict = Depends(get_current_user)):
     """관제 PC가 주기적으로 온라인 상태 갱신
 
-    Body: {"relay_zt_ip": "10.147.17.133"}
+    Body: {"relay_ip": "100.64.0.2"}
     """
-    relay_zt_ip = data.get("relay_zt_ip", "").strip()
-    if not relay_zt_ip:
-        raise HTTPException(status_code=400, detail="relay_zt_ip 필수")
+    relay_ip = data.get("relay_ip", "").strip() or data.get("relay_zt_ip", "").strip()
+    if not relay_ip:
+        raise HTTPException(status_code=400, detail="relay_ip 필수")
 
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE kvm_registry SET last_seen = NOW(), is_online = TRUE
-                WHERE relay_zt_ip = %s AND owner_username = %s
-            """, (relay_zt_ip, user["username"]))
+                WHERE relay_ip = %s AND owner_username = %s
+            """, (relay_ip, user["username"]))
 
     return {"status": "ok"}
 
@@ -888,7 +808,7 @@ def delete_kvm(kvm_id: int, user: dict = Depends(require_admin)):
 # ===========================================================
 @app.get("/api/version")
 def get_version():
-    return {"version": "1.8.4", "app_name": "WellcomLAND"}
+    return {"version": "1.9.0", "app_name": "WellcomLAND"}
 
 
 # ===========================================================

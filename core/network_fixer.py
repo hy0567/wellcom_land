@@ -161,7 +161,7 @@ def fix_network_priority_wmi() -> bool:
 def enable_ip_forwarding() -> bool:
     """Windows IP Forwarding 활성화 (관제 PC에서 KVM 서브넷 라우팅)
 
-    ZeroTier Managed Route를 통해 원격 PC가 관제 PC의 KVM 서브넷에 접근하려면
+    Tailscale 서브넷 라우팅을 통해 원격 PC가 관제 PC의 KVM 서브넷에 접근하려면
     관제 PC의 Windows에서 IP Forwarding이 활성화되어야 합니다.
 
     1단계: 레지스트리 (재부팅 후 영구 적용)
@@ -267,29 +267,33 @@ def _enable_runtime_forwarding():
         print(f"[IPForward] 런타임 forwarding 설정 오류: {e}")
 
 
-def setup_zt_subnet_route(api_client, zt_ip: str, lan_ip: str):
-    """ZeroTier 서버에 이 PC의 LAN 서브넷 route 등록
+def setup_tailscale_subnet_route(tailscale_ip: str, lan_ip: str):
+    """Tailscale 서브넷 라우팅 설정
 
-    관제 PC가 시작할 때 자동으로 호출되어,
+    관제 PC에서 실행: tailscale up --advertise-routes=<subnet>
     원격 PC가 이 PC의 KVM 서브넷에 접근할 수 있도록 함.
 
     Args:
-        api_client: 서버 API 클라이언트 (로그인 상태)
-        zt_ip: 이 PC의 ZeroTier IP (예: 10.147.17.133)
+        tailscale_ip: 이 PC의 Tailscale IP (예: 100.64.0.2)
         lan_ip: 이 PC의 LAN IP (예: 192.168.68.x)
     """
     try:
         parts = lan_ip.split('.')
         subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
 
-        # 서버에 route 등록 요청
-        result = api_client._post('/api/zerotier/route', {
-            'subnet': subnet,
-            'via': zt_ip,
-        })
-        print(f"[ZTRoute] {subnet} via {zt_ip} 등록: {result}")
+        import subprocess
+        # Tailscale에 서브넷 라우팅 광고
+        r = subprocess.run(
+            ['tailscale', 'up', f'--advertise-routes={subnet}', '--accept-routes'],
+            capture_output=True, text=True, timeout=15,
+            creationflags=0x08000000
+        )
+        if r.returncode == 0:
+            print(f"[Tailscale] 서브넷 라우팅 광고: {subnet} (via {tailscale_ip})")
+        else:
+            print(f"[Tailscale] 서브넷 라우팅 설정 실패: {r.stderr.strip()}")
     except Exception as e:
-        print(f"[ZTRoute] route 등록 실패 (무시): {e}")
+        print(f"[Tailscale] route 설정 실패 (무시): {e}")
 
 
 def setup_relay_firewall_rules():
@@ -328,73 +332,76 @@ def setup_relay_firewall_rules():
             print(f"[Firewall] {name} 규칙 추가 실패: {e}")
 
 
-def auto_setup_zt_forwarding(api_client=None, zt_ip: str = "", lan_ip: str = ""):
-    """관제 PC에서 ZeroTier 서브넷 라우팅 자동 설정
+def auto_setup_tailscale_forwarding(tailscale_ip: str = "", lan_ip: str = ""):
+    """관제 PC에서 Tailscale 서브넷 라우팅 자동 설정
 
     1. IP Forwarding 활성화 (레지스트리 + 런타임)
-    2. ZeroTier 인터페이스에서 allowGlobal 설정
-    3. 방화벽 규칙 추가 (릴레이 포트)
-    4. 서버에 subnet route 등록
+    2. 방화벽 규칙 추가 (릴레이 포트)
+    3. Tailscale 서브넷 라우팅 광고
     """
-    if not zt_ip or not lan_ip:
+    if not tailscale_ip or not lan_ip:
         return
 
-    # ZeroTier IP가 아닌 일반 LAN IP여야 의미 있음
-    if lan_ip.startswith('10.147.') or lan_ip.startswith('169.254.'):
+    # Tailscale IP가 아닌 일반 LAN IP여야 의미 있음
+    if lan_ip.startswith('100.') or lan_ip.startswith('169.254.'):
         return
 
-    print(f"[ZTForward] 관제 PC 서브넷 라우팅 설정: LAN={lan_ip} ZT={zt_ip}")
+    print(f"[Tailscale] 관제 PC 서브넷 라우팅 설정: LAN={lan_ip} TS={tailscale_ip}")
 
     # 1. IP Forwarding 활성화 (레지스트리 + 런타임 netsh)
     enable_ip_forwarding()
 
-    # 2. ZeroTier allowGlobal 설정
-    try:
-        cli = None
-        for p in [
-            r'C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat',
-            r'C:\Program Files\ZeroTier\One\zerotier-cli.bat',
-        ]:
-            if os.path.exists(p):
-                cli = p
-                break
-
-        if cli:
-            # 네트워크 ID 찾기
-            result = subprocess.run(
-                [cli, 'listnetworks'],
-                capture_output=True, text=True, timeout=10,
-                creationflags=0x08000000
-            )
-            for line in result.stdout.strip().split('\n'):
-                parts = line.split()
-                if len(parts) >= 3 and len(parts[2]) == 16:
-                    net_id = parts[2]
-                    subprocess.run(
-                        [cli, 'set', net_id, 'allowGlobal=true'],
-                        capture_output=True, timeout=5,
-                        creationflags=0x08000000
-                    )
-                    print(f"[ZTForward] {net_id} allowGlobal=true")
-    except Exception as e:
-        print(f"[ZTForward] allowGlobal 설정 오류 (무시): {e}")
-
-    # 3. 방화벽 규칙 추가
+    # 2. 방화벽 규칙 추가
     setup_relay_firewall_rules()
 
-    # 4. 서버에 subnet route 등록
-    if api_client:
-        setup_zt_subnet_route(api_client, zt_ip, lan_ip)
+    # 3. Tailscale 서브넷 라우팅 광고
+    setup_tailscale_subnet_route(tailscale_ip, lan_ip)
+
+    # 4. 원격 PC에서 accept-routes 활성화
+    try:
+        import subprocess
+        subprocess.run(
+            ['tailscale', 'up', '--accept-routes'],
+            capture_output=True, text=True, timeout=15,
+            creationflags=0x08000000
+        )
+    except Exception:
+        pass
+
+
+def _ensure_tailscale_high_metric():
+    """Tailscale 인터페이스 메트릭을 항상 높게 설정
+
+    Tailscale이 기본 라우트를 빼앗지 않도록 메트릭을 1000으로 설정.
+    LAN이 이미 기본 라우트여도 매번 실행 — 재부팅/Tailscale 재시작 시 리셋 방지.
+    """
+    if not is_admin():
+        return
+
+    try:
+        # Tailscale 인터페이스 메트릭 올리기 (이미 1000이면 무시됨)
+        result = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'set', 'interface', 'Tailscale', 'metric=1000'],
+            capture_output=True, text=True, timeout=5,
+            creationflags=0x08000000
+        )
+        if result.returncode == 0:
+            print("[NetworkFix] Tailscale metric=1000 설정 완료 (LAN 우선)")
+    except Exception:
+        pass
 
 
 def auto_fix_network():
     """앱 시작 시 자동 네트워크 우선순위 조정
 
-    1. 기본 라우트가 LAN이 아닌 경우만 실행
-    2. 관리자 권한이 있으면 자동 수정 시도
-    3. 관리자 권한이 없으면 로그만 남김 (앱 자체는 get_local_ip()로 올바른 IP 사용)
+    ★ 핵심: Tailscale이 기본 라우트를 빼앗지 않도록 항상 메트릭 조정
+    1. Tailscale 메트릭을 항상 높게 설정 (매번 실행)
+    2. 기본 라우트가 LAN이 아닌 경우 추가 수정
     """
     try:
+        # ★ Tailscale 메트릭은 항상 높게 유지 (기본 라우트 상관없이)
+        _ensure_tailscale_high_metric()
+
         if not needs_network_fix():
             print("[NetworkFix] 네트워크 정상 (LAN이 기본 라우트)")
             return

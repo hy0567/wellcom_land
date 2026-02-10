@@ -10,8 +10,8 @@ import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# 관제 PC ZeroTier IP
-RELAY_IP = "10.147.17.133"
+# 관제 PC Tailscale IP (tailscale ip -4 로 확인)
+RELAY_IP = "100.x.x.x"  # TODO: 실제 Tailscale IP로 변경
 
 # 릴레이 포트 목록
 PORTS = [18069, 18070, 18061]
@@ -132,8 +132,8 @@ def main():
         for info in addrs:
             ip = info[4][0]
             tag = ""
-            if ip.startswith('10.147.'):
-                tag = " (ZeroTier)"
+            if ip.startswith('100.'):
+                tag = " (Tailscale)"
             elif ip.startswith('192.168.'):
                 tag = " (LAN)"
             elif ip.startswith('169.254.'):

@@ -182,7 +182,7 @@ def main():
     window = MainWindow()
     window.show()
 
-    # KVM 릴레이 시작 (로컬 KVM을 ZeroTier로 중계 + 서버 등록)
+    # KVM 릴레이 시작 (로컬 KVM을 Tailscale로 중계 + 서버 등록)
     try:
         from core.kvm_relay import KVMRelayManager
         from api_client import api_client
@@ -196,32 +196,32 @@ def main():
             if not api_client.is_logged_in:
                 return
 
-            zt_ip = _kvm_relay.get_zt_ip()
-            if not zt_ip:
-                print("[Relay] ZeroTier IP 없음 — 릴레이 건너뜀")
+            ts_ip = _kvm_relay.get_tailscale_ip()
+            if not ts_ip:
+                print("[Relay] Tailscale IP 없음 — 릴레이 건너뜀")
                 return
 
-            print(f"[Relay] ZeroTier IP: {zt_ip}")
+            print(f"[Relay] Tailscale IP: {ts_ip}")
 
-            # ZeroTier 서브넷 라우팅 자동 설정
-            # (관제 PC의 KVM 서브넷을 ZeroTier 네트워크에 공유)
-            try:
-                from core.discovery import NetworkScanner
-                lan_ip = NetworkScanner.get_local_ip()
-                if lan_ip and not lan_ip.startswith('10.147.'):
-                    from core.network_fixer import auto_setup_zt_forwarding
-                    auto_setup_zt_forwarding(api_client, zt_ip, lan_ip)
-            except Exception as e:
-                print(f"[Relay] ZT 서브넷 라우팅 설정 실패 (무시): {e}")
+            from core.discovery import NetworkScanner
+            lan_ip = NetworkScanner.get_local_ip()
+            print(f"[Network] LAN IP: {lan_ip}")
 
-            # 로컬 KVM 장치에 대해 TCP 프록시 시작
+            # 로컬 KVM 장치에 대해 TCP 프록시 시작 (Tailscale 릴레이 IP는 제외)
             manager = window.manager if hasattr(window, 'manager') else None
+            relay_devices = []
             if manager:
                 devices = manager.get_all_devices()
-                relay_devices = []
                 for dev in devices:
                     kvm_ip = dev.ip
                     kvm_port = dev.info.web_port if hasattr(dev.info, 'web_port') else 80
+
+                    # 이미 릴레이로 치환된 디바이스(Tailscale IP)는 스킵
+                    # → 이 PC에서 직접 접근 가능한 로컬 KVM만 릴레이 생성
+                    if kvm_ip.startswith('100.'):
+                        print(f"[Relay] {dev.name} ({kvm_ip}) — 원격 릴레이 (스킵)")
+                        continue
+
                     relay_port = _kvm_relay.start_relay(kvm_ip, kvm_port, dev.name)
                     if relay_port:
                         udp_port = _kvm_relay.get_udp_port(kvm_ip)
@@ -235,16 +235,28 @@ def main():
                         udp_info = f" UDP:{udp_port}" if udp_port else ""
                         print(f"[Relay] {dev.name} ({kvm_ip}:{kvm_port}) → TCP:{relay_port}{udp_info}")
 
-                # 서버에 등록
-                if relay_devices:
-                    try:
-                        api_client.register_kvm_devices(relay_devices, zt_ip)
-                        print(f"[Relay] 서버에 {len(relay_devices)}개 KVM 등록 완료")
-                    except Exception as e:
-                        print(f"[Relay] 서버 등록 실패: {e}")
+            # 관제 PC 판별: 릴레이할 로컬 KVM이 1개 이상이면 관제 PC
+            is_control_pc = len(relay_devices) > 0
+            if is_control_pc:
+                print(f"[Relay] 관제 PC 모드 — {len(relay_devices)}개 로컬 KVM 릴레이 중")
+                try:
+                    if lan_ip and not lan_ip.startswith('100.'):
+                        from core.network_fixer import auto_setup_tailscale_forwarding
+                        auto_setup_tailscale_forwarding(ts_ip, lan_ip)
+                except Exception as e:
+                    print(f"[Relay] Tailscale 서브넷 라우팅 설정 실패 (무시): {e}")
+
+                # 서버에 릴레이 KVM 등록
+                try:
+                    api_client.register_kvm_devices(relay_devices, ts_ip)
+                    print(f"[Relay] 서버에 {len(relay_devices)}개 KVM 등록 완료")
+                except Exception as e:
+                    print(f"[Relay] 서버 등록 실패: {e}")
 
                 # heartbeat 시작
                 _kvm_relay.start_heartbeat(api_client, interval=120)
+            else:
+                print(f"[Relay] 클라이언트 PC 모드 — 로컬 KVM 없음, 서브넷 라우팅 생략")
 
         import threading
         threading.Thread(target=_start_kvm_relay, daemon=True).start()

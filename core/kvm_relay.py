@@ -1,8 +1,8 @@
 """
-KVM Relay — 관제 PC에서 로컬 KVM을 ZeroTier로 중계
+KVM Relay — 관제 PC에서 로컬 KVM을 Tailscale로 중계
 
 관제 PC가 로컬 네트워크의 KVM을 발견하면:
-1. 각 KVM에 대해 TCP 프록시 포트를 열어줌 (ZT_IP:18xxx → KVM_IP:80)
+1. 각 KVM에 대해 TCP 프록시 포트를 열어줌 (Tailscale_IP:18xxx → KVM_IP:80)
 2. 각 KVM에 대해 UDP 릴레이 포트를 열어줌 (WebRTC 미디어용)
 3. 서버에 등록하여 원격 PC(admin)가 접근 가능하게 함
 4. 주기적으로 heartbeat 전송
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class TCPProxy:
-    """단일 KVM에 대한 TCP 프록시 (ZT → 로컬 KVM)"""
+    """단일 KVM에 대한 TCP 프록시 (Tailscale → 로컬 KVM)"""
 
     def __init__(self, listen_port: int, target_ip: str, target_port: int = 80,
                  on_udp_port_detected: Optional[callable] = None):
@@ -207,7 +207,7 @@ class TCPProxy:
 
 
 class UDPRelay:
-    """WebRTC 미디어용 UDP 릴레이 (ZT → 로컬 KVM)
+    """WebRTC 미디어용 UDP 릴레이 (Tailscale → 로컬 KVM)
 
     WebRTC는 DTLS/SRTP를 UDP로 전송.
     원격 클라이언트가 relay_ip:udp_port 로 보내면 → kvm_ip:kvm_udp_port 로 전달.
@@ -301,35 +301,52 @@ class KVMRelayManager:
     def __init__(self):
         self._proxies: Dict[str, TCPProxy] = {}  # key: "kvm_ip:port"
         self._udp_relays: Dict[str, UDPRelay] = {}  # key: "kvm_ip"
-        self._zt_ip: Optional[str] = None
+        self._tailscale_ip: Optional[str] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._running = False
 
-    def get_zt_ip(self) -> Optional[str]:
-        """이 PC의 ZeroTier IP 가져오기"""
-        if self._zt_ip:
-            return self._zt_ip
+    def get_tailscale_ip(self) -> Optional[str]:
+        """이 PC의 Tailscale IP 가져오기 (100.x.x.x)"""
+        if self._tailscale_ip:
+            return self._tailscale_ip
 
+        # 방법 1: tailscale CLI
+        try:
+            import subprocess
+            r = subprocess.run(
+                ['tailscale', 'ip', '-4'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000
+            )
+            if r.returncode == 0:
+                ip = r.stdout.strip().split('\n')[0].strip()
+                if ip.startswith('100.'):
+                    self._tailscale_ip = ip
+                    return ip
+        except Exception:
+            pass
+
+        # 방법 2: hostname resolver에서 100.x 찾기
         try:
             hostname = socket.gethostname()
             addr_infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
             for info in addr_infos:
                 ip = info[4][0]
-                if ip.startswith('10.147.'):
-                    self._zt_ip = ip
+                if ip.startswith('100.'):
+                    self._tailscale_ip = ip
                     return ip
         except Exception:
             pass
 
-        # UDP 연결 방식
+        # 방법 3: UDP 연결 방식 (Tailscale Magic DNS)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0.1)
-            s.connect(("10.147.17.1", 80))
+            s.connect(("100.100.100.100", 80))
             ip = s.getsockname()[0]
             s.close()
-            if ip.startswith('10.147.'):
-                self._zt_ip = ip
+            if ip.startswith('100.'):
+                self._tailscale_ip = ip
                 return ip
         except Exception:
             pass
@@ -430,7 +447,7 @@ class KVMRelayManager:
 
     def get_relay_info(self) -> List[dict]:
         """현재 활성 릴레이 정보"""
-        zt_ip = self.get_zt_ip()
+        ts_ip = self.get_tailscale_ip()
         result = []
         for key, proxy in self._proxies.items():
             kvm_ip, kvm_port = key.rsplit(':', 1)
@@ -440,16 +457,16 @@ class KVMRelayManager:
                 "kvm_port": int(kvm_port),
                 "relay_port": proxy.listen_port,
                 "udp_relay_port": udp_port,
-                "relay_zt_ip": zt_ip or "",
-                "access_url": f"http://{zt_ip}:{proxy.listen_port}" if zt_ip else "",
+                "relay_ip": ts_ip or "",
+                "access_url": f"http://{ts_ip}:{proxy.listen_port}" if ts_ip else "",
             })
         return result
 
     def register_to_server(self, api_client, location: str = ""):
         """서버에 현재 릴레이 중인 KVM들을 등록"""
-        zt_ip = self.get_zt_ip()
-        if not zt_ip:
-            logger.warning("[Relay] ZeroTier IP 없음 — 서버 등록 건너뜀")
+        ts_ip = self.get_tailscale_ip()
+        if not ts_ip:
+            logger.warning("[Relay] Tailscale IP 없음 — 서버 등록 건너뜀")
             return
 
         devices = []
@@ -470,7 +487,7 @@ class KVMRelayManager:
         try:
             result = api_client._post('/api/kvm/register', {
                 "devices": devices,
-                "relay_zt_ip": zt_ip,
+                "relay_ip": ts_ip,
                 "location": location,
             })
             logger.info(f"[Relay] 서버 등록: {result}")
@@ -486,11 +503,11 @@ class KVMRelayManager:
 
         def _heartbeat_loop():
             while self._running:
-                zt_ip = self.get_zt_ip()
-                if zt_ip:
+                ts_ip = self.get_tailscale_ip()
+                if ts_ip:
                     try:
                         api_client._post('/api/kvm/heartbeat', {
-                            "relay_zt_ip": zt_ip,
+                            "relay_ip": ts_ip,
                         })
                     except Exception:
                         pass

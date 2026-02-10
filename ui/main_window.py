@@ -608,9 +608,8 @@ class KVMThumbnailWidget(QFrame):
             script.setRunsOnSubFrames(True)
 
             scripts = self._webview.page().scripts()
-            existing = scripts.findScript("wellcomland-ice-patch-thumb")
-            if not existing.isNull():
-                scripts.remove(existing)
+            for old in scripts.find("wellcomland-ice-patch-thumb"):
+                scripts.remove(old)
             scripts.insert(script)
         except Exception as e:
             print(f"[Thumbnail] ICE patch 주입 실패: {e}")
@@ -662,7 +661,7 @@ class KVMThumbnailWidget(QFrame):
                     url = f"http://{self.device.ip}:{self.device.info.web_port}/"
                     print(f"[Thumbnail] start_capture: {self.device.name} → {url} (crop={self._crop_region})")
                     # 릴레이 접속 시 ICE 패치 주입
-                    if self.device.ip.startswith('10.147.'):
+                    if self.device.ip.startswith('100.'):
                         self._inject_ice_patch_thumbnail()
                     self._webview.setUrl(QUrl(url))
                     self.status_label.hide()
@@ -1596,13 +1595,9 @@ class Aion2WebPage(QWebEnginePage):
         self.featurePermissionRequested.connect(self._on_permission_requested)
 
     def _on_permission_requested(self, origin, feature):
-        """권한 요청 자동 허용 (마우스 락)"""
-        if feature == QWebEnginePage.Feature.MouseLock:
-            self.setFeaturePermission(origin, feature,
-                                       QWebEnginePage.PermissionPolicy.PermissionGrantedByUser)
-        else:
-            self.setFeaturePermission(origin, feature,
-                                       QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
+        """권한 요청 자동 허용 (마우스 락, 미디어 등 모든 권한)"""
+        self.setFeaturePermission(origin, feature,
+                                   QWebEnginePage.PermissionPolicy.PermissionGrantedByUser)
 
 
 class LiveViewDialog(QDialog):
@@ -1983,9 +1978,10 @@ class LiveViewDialog(QDialog):
         self.device = device
         self.setWindowTitle(f"{device.name} ({device.ip})")
         self.resize(1920, 1080)
+        print(f"[LiveView] __init__ 시작: {device.name} ({device.ip})")
 
         # HID 컨트롤러 (SSH 직접 접속 — 릴레이 접속 시 사용 불가)
-        self._is_relay = device.ip.startswith('10.147.')
+        self._is_relay = device.ip.startswith('100.')
         if self._is_relay:
             # 릴레이 접속: SSH HID 사용 불가 → 웹 기반 입력만 사용
             hid_ip = getattr(device.info, '_kvm_local_ip', device.ip)
@@ -2008,9 +2004,12 @@ class LiveViewDialog(QDialog):
         self._pending_quality = None  # 대기 중인 품질 값
         self._previous_quality = 80  # 저지연 모드 해제 시 복원할 품질
         self._page_loaded = False
+        print(f"[LiveView] _init_ui 호출 전")
         self._init_ui()
+        print(f"[LiveView] _init_ui 완료, _load_kvm_url 호출")
         # URL 로드 (WebView 생성 후 바로 시작)
         self._load_kvm_url()
+        print(f"[LiveView] __init__ 완료")
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -2261,10 +2260,10 @@ class LiveViewDialog(QDialog):
             )
             self.vision_controller.status_changed.connect(self._on_vision_status_changed)
 
-            # 설정에서 모델 경로 로드
+            # 설정에서 모델 경로 로드 (페이지 로드 후 지연 실행)
             model_path = app_settings.get('vision.model_path', '')
             if model_path:
-                self.vision_controller.load_model(model_path)
+                QTimer.singleShot(2000, lambda p=model_path: self.vision_controller.load_model(p))
 
             # 설정 적용
             self.vision_controller.set_fps(app_settings.get('vision.capture_fps', 2))
@@ -2336,16 +2335,16 @@ class LiveViewDialog(QDialog):
     def _load_kvm_url(self):
         """KVM URL 로드 시작
 
-        릴레이 접속(ZeroTier IP)인 경우 WebRTC ICE candidate 패치 스크립트를
+        릴레이 접속(Tailscale IP)인 경우 WebRTC ICE candidate 패치 스크립트를
         UserScript로 주입하여 미디어 스트림이 릴레이를 통과하도록 함.
         """
         web_port = self.device.info.web_port if hasattr(self.device.info, 'web_port') else 80
         url = f"http://{self.device.ip}:{web_port}"
         print(f"[LiveView] URL 로드: {url}")
 
-        # 릴레이 접속 감지 (ZeroTier IP로 접속하는 경우)
+        # 릴레이 접속 감지 (Tailscale IP로 접속하는 경우)
         relay_ip = self.device.ip
-        is_relay = relay_ip.startswith('10.147.')
+        is_relay = relay_ip.startswith('100.')
 
         if is_relay:
             self._inject_ice_patch(relay_ip, web_port)
@@ -2477,9 +2476,8 @@ class LiveViewDialog(QDialog):
 
         # 기존 패치 제거 후 재등록
         scripts = self.web_view.page().scripts()
-        existing = scripts.findScript("wellcomland-ice-patch")
-        if not existing.isNull():
-            scripts.remove(existing)
+        for old in scripts.find("wellcomland-ice-patch"):
+            scripts.remove(old)
         scripts.insert(script)
 
     def _on_page_loaded(self, ok):
@@ -4359,7 +4357,7 @@ class MainWindow(QMainWindow):
 
     def _apply_relay_substitution(self, api_client):
         """원격 KVM 레지스트리에서 릴레이 정보를 가져와
-        직접 접근 불가한 KVM의 IP/포트를 ZeroTier 릴레이 주소로 치환.
+        직접 접근 불가한 KVM의 IP/포트를 Tailscale 릴레이 주소로 치환.
 
         관제 PC (KVM과 같은 서브넷)에서는 치환하지 않음.
         메인 PC (다른 서브넷)에서만 릴레이 IP:port로 변경.
@@ -4385,17 +4383,17 @@ class MainWindow(QMainWindow):
                     local_subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
 
             # KVM 로컬 IP → 릴레이 정보 매핑 생성
-            relay_map = {}  # kvm_local_ip → {relay_zt_ip, relay_port, udp_relay_port}
+            relay_map = {}  # kvm_local_ip → {relay_ip, relay_port, udp_relay_port}
             for rkvm in remote_kvms:
                 if not rkvm.get('is_online'):
                     continue
                 local_ip = rkvm.get('kvm_local_ip', '')
-                relay_ip = rkvm.get('relay_zt_ip', '')
+                relay_ip = rkvm.get('relay_ip', '') or rkvm.get('relay_zt_ip', '')
                 relay_port = rkvm.get('relay_port')
                 udp_port = rkvm.get('udp_relay_port')
                 if local_ip and relay_ip and relay_port:
                     relay_map[local_ip] = {
-                        'relay_zt_ip': relay_ip,
+                        'relay_ip': relay_ip,
                         'relay_port': relay_port,
                         'udp_relay_port': udp_port,
                         'kvm_name': rkvm.get('kvm_name', ''),
@@ -4414,8 +4412,8 @@ class MainWindow(QMainWindow):
 
                 device_subnet = f"{parts[0]}.{parts[1]}.{parts[2]}"
 
-                # 이미 ZeroTier IP면 스킵
-                if orig_ip.startswith('10.147.'):
+                # 이미 Tailscale IP면 스킵
+                if orig_ip.startswith('100.'):
                     continue
 
                 # 내 로컬 서브넷이면 직접 접근 가능 → 스킵
@@ -4425,13 +4423,13 @@ class MainWindow(QMainWindow):
                 # 릴레이 정보가 있으면 치환
                 if orig_ip in relay_map:
                     info = relay_map[orig_ip]
-                    device.info.ip = info['relay_zt_ip']
+                    device.info.ip = info['relay_ip']
                     device.info.web_port = info['relay_port']
                     # UDP 릴레이 포트 정보 저장 (ICE 패치에서 사용)
                     device.info._udp_relay_port = info.get('udp_relay_port')
                     device.info._kvm_local_ip = orig_ip  # 원본 IP 보존
                     substituted += 1
-                    print(f"[RelaySubst] {name}: {orig_ip}:80 → {info['relay_zt_ip']}:{info['relay_port']}"
+                    print(f"[RelaySubst] {name}: {orig_ip}:80 → {info['relay_ip']}:{info['relay_port']}"
                           f" (UDP:{info.get('udp_relay_port')})")
 
             if substituted:
@@ -4928,8 +4926,15 @@ class MainWindow(QMainWindow):
         self._stop_device_preview(self.current_device)
 
         # 다이얼로그 생성 (URL은 __init__에서 로드)
-        dialog = LiveViewDialog(self.current_device, self)
-        dialog.exec()
+        try:
+            dialog = LiveViewDialog(self.current_device, self)
+            dialog.exec()
+        except Exception as e:
+            print(f"[LiveView] 크래시: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "LiveView 오류", f"LiveView 실행 중 오류:\n{e}")
+            return
 
         # 1:1 제어 종료 — 플래그 해제 + 메인 윈도우 활성화
         self._live_control_device = None
