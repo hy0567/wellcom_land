@@ -84,10 +84,12 @@ Name: "desktopicon"; Description: "바탕화면에 바로가기 생성"; GroupDe
 [Run]
 ; ★ Tailscale 필수 설치 (미설치 시만) — MSI 무인 설치
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\tailscale-setup.msi"" /quiet /norestart"; StatusMsg: "Tailscale VPN 설치 중..."; Flags: shellexec waituntilterminated; Check: not IsTailscaleInstalled
-; Tailscale 서비스 시작 대기
-Filename: "cmd.exe"; Parameters: "/c timeout /t 5 /nobreak >nul"; StatusMsg: "Tailscale 서비스 시작 대기..."; Flags: shellexec waituntilterminated runhidden
-; ★ authkey로 회사 tailnet 자동 참여 + accept-routes + advertise-routes (LAN 서브넷 자동 감지)
+; Tailscale 서비스 시작 대기 (10초 — MSI 설치 직후 서비스 초기화 시간)
+Filename: "cmd.exe"; Parameters: "/c timeout /t 10 /nobreak >nul"; StatusMsg: "Tailscale 서비스 시작 대기..."; Flags: shellexec waituntilterminated runhidden
+; ★ authkey로 회사 tailnet 자동 참여 (풀 경로 사용 — PATH 미반영 대응)
 Filename: "cmd.exe"; Parameters: "/c ""{code:GetTailscaleUpCmd}"""; StatusMsg: "Tailscale 네트워크 연결 중..."; Flags: shellexec waituntilterminated runhidden
+; 재시도 (첫 시도 실패 시 — 서비스 시작 지연 대응)
+Filename: "cmd.exe"; Parameters: "/c ""{code:GetTailscaleUpCmd}"""; StatusMsg: "Tailscale 연결 확인 중..."; Flags: shellexec waituntilterminated runhidden
 ; Tailscale 네트워크 인터페이스 메트릭 올리기 (LAN이 기본 라우트 유지)
 ; ★ 인터페이스 이름 자동 감지 — 'Tailscale', 'Tailscale 2' 등 모두 대응
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -like '*Tailscale*' }} | ForEach-Object {{ netsh interface ipv4 set interface $_.Name metric=1000 }}"""; Flags: shellexec waituntilterminated runhidden
@@ -187,16 +189,28 @@ begin
   Log('GetLanSubnets: ' + Result);
 end;
 
-// tailscale up 명령 생성 (서브넷이 있으면 --advertise-routes 포함)
+// Tailscale CLI 풀 경로 반환 (PATH에 없어도 동작)
+function GetTailscaleExePath(): String;
+begin
+  Result := ExpandConstant('{commonpf64}\Tailscale\tailscale.exe');
+  if not FileExists(Result) then
+    Result := ExpandConstant('{commonpf}\Tailscale\tailscale.exe');
+  if not FileExists(Result) then
+    Result := 'tailscale';  // 폴백
+  Log('TailscaleExePath: ' + Result);
+end;
+
+// tailscale up 명령 생성 (풀 경로 + 서브넷이 있으면 --advertise-routes 포함)
 function GetTailscaleUpCmd(Param: String): String;
 var
-  Subnets: String;
+  Subnets, TsExe: String;
 begin
+  TsExe := GetTailscaleExePath();
   Subnets := GetLanSubnets('');
   if Subnets <> '' then
-    Result := 'tailscale up --authkey={#TailscaleAuthKey} --accept-routes --advertise-routes=' + Subnets + ' --reset'
+    Result := '"' + TsExe + '" up --authkey={#TailscaleAuthKey} --accept-routes --advertise-routes=' + Subnets + ' --reset'
   else
-    Result := 'tailscale up --authkey={#TailscaleAuthKey} --accept-routes --reset';
+    Result := '"' + TsExe + '" up --authkey={#TailscaleAuthKey} --accept-routes --reset';
   Log('TailscaleUpCmd: ' + Result);
 end;
 
