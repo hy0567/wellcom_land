@@ -60,8 +60,111 @@ def needs_network_fix() -> bool:
     return True
 
 
+def _get_interface_ip_map() -> dict:
+    """netsh로 인터페이스 이름 → IP 매핑 조회
+
+    Returns:
+        dict: {인터페이스이름: [ip1, ip2, ...]}
+    """
+    mapping = {}
+    try:
+        result = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'show', 'addresses'],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000
+        )
+        if result.returncode != 0:
+            return mapping
+
+        current_iface = None
+        for line in result.stdout.split('\n'):
+            line = line.rstrip()
+            # 인터페이스 이름 감지: "인터페이스 ..." 또는 "Configuration for interface ..."
+            if 'interface' in line.lower() or '\uc778\ud130\ud398\uc774\uc2a4' in line:
+                # 따옴표 안의 이름 추출
+                if '"' in line:
+                    parts = line.split('"')
+                    if len(parts) >= 2:
+                        current_iface = parts[1]
+                elif ':' in line:
+                    current_iface = line.split(':')[-1].strip().strip('"')
+            # IP 주소 행 감지
+            elif current_iface and ('IP' in line or 'ip' in line) and '.' in line:
+                # "   IP 주소:                           192.168.0.100"
+                for part in line.split():
+                    if '.' in part and part[0].isdigit():
+                        if current_iface not in mapping:
+                            mapping[current_iface] = []
+                        mapping[current_iface].append(part)
+                        break
+    except Exception as e:
+        print(f"[NetworkFix] 인터페이스 IP 매핑 실패: {e}")
+
+    return mapping
+
+
+def _find_tailscale_interface_name() -> str:
+    """실제 Tailscale 네트워크 인터페이스 이름 찾기
+
+    Windows에서 Tailscale 인터페이스 이름이 'Tailscale', 'Tailscale 2' 등
+    다양할 수 있으므로 100.x IP를 가진 인터페이스를 직접 찾음.
+
+    Returns:
+        인터페이스 이름 (못 찾으면 'Tailscale' 폴백)
+    """
+    # 방법 1: netsh interface ipv4 show addresses 파싱
+    iface_map = _get_interface_ip_map()
+    for iface_name, ips in iface_map.items():
+        for ip in ips:
+            if ip.startswith('100.'):
+                print(f"[NetworkFix] Tailscale 인터페이스 발견: '{iface_name}' ({ip})")
+                return iface_name
+
+    # 방법 2: 이름에 'tailscale' 포함된 인터페이스 찾기
+    try:
+        result = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'show', 'interfaces'],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000
+        )
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'tailscale' in line.lower():
+                    # 마지막 컬럼이 인터페이스 이름
+                    parts = line.strip().split()
+                    if len(parts) >= 4:
+                        # Idx Met MTU State Name (Name은 공백 포함 가능)
+                        name = ' '.join(parts[4:]) if len(parts) > 4 else parts[-1]
+                        print(f"[NetworkFix] Tailscale 인터페이스 (이름 매칭): '{name}'")
+                        return name
+    except Exception:
+        pass
+
+    return 'Tailscale'
+
+
+def _find_lan_interface_names() -> list:
+    """LAN 인터페이스 이름들 찾기 (192.168.x, 10.x 가진 어댑터)
+
+    Returns:
+        list of 인터페이스 이름
+    """
+    lan_names = []
+    iface_map = _get_interface_ip_map()
+    for iface_name, ips in iface_map.items():
+        for ip in ips:
+            if ip.startswith('192.168.') or ip.startswith('10.'):
+                if iface_name not in lan_names:
+                    lan_names.append(iface_name)
+                    print(f"[NetworkFix] LAN 인터페이스 발견: '{iface_name}' ({ip})")
+                break
+    return lan_names
+
+
 def fix_network_priority_netsh() -> bool:
     """netsh로 네트워크 메트릭 조정 (관리자 권한 필요)
+
+    하드코딩 대신 실제 인터페이스 IP를 파싱하여 정확한 이름을 찾음.
 
     Returns:
         True: 성공, False: 실패
@@ -79,23 +182,32 @@ def fix_network_priority_netsh() -> bool:
 
         success = False
 
-        # 1. Tailscale 메트릭 올리기 (낮은 우선순위)
-        subprocess.run(
-            ['netsh', 'interface', 'ipv4', 'set', 'interface', 'Tailscale', 'metric=1000'],
-            capture_output=True, timeout=5,
+        # 1. Tailscale 인터페이스 찾기 → 메트릭 1000 (낮은 우선순위)
+        ts_name = _find_tailscale_interface_name()
+        r = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'set', 'interface', ts_name, 'metric=1000'],
+            capture_output=True, text=True, timeout=5,
             creationflags=0x08000000
         )
+        if r.returncode == 0:
+            print(f"[NetworkFix] '{ts_name}' metric=1000 설정 완료")
+            success = True
+        else:
+            print(f"[NetworkFix] '{ts_name}' metric 설정 실패: {r.stderr.strip()}")
 
-        # 2. 일반 LAN 어댑터 메트릭 낮추기 (높은 우선순위)
-        for name in ['Ethernet', 'Ethernet 2', 'Ethernet 3', 'Wi-Fi', 'Local Area Connection']:
+        # 2. LAN 인터페이스 찾기 → 메트릭 5 (높은 우선순위)
+        lan_names = _find_lan_interface_names()
+        for name in lan_names:
             r = subprocess.run(
                 ['netsh', 'interface', 'ipv4', 'set', 'interface', name, 'metric=5'],
-                capture_output=True, timeout=5,
+                capture_output=True, text=True, timeout=5,
                 creationflags=0x08000000
             )
             if r.returncode == 0:
-                print(f"[NetworkFix] {name} metric=5 설정 완료")
+                print(f"[NetworkFix] '{name}' metric=5 설정 완료")
                 success = True
+            else:
+                print(f"[NetworkFix] '{name}' metric=5 실패: {r.stderr.strip()}")
 
         return success
 
@@ -374,21 +486,34 @@ def _ensure_tailscale_high_metric():
 
     Tailscale이 기본 라우트를 빼앗지 않도록 메트릭을 1000으로 설정.
     LAN이 이미 기본 라우트여도 매번 실행 — 재부팅/Tailscale 재시작 시 리셋 방지.
+
+    ★ 인터페이스 이름을 하드코딩하지 않고 100.x IP로 자동 감지
     """
     if not is_admin():
         return
 
     try:
+        ts_name = _find_tailscale_interface_name()
+
         # Tailscale 인터페이스 메트릭 올리기 (이미 1000이면 무시됨)
         result = subprocess.run(
-            ['netsh', 'interface', 'ipv4', 'set', 'interface', 'Tailscale', 'metric=1000'],
+            ['netsh', 'interface', 'ipv4', 'set', 'interface', ts_name, 'metric=1000'],
             capture_output=True, text=True, timeout=5,
             creationflags=0x08000000
         )
         if result.returncode == 0:
-            print("[NetworkFix] Tailscale metric=1000 설정 완료 (LAN 우선)")
-    except Exception:
-        pass
+            print(f"[NetworkFix] '{ts_name}' metric=1000 설정 완료 (LAN 우선)")
+
+        # LAN 인터페이스도 함께 metric=5로 설정 (재부팅 후 자동 리셋 방지)
+        lan_names = _find_lan_interface_names()
+        for name in lan_names:
+            subprocess.run(
+                ['netsh', 'interface', 'ipv4', 'set', 'interface', name, 'metric=5'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000
+            )
+    except Exception as e:
+        print(f"[NetworkFix] Tailscale metric 설정 실패: {e}")
 
 
 def auto_fix_network():

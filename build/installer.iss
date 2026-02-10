@@ -89,7 +89,8 @@ Filename: "cmd.exe"; Parameters: "/c timeout /t 5 /nobreak >nul"; StatusMsg: "Ta
 ; ★ authkey로 회사 tailnet 자동 참여 + accept-routes + advertise-routes (LAN 서브넷 자동 감지)
 Filename: "cmd.exe"; Parameters: "/c ""{code:GetTailscaleUpCmd}"""; StatusMsg: "Tailscale 네트워크 연결 중..."; Flags: shellexec waituntilterminated runhidden
 ; Tailscale 네트워크 인터페이스 메트릭 올리기 (LAN이 기본 라우트 유지)
-Filename: "netsh.exe"; Parameters: "interface ipv4 set interface ""Tailscale"" metric=1000"; Flags: shellexec waituntilterminated runhidden
+; ★ 인터페이스 이름 자동 감지 — 'Tailscale', 'Tailscale 2' 등 모두 대응
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -like '*Tailscale*' }} | ForEach-Object {{ netsh interface ipv4 set interface $_.Name metric=1000 }}"""; Flags: shellexec waituntilterminated runhidden
 ; WellcomLAND 실행
 Filename: "{app}\{#MyAppExeName}"; Description: "WellcomLAND 실행"; Flags: nowait postinstall skipifsilent
 
@@ -134,9 +135,8 @@ var
   ResultCode: Integer;
   TmpFile: String;
   Lines: TArrayOfString;
-  I: Integer;
-  Line, Subnet: String;
-  Parts: TArrayOfString;
+  I, DotPos, DotCount: Integer;
+  Line, Subnet, IP: String;
 begin
   Result := '';
   TmpFile := ExpandConstant('{tmp}\lan_detect.txt');
@@ -153,15 +153,24 @@ begin
       // "IPv4 주소 . . . . . . . . . : 192.168.0.198" 에서 IP 추출
       if Pos(':', Line) > 0 then
       begin
-        Line := Trim(Copy(Line, Pos(':', Line) + 1, Length(Line)));
+        IP := Trim(Copy(Line, Pos(':', Line) + 1, Length(Line)));
         // Tailscale(100.), APIPA(169.254.), loopback(127.) 제외
-        if (Pos('100.', Line) <> 1) and (Pos('169.254.', Line) <> 1) and (Pos('127.', Line) <> 1) and (Pos('.', Line) > 0) then
+        if (Pos('100.', IP) <> 1) and (Pos('169.254.', IP) <> 1) and (Pos('127.', IP) <> 1) and (Pos('.', IP) > 0) then
         begin
-          // IP를 서브넷으로 변환 (마지막 옥텟 → 0/24)
-          Parts := SplitString(Line, '.');
-          if GetArrayLength(Parts) = 4 then
+          // IP에서 마지막 '.' 위치 찾기 → 서브넷으로 변환
+          DotCount := 0;
+          DotPos := 0;
+          for DotCount := Length(IP) downto 1 do
           begin
-            Subnet := Parts[0] + '.' + Parts[1] + '.' + Parts[2] + '.0/24';
+            if IP[DotCount] = '.' then
+            begin
+              DotPos := DotCount;
+              Break;
+            end;
+          end;
+          if DotPos > 0 then
+          begin
+            Subnet := Copy(IP, 1, DotPos) + '0/24';
             if Result = '' then
               Result := Subnet
             else if Pos(Subnet, Result) = 0 then

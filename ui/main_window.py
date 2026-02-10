@@ -42,7 +42,11 @@ except ImportError:
 
 
 class InitialStatusCheckThread(QThread):
-    """최초 상태 체크 스레드"""
+    """최초 상태 체크 스레드
+
+    릴레이 경유(100.x) 장치는 타임아웃을 3초로 늘림.
+    서버 API heartbeat 정보도 병행 참조.
+    """
     check_completed = pyqtSignal(dict)
 
     def __init__(self, manager: KVMManager):
@@ -52,28 +56,69 @@ class InitialStatusCheckThread(QThread):
     def run(self):
         import socket
         results = {}
+
+        # 서버 heartbeat 상태 조회
+        server_status = {}
+        try:
+            from api_client import api_client
+            if api_client.is_logged_in:
+                remote_kvms = api_client.get_remote_kvm_list()
+                if remote_kvms:
+                    for rkvm in remote_kvms:
+                        name = rkvm.get('kvm_name', '')
+                        if name:
+                            server_status[name] = bool(rkvm.get('is_online'))
+        except Exception:
+            pass
+
         for device in self.manager.get_all_devices():
             try:
+                ip = device.ip
+                port = device.info.web_port
+
+                # 릴레이 경유(100.x)는 타임아웃 3초, 로컬은 1초
+                is_relay = ip.startswith('100.')
+                timeout = 3.0 if is_relay else 1.0
+
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                result = sock.connect_ex((device.ip, device.info.web_port))
+                sock.settimeout(timeout)
+                result = sock.connect_ex((ip, port))
                 sock.close()
-                results[device.name] = result == 0
-                print(f"  - {device.name}: {'ONLINE' if result == 0 else 'OFFLINE'}")
+
+                if result == 0:
+                    results[device.name] = True
+                    print(f"  - {device.name}: ONLINE ({ip}:{port})")
+                else:
+                    # TCP 실패 시 서버 heartbeat 참조
+                    srv_online = server_status.get(device.name, False)
+                    if srv_online and is_relay:
+                        results[device.name] = True
+                        print(f"  - {device.name}: ONLINE (서버 heartbeat, TCP 실패 {ip}:{port})")
+                    else:
+                        results[device.name] = False
+                        print(f"  - {device.name}: OFFLINE ({ip}:{port})")
             except Exception as e:
-                results[device.name] = False
-                print(f"  - {device.name}: OFFLINE (오류: {e})")
+                srv_online = server_status.get(device.name, False)
+                results[device.name] = bool(srv_online)
+                print(f"  - {device.name}: {'ONLINE(서버)' if srv_online else 'OFFLINE'} (오류: {e})")
         self.check_completed.emit(results)
 
 
 class StatusUpdateThread(QThread):
-    """백그라운드 상태 업데이트 스레드"""
+    """백그라운드 상태 업데이트 스레드
+
+    1. 로컬 KVM (192.168.x): TCP 포트 체크 (1초 타임아웃)
+    2. 릴레이 KVM (100.x): TCP 포트 체크 (3초 타임아웃) + 서버 API 병행
+    3. 서버 heartbeat 정보로 보완 (TCP 실패 시 서버 is_online 참조)
+    """
     status_updated = pyqtSignal(dict)
 
     def __init__(self, manager: KVMManager):
         super().__init__()
         self.manager = manager
         self.running = True
+        self._server_status_cache = {}  # kvm_name → is_online (서버 API 캐시)
+        self._server_check_counter = 0  # 서버 API 호출 주기 카운터
 
     def run(self):
         # 첫 실행 시 충분히 대기 (UI/WebEngine 초기화 완료 후)
@@ -81,27 +126,71 @@ class StatusUpdateThread(QThread):
 
         while self.running:
             try:
-                # SSH 연결 시도 없이 핑만 체크
+                # 매 6회(30초)마다 서버 API에서 온라인 상태 갱신
+                self._server_check_counter += 1
+                if self._server_check_counter >= 6:
+                    self._server_check_counter = 0
+                    self._refresh_server_status()
+
+                # TCP 포트 체크 (로컬/릴레이 구분)
                 status = self._check_status_safe()
                 self.status_updated.emit(status)
             except Exception as e:
                 print(f"상태 업데이트 오류: {e}")
             self.msleep(5000)
 
+    def _refresh_server_status(self):
+        """서버 API에서 KVM 온라인 상태 가져오기 (heartbeat 기반)"""
+        try:
+            from api_client import api_client
+            if not api_client.is_logged_in:
+                return
+            remote_kvms = api_client.get_remote_kvm_list()
+            if remote_kvms:
+                for rkvm in remote_kvms:
+                    name = rkvm.get('kvm_name', '')
+                    if name:
+                        self._server_status_cache[name] = bool(rkvm.get('is_online'))
+        except Exception:
+            pass
+
     def _check_status_safe(self) -> dict:
-        """안전한 상태 체크 (SSH 연결 시도 없이)"""
+        """안전한 상태 체크 (SSH 연결 시도 없이)
+
+        릴레이 경유(100.x) 장치는 타임아웃을 3초로 늘려 Tailscale 터널 지연 대응.
+        TCP 실패 시 서버 heartbeat 캐시로 보완.
+        """
         import socket
         results = {}
         for device in self.manager.get_all_devices():
             try:
-                # TCP 포트 체크만 (SSH 연결 없이)
+                ip = device.ip
+                port = device.info.web_port
+
+                # 릴레이 경유(100.x)는 타임아웃 3초, 로컬은 1초
+                is_relay = ip.startswith('100.')
+                timeout = 3.0 if is_relay else 1.0
+
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
-                result = sock.connect_ex((device.ip, device.info.web_port))
+                sock.settimeout(timeout)
+                result = sock.connect_ex((ip, port))
                 sock.close()
-                results[device.name] = {'online': result == 0}
+
+                if result == 0:
+                    results[device.name] = {'online': True}
+                else:
+                    # TCP 실패 시 서버 heartbeat 캐시 참조
+                    server_online = self._server_status_cache.get(device.name, None)
+                    if server_online is True and is_relay:
+                        # 서버에서는 온라인이지만 TCP 직접 연결 실패
+                        # → Tailscale 터널 문제일 수 있음, 서버 상태 신뢰
+                        results[device.name] = {'online': True}
+                    else:
+                        results[device.name] = {'online': False}
             except Exception:
-                results[device.name] = {'online': False}
+                # 예외 시에도 서버 캐시 참조
+                server_online = self._server_status_cache.get(device.name, False)
+                results[device.name] = {'online': bool(server_online)}
         return results
 
     def stop(self):
