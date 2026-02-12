@@ -252,9 +252,7 @@ def main():
     print(f"{'='*60}")
 
     # GPU 크래시 플래그: 소프트웨어 모드로 시작한 경우
-    # loading 플래그(자동감지)는 영구 유지 → 사용자가 환경설정에서 직접 해제해야 함
-    # (바로 삭제하면 다음 실행에서 또 GPU 모드 → 크래시 → 무한반복)
-    if _use_software_gl:
+    if _had_gpu_crash or _force_software:
         print("[GPU] 소프트웨어 렌더링 모드 유지 (환경설정에서 해제 가능)")
 
     # High DPI 스케일링 활성화
@@ -272,7 +270,7 @@ def main():
         print(f"[App] 아이콘 적용: {ICON_PATH}")
 
     # GPU 모드 설정
-    if _use_software_gl:
+    if _had_gpu_crash or _force_software:
         app.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
         print("[GPU] 소프트웨어 OpenGL 활성화")
     # else: Qt 기본값 사용 (강제 GPU 비활성화하지 않음)
