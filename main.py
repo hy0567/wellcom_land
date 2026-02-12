@@ -107,15 +107,32 @@ except Exception:
 _chromium_flags = ['--autoplay-policy=no-user-gesture-required']
 
 if _is_frozen:
-    # EXE 환경: GPU 서브프로세스 DLL 경로 문제 방지
-    # --in-process-gpu: GPU를 메인 프로세스에서 실행 (필수)
+    # EXE 환경: --in-process-gpu가 GPU 서브프로세스 DLL 문제를 완전히 해결
+    # 따라서 SwiftShader 폴백이 불필요 (오히려 다수 WebRTC 스트림에서 Abort 유발)
     _chromium_flags.append('--in-process-gpu')
-    # GPU 안정성 플래그 (비디오 렌더링에 영향 없음)
     _chromium_flags.append('--disable-gpu-shader-disk-cache')
     _chromium_flags.append('--disable-gpu-program-cache')
-    print(f"[GPU] frozen 환경 — --in-process-gpu 적용 (compositing 유지)")
+    print(f"[GPU] frozen 환경 — --in-process-gpu (하드웨어 GPU 사용)")
 
-if _had_gpu_crash:
+    # frozen 환경에서는 gpu_crash 플래그 무조건 삭제 (SwiftShader 폴백 비활성화)
+    # --in-process-gpu가 근본 원인을 해결하므로 소프트웨어 렌더링 불필요
+    if _had_gpu_crash:
+        _flag_reason = "플래그 존재"
+        try:
+            with open(_gpu_crash_flag, 'r') as _f:
+                _flag_reason = _f.read().strip()
+        except Exception:
+            pass
+        print(f"[GPU] 이전 크래시 플래그 감지 (무시): {_flag_reason}")
+        try:
+            os.remove(_gpu_crash_flag)
+            print(f"[GPU] 크래시 플래그 삭제 (frozen 환경은 --in-process-gpu로 보호)")
+        except Exception:
+            pass
+        _had_gpu_crash = False  # SwiftShader 적용 방지
+
+elif _had_gpu_crash:
+    # 개발환경 (non-frozen): 기존 SwiftShader 폴백 유지
     _flag_reason = "플래그 존재"
     try:
         with open(_gpu_crash_flag, 'r') as _f:
@@ -123,10 +140,8 @@ if _had_gpu_crash:
     except Exception:
         pass
     print(f"[GPU] 이전 크래시 감지 — 이유: {_flag_reason}")
-    # SwiftShader 소프트웨어 렌더링 추가
-    if '--use-gl=angle' not in ' '.join(_chromium_flags):
-        _chromium_flags.append('--use-gl=angle')
-        _chromium_flags.append('--use-angle=swiftshader')
+    _chromium_flags.append('--use-gl=angle')
+    _chromium_flags.append('--use-angle=swiftshader')
     # 크래시 플래그 삭제 (1회 적용)
     try:
         with open(_gpu_crash_flag, 'r') as _f:
