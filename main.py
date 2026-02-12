@@ -108,12 +108,14 @@ except Exception:
 _chromium_flags = ['--autoplay-policy=no-user-gesture-required']
 
 if _is_frozen:
-    # EXE(frozen) 환경: GPU를 별도 프로세스에서 실행 (기본값 유지)
-    # GPU 서브프로세스가 크래시해도 메인 프로세스는 생존하고
-    # renderProcessTerminated 시그널로 자동 재연결 가능
+    # EXE(frozen) 환경: PyInstaller 패키징 + Chromium 호환성
+    # --no-sandbox: PyInstaller frozen 환경에서 Chromium 샌드박스가 DLL 접근 차단 → access violation
+    # --disable-gpu-sandbox: GPU 프로세스 샌드박스 비활성화 (frozen 환경 DLL 경로 문제)
+    _chromium_flags.append('--no-sandbox')
+    _chromium_flags.append('--disable-gpu-sandbox')
     _chromium_flags.append('--disable-gpu-shader-disk-cache')
     _chromium_flags.append('--disable-gpu-program-cache')
-    print(f"[GPU] frozen 환경 — GPU 서브프로세스 모드 (크래시 격리)")
+    print(f"[GPU] frozen 환경 — 샌드박스 비활성화 (PyInstaller 호환)")
 
     # frozen 환경에서는 gpu_crash 플래그 무조건 삭제
     # GPU 크래시 시 renderProcessTerminated로 자동 복구하므로 SwiftShader 불필요
