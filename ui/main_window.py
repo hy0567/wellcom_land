@@ -1013,7 +1013,12 @@ class KVMThumbnailWidget(QFrame):
             self.name_label.setText(name)
 
     def _on_render_terminated(self, terminationStatus, exitCode):
-        """WebView 렌더 프로세스 종료 감지"""
+        """WebView 렌더 프로세스 종료 감지
+
+        GPU 서브프로세스가 크래시해도 메인 프로세스는 생존.
+        frozen 환경: 크래시 플래그 생성 안 함 (자동 재연결로 처리)
+        개발환경: 3회 크래시 시 소프트웨어 렌더링 전환 플래그 생성
+        """
         print(f"[Thumbnail] 렌더 프로세스 종료: {self.device.name} (status={terminationStatus}, code={exitCode})")
         self._stream_status = "dead"
         self._update_name_label()
@@ -1024,6 +1029,13 @@ class KVMThumbnailWidget(QFrame):
                 KVMThumbnailWidget._gpu_crash_count = 0
             KVMThumbnailWidget._gpu_crash_count += 1
             print(f"[Thumbnail] GPU 크래시 횟수: {KVMThumbnailWidget._gpu_crash_count}")
+
+            # frozen 환경: 크래시 플래그 생성하지 않음
+            # GPU 서브프로세스 크래시는 메인 프로세스에 영향 없으므로
+            # SwiftShader 폴백 불필요 (오히려 SwiftShader가 다수 스트림에서 Abort 유발)
+            if getattr(sys, 'frozen', False):
+                print(f"[Thumbnail] frozen 환경 — 크래시 플래그 생성 생략 (GPU 서브프로세스 격리)")
+                return
 
             if KVMThumbnailWidget._gpu_crash_count >= 3:
                 try:
@@ -2740,7 +2752,14 @@ class LiveViewDialog(QDialog):
         create=True: URL 로드 직전에 생성 (프로세스 즉사 대비)
         create=False: 페이지 로드 성공 후 제거 (정상 동작 확인)
         수동 설정(manual=True) 플래그는 건드리지 않음.
+
+        frozen(EXE) 환경: GPU 서브프로세스 모드이므로 플래그 불필요
+        (GPU 크래시 시 renderProcessTerminated로 자동 복구)
         """
+        # frozen 환경: GPU 크래시가 메인 프로세스를 죽이지 않으므로 플래그 불필요
+        if getattr(sys, 'frozen', False):
+            return
+
         try:
             from config import DATA_DIR
             flag_path = os.path.join(DATA_DIR, ".gpu_crash")
@@ -2776,9 +2795,15 @@ class LiveViewDialog(QDialog):
 
         페이지 로드 성공 후 WebRTC 스트리밍 단계로 전환.
         정상 종료(closeEvent)에서만 제거됨.
-        스트리밍 중 access violation으로 프로세스가 죽으면
-        이 플래그가 남아 다음 실행에서 소프트웨어 렌더링 전환.
+
+        frozen(EXE) 환경: GPU 서브프로세스 모드이므로 플래그 불필요
+        (GPU 크래시 시 renderProcessTerminated로 자동 재연결)
         """
+        # frozen 환경: GPU 크래시가 메인 프로세스를 죽이지 않으므로 플래그 불필요
+        if getattr(sys, 'frozen', False):
+            print(f"[LiveView] GPU 스트리밍 시작 (frozen 환경 — 크래시 격리)")
+            return
+
         try:
             from config import DATA_DIR
             flag_path = os.path.join(DATA_DIR, ".gpu_crash")

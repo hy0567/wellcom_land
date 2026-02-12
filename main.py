@@ -81,9 +81,10 @@ print(f"[Log] 로그 파일: {_log_path}")
 print(f"[Log] Fault 로그: {_fault_path}")
 
 # ── GPU / Chromium 설정 ──
-# EXE(frozen) 환경에서 Chromium GPU 서브프로세스가 DLL 경로 문제로 크래시 발생
-# --in-process-gpu: GPU를 별도 프로세스 대신 메인 프로세스에서 실행 (frozen 호환)
-# 주의: --disable-gpu-compositing 사용 금지! WebRTC 비디오 합성을 차단하여 검은화면 발생
+# 핵심 원칙:
+# - --in-process-gpu 사용 금지! GPU 크래시 시 전체 프로세스가 사망 (access violation)
+# - --disable-gpu-compositing 사용 금지! WebRTC 비디오 합성이 차단되어 검은화면
+# - GPU 서브프로세스 모드 유지: GPU 크래시 → renderProcessTerminated 시그널 → 자동 재연결
 _is_frozen = getattr(sys, 'frozen', False)
 
 # GPU 크래시 플래그 확인
@@ -107,15 +108,15 @@ except Exception:
 _chromium_flags = ['--autoplay-policy=no-user-gesture-required']
 
 if _is_frozen:
-    # EXE 환경: --in-process-gpu가 GPU 서브프로세스 DLL 문제를 완전히 해결
-    # 따라서 SwiftShader 폴백이 불필요 (오히려 다수 WebRTC 스트림에서 Abort 유발)
-    _chromium_flags.append('--in-process-gpu')
+    # EXE(frozen) 환경: GPU를 별도 프로세스에서 실행 (기본값 유지)
+    # GPU 서브프로세스가 크래시해도 메인 프로세스는 생존하고
+    # renderProcessTerminated 시그널로 자동 재연결 가능
     _chromium_flags.append('--disable-gpu-shader-disk-cache')
     _chromium_flags.append('--disable-gpu-program-cache')
-    print(f"[GPU] frozen 환경 — --in-process-gpu (하드웨어 GPU 사용)")
+    print(f"[GPU] frozen 환경 — GPU 서브프로세스 모드 (크래시 격리)")
 
-    # frozen 환경에서는 gpu_crash 플래그 무조건 삭제 (SwiftShader 폴백 비활성화)
-    # --in-process-gpu가 근본 원인을 해결하므로 소프트웨어 렌더링 불필요
+    # frozen 환경에서는 gpu_crash 플래그 무조건 삭제
+    # GPU 크래시 시 renderProcessTerminated로 자동 복구하므로 SwiftShader 불필요
     if _had_gpu_crash:
         _flag_reason = "플래그 존재"
         try:
@@ -126,7 +127,7 @@ if _is_frozen:
         print(f"[GPU] 이전 크래시 플래그 감지 (무시): {_flag_reason}")
         try:
             os.remove(_gpu_crash_flag)
-            print(f"[GPU] 크래시 플래그 삭제 (frozen 환경은 --in-process-gpu로 보호)")
+            print(f"[GPU] 크래시 플래그 삭제 (GPU 서브프로세스 크래시 격리)")
         except Exception:
             pass
         _had_gpu_crash = False  # SwiftShader 적용 방지
