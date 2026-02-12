@@ -83,7 +83,7 @@ print(f"[Log] Fault 로그: {_fault_path}")
 # ── GPU / Chromium 설정 ──
 # EXE(frozen) 환경에서 Chromium GPU 서브프로세스가 DLL 경로 문제로 크래시 발생
 # --in-process-gpu: GPU를 별도 프로세스 대신 메인 프로세스에서 실행 (frozen 호환)
-# --disable-gpu-compositing: GPU 합성 비활성화 (안정성 향상, 비디오 디코딩은 유지)
+# 주의: --disable-gpu-compositing 사용 금지! WebRTC 비디오 합성을 차단하여 검은화면 발생
 _is_frozen = getattr(sys, 'frozen', False)
 
 # GPU 크래시 플래그 확인
@@ -107,10 +107,13 @@ except Exception:
 _chromium_flags = ['--autoplay-policy=no-user-gesture-required']
 
 if _is_frozen:
-    # EXE 환경: GPU 서브프로세스 문제 방지
+    # EXE 환경: GPU 서브프로세스 DLL 경로 문제 방지
+    # --in-process-gpu: GPU를 메인 프로세스에서 실행 (필수)
     _chromium_flags.append('--in-process-gpu')
-    _chromium_flags.append('--disable-gpu-compositing')
-    print(f"[GPU] frozen 환경 — --in-process-gpu, --disable-gpu-compositing 적용")
+    # GPU 안정성 플래그 (비디오 렌더링에 영향 없음)
+    _chromium_flags.append('--disable-gpu-shader-disk-cache')
+    _chromium_flags.append('--disable-gpu-program-cache')
+    print(f"[GPU] frozen 환경 — --in-process-gpu 적용 (compositing 유지)")
 
 if _had_gpu_crash:
     _flag_reason = "플래그 존재"
