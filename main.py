@@ -109,13 +109,32 @@ _chromium_flags = ['--autoplay-policy=no-user-gesture-required']
 
 if _is_frozen:
     # EXE(frozen) 환경: PyInstaller 패키징 + Chromium 호환성
-    # --no-sandbox: PyInstaller frozen 환경에서 Chromium 샌드박스가 DLL 접근 차단 → access violation
-    # --disable-gpu-sandbox: GPU 프로세스 샌드박스 비활성화 (frozen 환경 DLL 경로 문제)
     _chromium_flags.append('--no-sandbox')
     _chromium_flags.append('--disable-gpu-sandbox')
     _chromium_flags.append('--disable-gpu-shader-disk-cache')
     _chromium_flags.append('--disable-gpu-program-cache')
-    print(f"[GPU] frozen 환경 — 샌드박스 비활성화 (PyInstaller 호환)")
+
+    # v1.10.37: 원격 데스크톱 세션 감지 → GPU 비활성화
+    # 원격(Chrome Remote Desktop, RDP 등)에서는 가상 GPU 드라이버 사용
+    # → Chromium GPU 비디오 디코딩 시 access violation 발생
+    # GetSystemMetrics(SM_REMOTESESSION) = 0x1000 → 원격 세션
+    _is_remote_session = False
+    try:
+        import ctypes
+        SM_REMOTESESSION = 0x1000
+        _is_remote_session = bool(ctypes.windll.user32.GetSystemMetrics(SM_REMOTESESSION))
+    except Exception:
+        pass
+
+    if _is_remote_session:
+        # 원격 세션: GPU 완전 비활성화 (소프트웨어 렌더링)
+        # --disable-gpu: Chromium GPU 프로세스 비활성화
+        # --disable-accelerated-video-decode: 비디오 HW 디코딩 비활성화
+        # AA_UseSoftwareOpenGL 대신 Chromium 플래그로 처리 (SwiftShader 미사용)
+        _chromium_flags.append('--disable-gpu')
+        print(f"[GPU] frozen + 원격 세션 감지 — GPU 완전 비활성화 (소프트웨어 렌더링)")
+    else:
+        print(f"[GPU] frozen + 로컬 세션 — GPU 활성화 (하드웨어 가속)")
 
     # frozen 환경에서는 gpu_crash 플래그 무조건 삭제
     # GPU 크래시 시 renderProcessTerminated로 자동 복구하므로 SwiftShader 불필요
