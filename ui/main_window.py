@@ -42,10 +42,11 @@ except ImportError:
 
 
 class InitialStatusCheckThread(QThread):
-    """최초 상태 체크 스레드
+    """최초 상태 체크 스레드 (병렬 TCP 체크)
 
     릴레이 경유(100.x) 장치는 타임아웃을 3초로 늘림.
     서버 API heartbeat 정보도 병행 참조.
+    50개+ 장치: ThreadPoolExecutor로 병렬 처리.
     """
     check_completed = pyqtSignal(dict)
 
@@ -53,8 +54,32 @@ class InitialStatusCheckThread(QThread):
         super().__init__()
         self.manager = manager
 
-    def run(self):
+    def _check_single(self, device, server_status: dict) -> tuple:
+        """단일 장치 TCP 체크 (병렬 워커용)"""
         import socket
+        try:
+            ip = device.ip
+            port = device.info.web_port
+            is_relay = ip.startswith('100.')
+            timeout = 3.0 if is_relay else 1.0
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+
+            if result == 0:
+                return device.name, True
+            else:
+                srv_online = server_status.get(device.name, False)
+                if srv_online and is_relay:
+                    return device.name, True
+                return device.name, False
+        except Exception:
+            srv_online = server_status.get(device.name, False)
+            return device.name, bool(srv_online)
+
+    def run(self):
         results = {}
 
         # 서버 heartbeat 상태 조회
@@ -71,45 +96,42 @@ class InitialStatusCheckThread(QThread):
         except Exception:
             pass
 
-        for device in self.manager.get_all_devices():
-            try:
-                ip = device.ip
-                port = device.info.web_port
+        devices = self.manager.get_all_devices()
 
-                # 릴레이 경유(100.x)는 타임아웃 3초, 로컬은 1초
-                is_relay = ip.startswith('100.')
-                timeout = 3.0 if is_relay else 1.0
-
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                result = sock.connect_ex((ip, port))
-                sock.close()
-
-                if result == 0:
-                    results[device.name] = True
-                    print(f"  - {device.name}: ONLINE ({ip}:{port})")
-                else:
-                    # TCP 실패 시 서버 heartbeat 참조
-                    srv_online = server_status.get(device.name, False)
-                    if srv_online and is_relay:
-                        results[device.name] = True
-                        print(f"  - {device.name}: ONLINE (서버 heartbeat, TCP 실패 {ip}:{port})")
-                    else:
+        if len(devices) <= 20:
+            # 소규모: 순차 처리
+            for device in devices:
+                name, online = self._check_single(device, server_status)
+                results[name] = online
+                print(f"  - {name}: {'ONLINE' if online else 'OFFLINE'}")
+        else:
+            # 대규모: 병렬 처리
+            workers = min(20, len(devices))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(self._check_single, d, server_status): d
+                    for d in devices
+                }
+                for future in futures:
+                    try:
+                        name, online = future.result(timeout=5)
+                        results[name] = online
+                        print(f"  - {name}: {'ONLINE' if online else 'OFFLINE'}")
+                    except Exception as e:
+                        device = futures[future]
                         results[device.name] = False
-                        print(f"  - {device.name}: OFFLINE ({ip}:{port})")
-            except Exception as e:
-                srv_online = server_status.get(device.name, False)
-                results[device.name] = bool(srv_online)
-                print(f"  - {device.name}: {'ONLINE(서버)' if srv_online else 'OFFLINE'} (오류: {e})")
+                        print(f"  - {device.name}: OFFLINE (오류: {e})")
+
         self.check_completed.emit(results)
 
 
 class StatusUpdateThread(QThread):
-    """백그라운드 상태 업데이트 스레드
+    """백그라운드 상태 업데이트 스레드 (병렬 TCP 체크)
 
     1. 로컬 KVM (192.168.x): TCP 포트 체크 (1초 타임아웃)
     2. 릴레이 KVM (100.x): TCP 포트 체크 (3초 타임아웃) + 서버 API 병행
     3. 서버 heartbeat 정보로 보완 (TCP 실패 시 서버 is_online 참조)
+    4. 50개+ 장치: ThreadPoolExecutor로 병렬 처리 (순차→병렬, 최대 20 워커)
     """
     status_updated = pyqtSignal(dict)
 
@@ -132,12 +154,16 @@ class StatusUpdateThread(QThread):
                     self._server_check_counter = 0
                     self._refresh_server_status()
 
-                # TCP 포트 체크 (로컬/릴레이 구분)
-                status = self._check_status_safe()
+                # TCP 포트 체크 (병렬)
+                status = self._check_status_parallel()
                 self.status_updated.emit(status)
             except Exception as e:
                 print(f"상태 업데이트 오류: {e}")
-            self.msleep(5000)
+
+            # 장치 수에 따라 모니터링 간격 조정 (20대 이하: 5초, 50대 이상: 10초)
+            device_count = len(self.manager.get_all_devices())
+            interval = 5000 if device_count <= 20 else (8000 if device_count <= 50 else 10000)
+            self.msleep(interval)
 
     def _refresh_server_status(self):
         """서버 API에서 KVM 온라인 상태 가져오기 (heartbeat 기반)"""
@@ -154,43 +180,64 @@ class StatusUpdateThread(QThread):
         except Exception:
             pass
 
-    def _check_status_safe(self) -> dict:
-        """안전한 상태 체크 (SSH 연결 시도 없이)
-
-        릴레이 경유(100.x) 장치는 타임아웃을 3초로 늘려 Tailscale 터널 지연 대응.
-        TCP 실패 시 서버 heartbeat 캐시로 보완.
-        """
+    def _check_single_device(self, device) -> tuple:
+        """단일 장치 TCP 체크 (병렬 실행용)"""
         import socket
-        results = {}
-        for device in self.manager.get_all_devices():
-            try:
-                ip = device.ip
-                port = device.info.web_port
+        try:
+            ip = device.ip
+            port = device.info.web_port
+            is_relay = ip.startswith('100.')
+            timeout = 3.0 if is_relay else 1.0
 
-                # 릴레이 경유(100.x)는 타임아웃 3초, 로컬은 1초
-                is_relay = ip.startswith('100.')
-                timeout = 3.0 if is_relay else 1.0
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
 
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                result = sock.connect_ex((ip, port))
-                sock.close()
-
-                if result == 0:
-                    results[device.name] = {'online': True}
+            if result == 0:
+                return device.name, {'online': True}
+            else:
+                server_online = self._server_status_cache.get(device.name, None)
+                if server_online is True and is_relay:
+                    return device.name, {'online': True}
                 else:
-                    # TCP 실패 시 서버 heartbeat 캐시 참조
-                    server_online = self._server_status_cache.get(device.name, None)
-                    if server_online is True and is_relay:
-                        # 서버에서는 온라인이지만 TCP 직접 연결 실패
-                        # → Tailscale 터널 문제일 수 있음, 서버 상태 신뢰
-                        results[device.name] = {'online': True}
-                    else:
+                    return device.name, {'online': False}
+        except Exception:
+            server_online = self._server_status_cache.get(device.name, False)
+            return device.name, {'online': bool(server_online)}
+
+    def _check_status_parallel(self) -> dict:
+        """병렬 TCP 상태 체크 (50개+ 장치 대응)
+
+        ThreadPoolExecutor로 모든 장치를 병렬 TCP 체크.
+        20대 이하: 순차 (오버헤드 최소화)
+        20대 초과: 병렬 (최대 20 워커)
+        """
+        devices = self.manager.get_all_devices()
+        results = {}
+
+        if len(devices) <= 20:
+            # 소규모: 순차 처리 (스레드풀 오버헤드 회피)
+            for device in devices:
+                if not self.running:
+                    break
+                name, status = self._check_single_device(device)
+                results[name] = status
+        else:
+            # 대규모: 병렬 처리
+            workers = min(20, len(devices))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(self._check_single_device, d): d for d in devices}
+                for future in futures:
+                    if not self.running:
+                        break
+                    try:
+                        name, status = future.result(timeout=5)
+                        results[name] = status
+                    except Exception:
+                        device = futures[future]
                         results[device.name] = {'online': False}
-            except Exception:
-                # 예외 시에도 서버 캐시 참조
-                server_online = self._server_status_cache.get(device.name, False)
-                results[device.name] = {'online': bool(server_online)}
+
         return results
 
     def stop(self):
@@ -469,9 +516,55 @@ class KVMThumbnailWidget(QFrame):
             return true;
         }
 
+        // 4-1. 썸네일 저FPS 모드: pause/play 사이클 (CPU 대폭 절약)
+        // WebRTC 수신 트랙은 applyConstraints가 무시되므로
+        // video를 주기적으로 pause→play 반복하여 실질 FPS를 ~1fps로 제한
+        var _fpsLimitId = null;
+        function startLowFpsMode() {
+            if (_fpsLimitId) return;
+            var video = document.querySelector('video');
+            if (!video) return;
+
+            function tick() {
+                if (!video || !video.srcObject) return;
+                // 잠깐 play → 200ms 후 pause (초당 ~1프레임만 렌더)
+                video.play().catch(function(){});
+                setTimeout(function() {
+                    if (video && video.srcObject) {
+                        video.pause();
+                    }
+                }, 200);
+                _fpsLimitId = setTimeout(tick, 2000);
+            }
+            // 최초 1회 play 후 사이클 시작
+            video.play().catch(function(){});
+            _fpsLimitId = setTimeout(tick, 2000);
+        }
+
         // 4. 저품질 설정 (10% = 약 660Kbps)
+        // ★ CPU 최적화: Fiber 탐색 횟수 제한 + 캐싱
+        var _qualityAttempts = 0;
+        var _cachedRpc = null;
         function setLowQuality() {
             if (_qualityDone) return true;
+
+            // 최대 10회까지만 Fiber 탐색 시도 (CPU 보호)
+            _qualityAttempts++;
+            if (_qualityAttempts > 10) {
+                _qualityDone = true;  // 포기 — 더 이상 탐색 안함
+                return true;
+            }
+
+            // 캐싱된 RPC 채널 재사용
+            if (_cachedRpc && _cachedRpc.readyState === 'open') {
+                _cachedRpc.send(JSON.stringify({
+                    jsonrpc: '2.0', id: Date.now(),
+                    method: 'setStreamQualityFactor',
+                    params: { factor: 0.05 }
+                }));
+                _qualityDone = true;
+                return true;
+            }
 
             var root = document.querySelector('#root');
             if (!root) return false;
@@ -496,12 +589,12 @@ class KVMThumbnailWidget(QFrame):
                         if (state.memoizedState && state.memoizedState.rpcDataChannel) {
                             var rpc = state.memoizedState.rpcDataChannel;
                             if (rpc.readyState === 'open') {
-                                // 저비트레이트 설정 (10%)
+                                _cachedRpc = rpc;
                                 rpc.send(JSON.stringify({
                                     jsonrpc: '2.0',
                                     id: Date.now(),
                                     method: 'setStreamQualityFactor',
-                                    params: { factor: 0.1 }
+                                    params: { factor: 0.05 }
                                 }));
                                 _qualityDone = true;
                                 return true;
@@ -513,27 +606,35 @@ class KVMThumbnailWidget(QFrame):
 
                 if (current.child) queue.push(current.child);
                 if (current.sibling) queue.push(current.sibling);
-                if (visited.size > 500) break;
+                if (visited.size > 200) break;  // 탐색 범위 축소 (500→200)
             }
             return false;
         }
 
-        // 5. 메인 루프
+        // 5. 메인 루프 (완료 시 즉시 중단 — CPU 최적화)
         var attempts = 0;
         function loop() {
             attempts++;
             injectCSS();
             blockInput();
-            setupVideo();
-            setLowQuality();
+            var videoReady = setupVideo();
+            var qualityReady = setLowQuality();
 
             // video + CSS 준비 완료 시그널 (Python 폴링용)
             if (_cssDone && _videoDone) {
                 window._thumbReady = true;
             }
 
-            if (attempts < 60) {
-                setTimeout(loop, 500);
+            // ★ 모든 작업 완료 시 저FPS 모드 시작 + 루프 중단
+            if (_cssDone && _videoDone && _qualityDone && _inputBlocked) {
+                startLowFpsMode();
+                return;
+            }
+
+            if (attempts < 30) {
+                // 적응형 간격: 초기 빠르게, 이후 느리게
+                var delay = attempts < 5 ? 300 : (attempts < 15 ? 1000 : 2000);
+                setTimeout(loop, delay);
             }
         }
 
@@ -630,12 +731,15 @@ class KVMThumbnailWidget(QFrame):
             page.featurePermissionRequested.connect(self._on_permission_requested)
             self._webview.setPage(page)
 
-            # 설정
+            # 설정 (CPU 최적화: 불필요한 기능 비활성화)
             settings = self._webview.settings()
             settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
             settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
+            # CPU 절약: 불필요한 기능 끄기
+            settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
 
             # 로드 완료 시 JS 실행
             self._webview.loadFinished.connect(self._on_load_finished)
@@ -914,6 +1018,24 @@ class KVMThumbnailWidget(QFrame):
         self._stream_status = "dead"
         self._update_name_label()
 
+        # 비정상/강제 종료 시 GPU 크래시 카운트 (클래스 변수로 공유)
+        if terminationStatus in (1, 2):
+            if not hasattr(KVMThumbnailWidget, '_gpu_crash_count'):
+                KVMThumbnailWidget._gpu_crash_count = 0
+            KVMThumbnailWidget._gpu_crash_count += 1
+            print(f"[Thumbnail] GPU 크래시 횟수: {KVMThumbnailWidget._gpu_crash_count}")
+
+            if KVMThumbnailWidget._gpu_crash_count >= 3:
+                try:
+                    from config import DATA_DIR
+                    flag_path = os.path.join(DATA_DIR, ".gpu_crash")
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    with open(flag_path, 'w') as f:
+                        f.write(f"thumbnail_crash={KVMThumbnailWidget._gpu_crash_count}\n")
+                    print(f"[Thumbnail] GPU 크래시 플래그 생성 → 다음 실행에서 소프트웨어 렌더링")
+                except Exception as e:
+                    print(f"[Thumbnail] GPU 크래시 플래그 생성 실패: {e}")
+
     def _update_style(self):
         if self.device.status == DeviceStatus.ONLINE:
             self.setStyleSheet("QFrame { border: 2px solid #4CAF50; background: #1a1a1a; }")
@@ -967,6 +1089,9 @@ class GridViewTab(QWidget):
     device_double_clicked = pyqtSignal(object)  # KVMDevice
     device_right_clicked = pyqtSignal(object, object)  # KVMDevice, QPoint
 
+    # 가상 스크롤링: 동시 스트림 최대 수 (보이는 것 + 버퍼)
+    MAX_ACTIVE_STREAMS = 12
+
     def __init__(self, manager: KVMManager, parent=None):
         super().__init__(parent)
         self.manager = manager
@@ -976,6 +1101,8 @@ class GridViewTab(QWidget):
         self._filter_group = None  # None이면 전체, 문자열이면 해당 그룹만
         self._crop_region = None  # 부분제어 크롭 영역
         self._load_in_progress = False  # load_devices 중복 호출 방지
+        self._active_streams: set = set()  # 현재 스트림 중인 썸네일 인덱스
+        self._scroll_debounce_timer = None  # 스크롤 디바운스 타이머
         self._init_ui()
 
     def _init_ui(self):
@@ -1032,6 +1159,78 @@ class GridViewTab(QWidget):
         self.scroll_area.setWidget(self.grid_container)
         layout.addWidget(self.scroll_area)
 
+        # 스크롤 이벤트 → 가상 스크롤링 (보이는 썸네일만 스트림)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
+
+    def _on_scroll_changed(self):
+        """스크롤 위치 변경 시 가시 영역 썸네일만 스트림 (디바운스 200ms)"""
+        if not self._is_visible or not self._live_preview_enabled:
+            return
+        # 30개 이하면 전체 스트림 (가상 스크롤링 불필요)
+        if len(self.thumbnails) <= self.MAX_ACTIVE_STREAMS:
+            return
+        # 디바운스: 200ms 이내 추가 스크롤 시 이전 타이머 취소
+        if self._scroll_debounce_timer is not None:
+            try:
+                self._scroll_debounce_timer.stop()
+            except Exception:
+                pass
+        self._scroll_debounce_timer = QTimer()
+        self._scroll_debounce_timer.setSingleShot(True)
+        self._scroll_debounce_timer.timeout.connect(self._update_visible_streams)
+        self._scroll_debounce_timer.start(200)
+
+    def _get_visible_thumb_indices(self) -> set:
+        """현재 스크롤 뷰포트에 보이는 썸네일 인덱스 반환 (+ 상하 1행 버퍼)"""
+        viewport_rect = self.scroll_area.viewport().rect()
+        # 뷰포트를 그리드 컨테이너 좌표로 변환
+        scroll_y = self.scroll_area.verticalScrollBar().value()
+        visible_top = scroll_y - 160  # 상단 1행 버퍼
+        visible_bottom = scroll_y + viewport_rect.height() + 160  # 하단 1행 버퍼
+
+        visible = set()
+        for i, thumb in enumerate(self.thumbnails):
+            y = thumb.y()
+            if visible_top <= y <= visible_bottom:
+                visible.add(i)
+        return visible
+
+    def _update_visible_streams(self):
+        """보이는 썸네일만 스트림하고, 보이지 않는 것은 중지"""
+        if not self._is_visible or not self._live_preview_enabled:
+            return
+        # 소규모: 전체 스트림 유지
+        if len(self.thumbnails) <= self.MAX_ACTIVE_STREAMS:
+            return
+
+        visible = self._get_visible_thumb_indices()
+
+        # 보이지 않는 활성 스트림 중지
+        to_stop = self._active_streams - visible
+        for idx in to_stop:
+            if 0 <= idx < len(self.thumbnails):
+                try:
+                    self.thumbnails[idx].stop_capture()
+                    self.thumbnails[idx]._update_status_display()
+                except Exception:
+                    pass
+
+        # 새로 보이는 썸네일 스트림 시작
+        to_start = visible - self._active_streams
+        delay = 0
+        for idx in sorted(to_start):
+            if 0 <= idx < len(self.thumbnails):
+                thumb = self.thumbnails[idx]
+                if thumb.device.status == DeviceStatus.ONLINE and not thumb._is_active:
+                    def start_if_valid(t=thumb):
+                        if t in self.thumbnails:
+                            t.start_capture()
+                    QTimer.singleShot(delay, start_if_valid)
+                    delay += 100
+
+        self._active_streams = visible
+        # print(f"[GridView] 가시 스트림 업데이트: {len(visible)}개 활성, {len(to_stop)}개 중지, {len(to_start)}개 시작")
+
     def _toggle_live_preview(self):
         """실시간 미리보기 토글"""
         self._live_preview_enabled = self.btn_toggle_preview.isChecked()
@@ -1052,14 +1251,43 @@ class GridViewTab(QWidget):
                 thumb._update_status_display()
 
     def load_devices(self):
-        """장치 목록 로드 및 그리드 구성"""
+        """장치 목록 로드 및 그리드 구성 (증분 업데이트 지원)
+
+        장치 목록이 변경되지 않았으면 스킵, 소규모 변경은 증분 처리.
+        """
         if self._load_in_progress:
             print("[GridView] load_devices 건너뜀 - 이미 진행 중")
             return
         self._load_in_progress = True
         try:
-            print("[GridView] load_devices 시작...")
-            # 기존 썸네일 정리
+            # 장치 목록 가져오기 (그룹 필터 적용)
+            all_devices = self.manager.get_all_devices()
+            if self._filter_group is not None:
+                devices = [d for d in all_devices if (d.info.group or 'default') == self._filter_group]
+            else:
+                devices = all_devices
+
+            # ★ 증분 업데이트: 기존 목록과 비교
+            current_names = {thumb.device.name for thumb in self.thumbnails}
+            new_names = {d.name for d in devices}
+
+            if current_names == new_names and len(self.thumbnails) == len(devices):
+                # 변경 없음 → 스킵 (상태 업데이트만)
+                print(f"[GridView] load_devices 스킵 - 변경 없음 ({len(devices)}개)")
+                self._load_in_progress = False
+                return
+
+            # 소규모 변경 (추가/삭제 5개 이하): 증분 처리
+            added = new_names - current_names
+            removed = current_names - new_names
+            if len(added) + len(removed) <= 5 and self.thumbnails:
+                print(f"[GridView] 증분 업데이트: +{len(added)} -{len(removed)}")
+                self._incremental_update(devices, added, removed)
+                self._load_in_progress = False
+                return
+
+            # ★ 전체 재구성 (대규모 변경)
+            print(f"[GridView] load_devices 전체 재구성 ({len(devices)}개)...")
             self._stop_all_captures()
             for thumb in self.thumbnails:
                 try:
@@ -1078,17 +1306,8 @@ class GridViewTab(QWidget):
                     except Exception:
                         pass
 
-            # 장치 목록 가져오기 (그룹 필터 적용)
-            all_devices = self.manager.get_all_devices()
-            if self._filter_group is not None:
-                devices = [d for d in all_devices if (d.info.group or 'default') == self._filter_group]
-            else:
-                devices = all_devices
-
-            # 열 수 계산 (창 크기에 따라 조정, 최소 4개)
             cols = max(4, self.scroll_area.width() // 210)
 
-            # 레이아웃 갱신 일시 중지 (깜빡임 방지)
             self.setUpdatesEnabled(False)
             try:
                 for idx, device in enumerate(devices):
@@ -1097,7 +1316,6 @@ class GridViewTab(QWidget):
 
                     thumb = KVMThumbnailWidget(device)
                     thumb._use_preview = self._live_preview_enabled
-                    # 크롭 영역이 있으면 새 썸네일에도 적용
                     if self._crop_region:
                         thumb._crop_region = self._crop_region
                     thumb.clicked.connect(self._on_thumbnail_clicked)
@@ -1106,7 +1324,6 @@ class GridViewTab(QWidget):
                     self.thumbnails.append(thumb)
                     self.grid_layout.addWidget(thumb, row, col)
 
-                # 빈 공간 채우기
                 if devices:
                     self.grid_layout.setRowStretch(len(devices) // cols + 1, 1)
                     self.grid_layout.setColumnStretch(cols, 1)
@@ -1115,10 +1332,7 @@ class GridViewTab(QWidget):
 
             print(f"[GridView] load_devices 완료 - {len(self.thumbnails)}개 썸네일 생성")
 
-            # 탭이 보이는 상태면 캡처 시작
-            print(f"[GridView] _is_visible: {self._is_visible}")
             if self._is_visible:
-                print("[GridView] _start_all_captures 호출...")
                 self._start_all_captures()
         except Exception as e:
             print(f"[GridView] load_devices 오류: {e}")
@@ -1127,8 +1341,58 @@ class GridViewTab(QWidget):
         finally:
             self._load_in_progress = False
 
+    def _incremental_update(self, devices, added_names: set, removed_names: set):
+        """증분 그리드 업데이트 (소규모 변경 시 전체 재구성 방지)"""
+        try:
+            self.setUpdatesEnabled(False)
+
+            # 1) 삭제된 장치 제거
+            for name in removed_names:
+                for i, thumb in enumerate(self.thumbnails):
+                    if thumb.device.name == name:
+                        thumb.stop_capture()
+                        thumb.cleanup()
+                        self.grid_layout.removeWidget(thumb)
+                        thumb.deleteLater()
+                        self.thumbnails.pop(i)
+                        self._active_streams.discard(i)
+                        print(f"[GridView] 증분 삭제: {name}")
+                        break
+
+            # 2) 추가된 장치 append
+            cols = max(4, self.scroll_area.width() // 210)
+            device_map = {d.name: d for d in devices}
+            for name in added_names:
+                device = device_map.get(name)
+                if not device:
+                    continue
+                idx = len(self.thumbnails)
+                row = idx // cols
+                col = idx % cols
+
+                thumb = KVMThumbnailWidget(device)
+                thumb._use_preview = self._live_preview_enabled
+                if self._crop_region:
+                    thumb._crop_region = self._crop_region
+                thumb.clicked.connect(self._on_thumbnail_clicked)
+                thumb.double_clicked.connect(self._on_thumbnail_double_clicked)
+                thumb.right_clicked.connect(self._on_thumbnail_right_clicked)
+                self.thumbnails.append(thumb)
+                self.grid_layout.addWidget(thumb, row, col)
+                print(f"[GridView] 증분 추가: {name}")
+
+                # 보이는 상태면 캡처 시작
+                if self._is_visible and self._live_preview_enabled:
+                    if len(self.thumbnails) <= self.MAX_ACTIVE_STREAMS:
+                        QTimer.singleShot(200, thumb.start_capture)
+
+            self.setUpdatesEnabled(True)
+        except Exception as e:
+            self.setUpdatesEnabled(True)
+            print(f"[GridView] 증분 업데이트 오류: {e}")
+
     def _start_all_captures(self):
-        """모든 썸네일 캡처 시작/재개 (순차적으로 로드하여 충돌 방지)"""
+        """썸네일 캡처 시작 (가상 스크롤링: 대규모 시 보이는 것만)"""
         try:
             print(f"[GridView] _start_all_captures - preview_enabled: {self._live_preview_enabled}, thumbs: {len(self.thumbnails)}, crop={self._crop_region}")
             if not self._live_preview_enabled:
@@ -1146,19 +1410,26 @@ class GridViewTab(QWidget):
                     thumb._crop_region = self._crop_region
                 print(f"[GridView] 크롭 영역 전파 완료: {self._crop_region} → {len(self.thumbnails)}개 썸네일")
 
+            # ★ 대규모(MAX_ACTIVE_STREAMS 초과): 보이는 썸네일만 스트림
+            if len(self.thumbnails) > self.MAX_ACTIVE_STREAMS:
+                print(f"[GridView] 가상 스크롤링 모드 ({len(self.thumbnails)}개 > {self.MAX_ACTIVE_STREAMS})")
+                # 오프라인 장치는 상태만 표시
+                for thumb in self.thumbnails:
+                    if thumb.device.status != DeviceStatus.ONLINE:
+                        thumb._update_status_display()
+                # 짧은 지연 후 레이아웃 안정화 대기 → 가시 영역만 시작
+                QTimer.singleShot(300, self._update_visible_streams)
+                return
+
+            # ★ 소규모: 기존 방식 (전체 순차 시작)
             current_thumbs = list(self.thumbnails)  # 스냅샷
             for i, thumb in enumerate(current_thumbs):
-                # 일시정지 상태면 즉시 재개, 아니면 지연 시작
                 if thumb._is_paused:
-                    print(f"[GridView] thumb[{i}] resume_capture")
                     thumb.resume_capture()
                 else:
-                    # 각 썸네일을 100ms 간격으로 로드 (WebView 동시 생성 방지)
-                    # 삭제된 썸네일에 실행 방지: 콜백 시점에 목록 확인
                     def start_if_valid(t=thumb):
                         if t in self.thumbnails:
                             t.start_capture()
-                    print(f"[GridView] thumb[{i}] start_capture 예약 ({i * 100}ms)")
                     QTimer.singleShot(i * 100, start_if_valid)
         except Exception as e:
             print(f"[GridView] _start_all_captures 오류: {e}")
@@ -1167,6 +1438,7 @@ class GridViewTab(QWidget):
         """모든 썸네일 캡처 완전 중지 (WebView 언로드 - 비트레이트 해제)"""
         try:
             print("[GridView] _stop_all_captures - 모든 WebView 중지")
+            self._active_streams.clear()
             for thumb in self.thumbnails:
                 try:
                     thumb.stop_capture()  # 완전 중지 (about:blank로 변경)
@@ -2066,8 +2338,15 @@ class LiveViewDialog(QDialog):
         super().__init__(parent)
         self.device = device
         self.setWindowTitle(f"{device.name} ({device.ip})")
-        self.resize(1920, 1080)
-        print(f"[LiveView] __init__ 시작: {device.name} ({device.ip})")
+
+        # 마지막 창 크기 복원 (설정에서 기억 활성화된 경우)
+        if app_settings.get('liveview.remember_resolution', True):
+            w = app_settings.get('liveview.last_width', 1920)
+            h = app_settings.get('liveview.last_height', 1080)
+        else:
+            w, h = 1920, 1080
+        self.resize(w, h)
+        print(f"[LiveView] __init__ 시작: {device.name} ({device.ip}) [{w}x{h}]")
 
         # HID 컨트롤러 (SSH 직접 접속 — 릴레이 접속 시 사용 불가)
         self._is_relay = device.ip.startswith('100.')
@@ -2150,7 +2429,7 @@ class LiveViewDialog(QDialog):
         control_bar.addWidget(self.btn_mouse_mode)
 
         self.btn_game_mode = QPushButton("아이온2")
-        self.btn_game_mode.setToolTip("Alt+1: 시작 (자동 Rel 전환)\nAlt+2: 해제 (자동 Abs 복원)\nALT: 커서 일시 표시")
+        self.btn_game_mode.setToolTip("Alt+F1: 시작 (자동 Rel 전환)\nAlt+F2: 해제 (자동 Abs 복원)\nALT: 커서 일시 표시")
         self.btn_game_mode.setStyleSheet(f"{_btn_style} background-color:#FF5722; color:white; font-weight:bold;")
         self.btn_game_mode.clicked.connect(self._toggle_game_mode)
         control_bar.addWidget(self.btn_game_mode)
@@ -2288,7 +2567,7 @@ class LiveViewDialog(QDialog):
         layout.addWidget(self.shortcut_bar)
 
         # 아이온2 모드 안내 바 - 더 컴팩트
-        self.game_mode_bar = QLabel("  아이온2 모드 | 클릭: 잠금 | ALT: 커서 | Alt+2: 해제")
+        self.game_mode_bar = QLabel("  아이온2 모드 | 클릭: 잠금 | ALT: 커서 | Alt+F2: 해제")
         self.game_mode_bar.setStyleSheet("""
             background-color: #4CAF50;
             color: white;
@@ -2308,16 +2587,17 @@ class LiveViewDialog(QDialog):
         settings = self.web_view.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-        settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
-        # 성능 최적화 설정 - 아이온2 모드용
-        settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
-        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+        # GPU 부하 최소화 (WebRTC 비디오 디코딩만 사용)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
-        # 추가 최적화
         settings.setAttribute(QWebEngineSettings.WebAttribute.FocusOnNavigationEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript, True)
+        # PicoKVM 페이지의 이미지는 필요 (CLEAN_UI_JS에서 비디오 찾기 전까지)
+        # settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, False)
 
         layout.addWidget(self.web_view, 1)  # stretch factor 1 - 최대 공간
 
@@ -2368,13 +2648,19 @@ class LiveViewDialog(QDialog):
         # 페이지 로드 완료 시 처리
         self.web_view.loadFinished.connect(self._on_page_loaded)
 
+        # 렌더 프로세스 크래시 감지 → 자동 재연결
+        self.aion2_page.renderProcessTerminated.connect(self._on_render_process_terminated)
+        self._reconnect_count = 0
+        self._max_reconnect = 5
+        self._reconnect_timer = None
+
         # ── 글로벌 단축키 (QShortcut) ──
         # WebEngineView가 포커스를 가져가도 다이얼로그 레벨에서 키를 잡음
-        sc_start = QShortcut(QKeySequence("Alt+1"), self)
+        sc_start = QShortcut(QKeySequence("Alt+F1"), self)
         sc_start.setContext(Qt.ShortcutContext.WindowShortcut)
         sc_start.activated.connect(lambda: self._start_game_mode() if not self.game_mode_active else None)
 
-        sc_stop = QShortcut(QKeySequence("Alt+2"), self)
+        sc_stop = QShortcut(QKeySequence("Alt+F2"), self)
         sc_stop.setContext(Qt.ShortcutContext.WindowShortcut)
         sc_stop.activated.connect(lambda: self._stop_game_mode() if self.game_mode_active else None)
 
@@ -2426,10 +2712,17 @@ class LiveViewDialog(QDialog):
 
         릴레이 접속(Tailscale IP)인 경우 WebRTC ICE candidate 패치 스크립트를
         UserScript로 주입하여 미디어 스트림이 릴레이를 통과하도록 함.
+
+        GPU 크래시 방어: URL 로드 직전에 플래그 파일을 생성하여,
+        로드 중 프로세스가 죽어도 다음 실행에서 소프트웨어 렌더링으로 전환.
         """
         web_port = self.device.info.web_port if hasattr(self.device.info, 'web_port') else 80
         url = f"http://{self.device.ip}:{web_port}"
         print(f"[LiveView] URL 로드: {url}")
+
+        # GPU 크래시 방어: URL 로드 전 플래그 생성
+        # 페이지 로드 성공 시 _on_page_loaded에서 제거
+        self._set_gpu_loading_flag(True)
 
         # 릴레이 접속 감지 (Tailscale IP로 접속하는 경우)
         relay_ip = self.device.ip
@@ -2440,6 +2733,69 @@ class LiveViewDialog(QDialog):
             print(f"[LiveView] 릴레이 접속 — ICE 패치 주입 완료")
 
         self.web_view.setUrl(QUrl(url))
+
+    def _set_gpu_loading_flag(self, create: bool):
+        """GPU 크래시 감지용 플래그 파일 관리
+
+        create=True: URL 로드 직전에 생성 (프로세스 즉사 대비)
+        create=False: 페이지 로드 성공 후 제거 (정상 동작 확인)
+        수동 설정(manual=True) 플래그는 건드리지 않음.
+        """
+        try:
+            from config import DATA_DIR
+            flag_path = os.path.join(DATA_DIR, ".gpu_crash")
+
+            if create:
+                # 수동 설정된 플래그가 이미 있으면 건드리지 않음
+                if os.path.exists(flag_path):
+                    try:
+                        with open(flag_path, 'r') as f:
+                            if 'manual=True' in f.read():
+                                return
+                    except Exception:
+                        pass
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(flag_path, 'w') as f:
+                    f.write("loading=True\n")
+            else:
+                # 정상 종료 → 플래그 제거 (수동 설정은 유지)
+                if os.path.exists(flag_path):
+                    try:
+                        with open(flag_path, 'r') as f:
+                            content = f.read()
+                        if 'manual=True' not in content:
+                            os.remove(flag_path)
+                            print(f"[LiveView] GPU 플래그 제거 (정상 종료)")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[LiveView] GPU 플래그 처리 오류: {e}")
+
+    def _set_gpu_streaming_flag(self):
+        """GPU 크래시 감지: 스트리밍 중 플래그 설정
+
+        페이지 로드 성공 후 WebRTC 스트리밍 단계로 전환.
+        정상 종료(closeEvent)에서만 제거됨.
+        스트리밍 중 access violation으로 프로세스가 죽으면
+        이 플래그가 남아 다음 실행에서 소프트웨어 렌더링 전환.
+        """
+        try:
+            from config import DATA_DIR
+            flag_path = os.path.join(DATA_DIR, ".gpu_crash")
+            # 수동 설정된 플래그는 건드리지 않음
+            if os.path.exists(flag_path):
+                try:
+                    with open(flag_path, 'r') as f:
+                        if 'manual=True' in f.read():
+                            return
+                except Exception:
+                    pass
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(flag_path, 'w') as f:
+                f.write(f"streaming=True\ndevice={self.device.name}\n")
+            print(f"[LiveView] GPU 스트리밍 플래그 설정 (크래시 시 소프트웨어 렌더링 전환)")
+        except Exception as e:
+            print(f"[LiveView] GPU 스트리밍 플래그 설정 오류: {e}")
 
     def _inject_ice_patch(self, relay_ip: str, relay_port: int):
         """WebRTC ICE candidate를 릴레이 IP로 교체하는 UserScript 주입
@@ -2571,15 +2927,179 @@ class LiveViewDialog(QDialog):
 
     def _on_page_loaded(self, ok):
         self._page_loaded = True
+        print(f"[LiveView] _on_page_loaded: ok={ok}")
         # 로딩 오버레이 숨기기
         if hasattr(self, '_loading_overlay') and self._loading_overlay:
             self._loading_overlay.hide()
         if ok:
+            self._reconnect_count = 0  # 성공 시 재연결 카운터 리셋
             self.status_label.setText(f"{self.device.name} - 연결됨")
+            # GPU 크래시 플래그: loading → streaming 전환
+            # closeEvent에서만 제거 (정상 종료 시)
+            # 크래시 시 streaming=True 플래그가 남아 다음 실행에서 소프트웨어 렌더링 전환
+            self._set_gpu_streaming_flag()
             # UI 정리 (비디오만 표시) - 약간의 지연 후 실행
             QTimer.singleShot(500, self._clean_kvm_ui)
+            # WebRTC 연결 상태 모니터링 주입
+            QTimer.singleShot(2000, self._inject_webrtc_monitor)
+            # WebRTC 비디오 스트림 시작 모니터링 (크래시 진단용)
+            QTimer.singleShot(3000, self._log_webrtc_phase)
+            QTimer.singleShot(8000, self._log_webrtc_phase)
+            QTimer.singleShot(15000, self._log_webrtc_phase)
         else:
             self.status_label.setText(f"{self.device.name} - 연결 실패")
+            # 로드 실패: GPU 플래그 제거 (네트워크 실패는 GPU 문제 아님)
+            self._set_gpu_loading_flag(False)
+            # 자동 재시도
+            self._schedule_reconnect("페이지 로드 실패")
+
+    def _log_webrtc_phase(self):
+        """WebRTC 비디오 스트림 상태를 로그에 기록 (크래시 진단용)"""
+        js = """
+        (function() {
+            var info = {};
+            // video 요소 상태
+            var v = document.querySelector('video');
+            if (v) {
+                info.video = {
+                    readyState: v.readyState,
+                    paused: v.paused,
+                    width: v.videoWidth,
+                    height: v.videoHeight,
+                    srcObj: !!v.srcObject
+                };
+            }
+            // canvas 요소 상태
+            var c = document.querySelector('canvas');
+            if (c) {
+                info.canvas = { width: c.width, height: c.height };
+            }
+            // RTCPeerConnection 상태
+            if (window._origRTCPeerConnection || window.RTCPeerConnection) {
+                var pcs = window._wellcom_pcs || [];
+                info.rtc_count = pcs.length;
+            }
+            return JSON.stringify(info);
+        })();
+        """
+        try:
+            self.web_view.page().runJavaScript(js, self._on_webrtc_phase_result)
+        except Exception:
+            pass
+
+    def _on_webrtc_phase_result(self, result):
+        if result:
+            print(f"[LiveView] WebRTC 상태: {result}")
+
+    def _on_render_process_terminated(self, status, exit_code):
+        """렌더 프로세스 크래시 감지 → 자동 재연결 + GPU 크래시 플래그"""
+        status_names = {0: "정상 종료", 1: "비정상 종료", 2: "강제 종료"}
+        reason = status_names.get(status, f"알 수 없음({status})")
+        print(f"[LiveView] 렌더 프로세스 종료: {reason} (exit_code={exit_code})")
+        self.status_label.setText(f"{self.device.name} - 연결 끊김")
+        self.status_label.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 11px;")
+
+        # 비정상/강제 종료 시 GPU 크래시 플래그 생성
+        # → 다음 실행에서 소프트웨어 렌더링으로 폴백
+        if status in (1, 2):
+            if not hasattr(self, '_gpu_crash_count'):
+                self._gpu_crash_count = 0
+            self._gpu_crash_count += 1
+            print(f"[LiveView] GPU 크래시 횟수: {self._gpu_crash_count}")
+
+            if self._gpu_crash_count >= 2:
+                try:
+                    from config import DATA_DIR
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    flag_path = os.path.join(DATA_DIR, ".gpu_crash")
+                    with open(flag_path, 'w') as f:
+                        f.write(f"crash_count={self._gpu_crash_count}\nexit_code={exit_code}\n")
+                    print(f"[LiveView] GPU 크래시 플래그 생성 → 다음 실행에서 소프트웨어 렌더링")
+                except Exception as e:
+                    print(f"[LiveView] GPU 크래시 플래그 생성 실패: {e}")
+
+        self._schedule_reconnect(f"렌더 프로세스 {reason}")
+
+    def _schedule_reconnect(self, reason: str):
+        """자동 재연결 스케줄링 (최대 횟수 제한)"""
+        if self._reconnect_count >= self._max_reconnect:
+            print(f"[LiveView] 최대 재연결 횟수 초과 ({self._max_reconnect}회)")
+            self.status_label.setText(f"{self.device.name} - 연결 실패 (재시도 초과)")
+            self.status_label.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 11px;")
+            return
+
+        self._reconnect_count += 1
+        delay = min(2000 * self._reconnect_count, 10000)  # 2초~10초 백오프
+        print(f"[LiveView] {reason} → {delay/1000:.0f}초 후 재연결 ({self._reconnect_count}/{self._max_reconnect})")
+        self.status_label.setText(f"{self.device.name} - 재연결 중... ({self._reconnect_count}/{self._max_reconnect})")
+        self.status_label.setStyleSheet("color: #FFC107; font-weight: bold; font-size: 11px;")
+
+        # 로딩 오버레이 표시
+        if hasattr(self, '_loading_overlay') and self._loading_overlay:
+            self._loading_overlay.setText(f"재연결 중... ({self._reconnect_count}/{self._max_reconnect})")
+            self._loading_overlay.show()
+
+        self._reconnect_timer = QTimer.singleShot(delay, self._do_reconnect)
+
+    def _do_reconnect(self):
+        """실제 재연결 수행"""
+        try:
+            print(f"[LiveView] 재연결 시도: {self.device.name}")
+            self._load_kvm_url()
+        except Exception as e:
+            print(f"[LiveView] 재연결 실패: {e}")
+            self._schedule_reconnect(f"재연결 예외: {e}")
+
+    def _inject_webrtc_monitor(self):
+        """WebRTC 연결 상태 모니터링 JavaScript 주입"""
+        js = """
+        (function() {
+            if (window._wellcom_rtc_monitor) return;
+            window._wellcom_rtc_monitor = true;
+
+            // RTCPeerConnection 감시
+            var origPC = window._origRTCPeerConnection || window.RTCPeerConnection;
+            var patchedPC = function(config) {
+                var pc = new origPC(config);
+                pc.addEventListener('iceconnectionstatechange', function() {
+                    var state = pc.iceConnectionState;
+                    console.log('[WellcomRTC] ICE state: ' + state);
+                    if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+                        document.title = 'WELLCOM_RTC_' + state.toUpperCase();
+                    } else if (state === 'connected' || state === 'completed') {
+                        document.title = 'WELLCOM_RTC_CONNECTED';
+                    }
+                });
+                pc.addEventListener('connectionstatechange', function() {
+                    console.log('[WellcomRTC] Connection state: ' + pc.connectionState);
+                });
+                return pc;
+            };
+            patchedPC.prototype = origPC.prototype;
+            if (!window._origRTCPeerConnection) {
+                window._origRTCPeerConnection = origPC;
+            }
+            window.RTCPeerConnection = patchedPC;
+            true;
+        })();
+        """
+        self.web_view.page().runJavaScript(js)
+        # 타이틀 변경 감시 시작
+        self.web_view.page().titleChanged.connect(self._on_webrtc_title_changed)
+
+    def _on_webrtc_title_changed(self, title: str):
+        """WebRTC 상태 변경 감지 (title로 전달)"""
+        if not title.startswith('WELLCOM_RTC_'):
+            return
+        state = title.replace('WELLCOM_RTC_', '')
+        print(f"[LiveView] WebRTC 상태 변경: {state}")
+        if state in ('DISCONNECTED', 'FAILED', 'CLOSED'):
+            self.status_label.setText(f"{self.device.name} - WebRTC 끊김")
+            self.status_label.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 11px;")
+            self._schedule_reconnect(f"WebRTC {state}")
+        elif state == 'CONNECTED':
+            self.status_label.setText(f"{self.device.name} - 연결됨")
+            self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
 
     def _clean_kvm_ui(self):
         """PicoKVM UI 정리 - 비디오 스트림만 표시"""
@@ -3098,7 +3618,7 @@ class LiveViewDialog(QDialog):
 
         # UI 업데이트
         self.game_mode_bar.show()
-        self.btn_game_mode.setText("해제 (Alt+2)")
+        self.btn_game_mode.setText("해제 (Alt+F2)")
         self.btn_game_mode.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
@@ -3119,7 +3639,7 @@ class LiveViewDialog(QDialog):
         """아이온2 모드 JavaScript 실행 결과"""
         if not result:
             # Pointer Lock 실패 시 대체 메시지
-            self.game_mode_bar.setText("  화면 클릭하여 마우스 잠금 | ALT: 커서 | Alt+2: 해제")
+            self.game_mode_bar.setText("  화면 클릭하여 마우스 잠금 | ALT: 커서 | Alt+F2: 해제")
 
     def _stop_game_mode(self):
         """아이온2 모드 중지 + 자동 Abs 복원"""
@@ -3134,7 +3654,7 @@ class LiveViewDialog(QDialog):
 
         # UI 업데이트
         self.game_mode_bar.hide()
-        self.btn_game_mode.setText("아이온2 (Alt+1)")
+        self.btn_game_mode.setText("아이온2 (Alt+F1)")
         self.btn_game_mode.setStyleSheet("""
             QPushButton {
                 background-color: #FF5722;
@@ -3677,18 +4197,52 @@ class LiveViewDialog(QDialog):
             self._region_overlay.setGeometry(self.web_view.rect())
 
     def closeEvent(self, event):
+        # GPU 플래그 정리 (정상 종료 — 크래시 아님)
+        self._set_gpu_loading_flag(False)
+        print("[LiveView] 정상 종료 — GPU 플래그 제거")
+
+        # 마지막 창 크기 저장
+        if app_settings.get('liveview.remember_resolution', True):
+            size = self.size()
+            app_settings.set('liveview.last_width', size.width(), False)
+            app_settings.set('liveview.last_height', size.height(), False)
+            app_settings.save()
+            print(f"[LiveView] 창 크기 저장: {size.width()}x{size.height()}")
+
+        # 재연결 방지 (닫는 중에 재연결 시도 안 함)
+        self._max_reconnect = 0
+
         self._stop_game_mode()
         if self._recording:
             self._stop_recording()
         if self.vision_controller:
             self.vision_controller.cleanup()
-        # WebView 정리 (WebRTC 연결 해제 + 포커스 반환)
+
+        # 시그널 해제 (재연결 트리거 방지)
         try:
-            self.web_view.setUrl(QUrl("about:blank"))
-            self.web_view.setParent(None)
-            self.web_view.deleteLater()
+            self.web_view.page().titleChanged.disconnect(self._on_webrtc_title_changed)
         except Exception:
             pass
+        try:
+            self.web_view.loadFinished.disconnect(self._on_page_loaded)
+        except Exception:
+            pass
+        try:
+            self.aion2_page.renderProcessTerminated.disconnect(self._on_render_process_terminated)
+        except Exception:
+            pass
+
+        # WebView 정리 (WebRTC 연결 해제 + Chromium 리소스 반환)
+        try:
+            self.web_view.stop()
+            self.web_view.setUrl(QUrl("about:blank"))
+            # 이벤트 처리: about:blank 전환이 시작되도록
+            QApplication.processEvents()
+            self.web_view.setParent(None)
+            self.web_view.deleteLater()
+            print("[LiveView] WebView 정리 완료")
+        except Exception as e:
+            print(f"[LiveView] WebView 정리 오류: {e}")
         self.hid.disconnect()
         super().closeEvent(event)
 
@@ -4415,26 +4969,35 @@ class MainWindow(QMainWindow):
         pass  # 메뉴에 통합됨
 
     def _load_devices_from_source(self):
-        """서버 + 로컬 DB에서 기기 목록 로드
+        """서버/로컬 DB에서 기기 목록 로드
 
-        서버 기기를 먼저 로드하고, 로컬 DB에만 있는 기기도 추가.
-        (로컬에서 수동 추가한 기기가 사라지지 않도록)
+        - 일반 사용자: 서버에서 할당된 기기만 표시
+        - 관리자(admin): 로컬 DB + 서버 기기 병합
+        - 서버 연결 실패: 로컬 DB 기기 표시
 
         추가: 원격 KVM 레지스트리에서 릴레이 접속 정보를 가져와
         직접 접근 불가한 KVM의 IP/포트를 릴레이 주소로 자동 치환.
         """
-        # 항상 로컬 DB를 먼저 로드
-        self.manager.load_devices_from_db()
-        local_count = len(self.manager.devices)
-
-        # 서버 기기를 병합 (로컬 기기를 덮어쓰지 않음)
         try:
             from api_client import api_client
             if api_client.is_logged_in:
-                devices = api_client.get_my_devices()
-                if devices:
-                    self.manager.merge_devices_from_server(devices)
-                    print(f"[MainWindow] 서버에서 {len(devices)}개 기기 병합 (로컬 {local_count}개 유지)")
+                if api_client.is_admin:
+                    # 관리자: 로컬 DB 먼저 로드 + 서버 기기 병합
+                    self.manager.load_devices_from_db()
+                    local_count = len(self.manager.devices)
+                    devices = api_client.get_my_devices()
+                    if devices:
+                        self.manager.merge_devices_from_server(devices)
+                        print(f"[MainWindow] 관리자: 서버 {len(devices)}개 병합 (로컬 {local_count}개 유지)")
+                else:
+                    # 일반 사용자: 서버에서 할당된 기기만 표시
+                    devices = api_client.get_my_devices()
+                    if devices:
+                        self.manager.load_devices_from_server(devices)
+                        print(f"[MainWindow] 사용자: 할당된 {len(devices)}개 기기 로드")
+                    else:
+                        self.manager.devices.clear()
+                        print("[MainWindow] 사용자: 할당된 기기 없음")
 
                 # 원격 KVM 릴레이 정보로 접근 불가 기기의 IP/포트 자동 치환
                 self._apply_relay_substitution(api_client)
@@ -4442,7 +5005,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[MainWindow] 서버 기기 로드 실패, 로컬 DB만 사용: {e}")
 
-        print(f"[MainWindow] 로컬 DB에서 {local_count}개 기기 로드")
+        # 서버 연결 실패 시 로컬 DB 사용
+        self.manager.load_devices_from_db()
+        print(f"[MainWindow] 로컬 DB에서 {len(self.manager.devices)}개 기기 로드")
 
     def _apply_relay_substitution(self, api_client):
         """원격 KVM 레지스트리에서 릴레이 정보를 가져와
@@ -4694,19 +5259,23 @@ class MainWindow(QMainWindow):
 
     def _on_status_updated(self, status: dict):
         # 상태 결과를 장치에 반영
-        for device_name, device_status in status.items():
-            device = self.manager.get_device(device_name)
-            if device:
-                if device_status.get('online', False):
-                    device.status = DeviceStatus.ONLINE
-                else:
-                    device.status = DeviceStatus.OFFLINE
+        try:
+            for device_name, device_status in status.items():
+                device = self.manager.get_device(device_name)
+                if device:
+                    if device_status.get('online', False):
+                        device.status = DeviceStatus.ONLINE
+                    else:
+                        device.status = DeviceStatus.OFFLINE
 
-        self._load_device_list()
-        if self.current_device:
-            self._update_device_info()
-        # 그리드 뷰 상태 업데이트
-        self.grid_view_tab.update_device_status()
+            self._load_device_list()
+            if self.current_device:
+                self._update_device_info()
+            # 그리드 뷰 상태 업데이트
+            if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+                self.grid_view_tab.update_device_status()
+        except Exception as e:
+            print(f"[MainWindow] 상태 업데이트 처리 오류: {e}")
 
     def _on_grid_device_selected(self, device: KVMDevice):
         """그리드 뷰에서 장치 클릭 - 선택만"""
@@ -4749,7 +5318,9 @@ class MainWindow(QMainWindow):
         menu.addAction("이름 변경", self._on_rename_device)
         menu.addAction("설정", self._on_device_settings)
         menu.addSeparator()
-        menu.addAction("삭제", self._on_delete_device)
+        # 우클릭한 장치 참조를 직접 전달 (self.current_device 경쟁 조건 방지)
+        _ctx_device = device
+        menu.addAction("삭제", lambda: self._on_delete_device(_ctx_device))
         menu.exec(pos)
 
     def _on_device_selected(self, item: QTreeWidgetItem, column: int):
@@ -4778,6 +5349,16 @@ class MainWindow(QMainWindow):
         self.btn_start_live.setEnabled(True)
         self.btn_open_web.setEnabled(True)
 
+    def _clear_device_info(self):
+        """장치 삭제 후 왼쪽 패널 초기화"""
+        try:
+            for key in self.info_labels:
+                self.info_labels[key].setText("-")
+            self.btn_start_live.setEnabled(False)
+            self.btn_open_web.setEnabled(False)
+        except Exception as e:
+            print(f"[MainWindow] 장치 정보 초기화 오류: {e}")
+
     def _on_device_context_menu(self, pos):
         item = self.device_tree.itemAt(pos)
         menu = QMenu()
@@ -4798,7 +5379,10 @@ class MainWindow(QMainWindow):
                 menu.addAction("그룹 이름 변경", lambda: self._on_rename_group(item))
                 menu.addAction("그룹 삭제", lambda: self._on_delete_group(group_name))
         else:
-            # 장치 항목 우클릭
+            # 장치 항목 우클릭 — 우클릭한 장치를 current_device로 설정
+            self.current_device = self.manager.get_device(device_name)
+            self._update_device_info()
+
             menu.addAction("실시간 제어", self._on_start_live_control)
             menu.addAction("브라우저에서 열기", self._on_open_web_browser)
             menu.addAction("파일 전송", self._on_file_transfer)
@@ -4825,7 +5409,9 @@ class MainWindow(QMainWindow):
             menu.addAction("이름 변경", self._on_rename_device)
             menu.addAction("설정", self._on_device_settings)
             menu.addSeparator()
-            menu.addAction("삭제", self._on_delete_device)
+            # 우클릭한 장치 참조를 직접 전달 (self.current_device 경쟁 조건 방지)
+            _ctx_device = self.current_device
+            menu.addAction("삭제", lambda: self._on_delete_device(_ctx_device))
 
         menu.exec(self.device_tree.mapToGlobal(pos))
 
@@ -5010,9 +5596,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "경고", "장치를 먼저 선택해주세요.")
             return
 
-        # 1:1 제어 시작 전: 해당 장치의 미리보기 중지 + 플래그 설정
+        # 1:1 제어 시작 전: 모든 썸네일 미리보기 중지 (GPU 부하 경감)
+        # 16개 WebEngine 썸네일 + 1개 LiveView = GPU 과부하 → 크래시 원인
         self._live_control_device = self.current_device.name
-        self._stop_device_preview(self.current_device)
+        self._stop_all_previews_for_liveview()
 
         # 다이얼로그 생성 (URL은 __init__에서 로드)
         try:
@@ -5024,6 +5611,10 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "LiveView 오류", f"LiveView 실행 중 오류:\n{e}")
             return
+        finally:
+            # WebView deleteLater() 완료 대기 (이전 WebEngine 정리)
+            # 두 번째 LiveView 열 때 이전 WebEngine과 충돌 방지
+            QApplication.processEvents()
 
         # 1:1 제어 종료 — 플래그 해제 + 메인 윈도우 활성화
         self._live_control_device = None
@@ -5034,8 +5625,8 @@ class MainWindow(QMainWindow):
         if getattr(dialog, '_partial_control_closing', False):
             return
 
-        # 1:1 제어 종료 후: 해당 장치의 미리보기 재시작
-        self._restart_device_preview(self.current_device)
+        # 1:1 제어 종료 후: 모든 썸네일 미리보기 재시작
+        self._resume_all_previews_after_liveview()
 
     def _apply_partial_crop(self, group: str, region: tuple):
         """부분제어 — 해당 그룹 탭으로 전환하고 크롭 적용
@@ -5083,6 +5674,81 @@ class MainWindow(QMainWindow):
                 self.tab_widget.setCurrentIndex(idx)
         else:
             print(f"[부분제어] 경고: target_tab의 인덱스를 찾을 수 없음")
+
+    # JavaScript: WebRTC 미디어 트랙 일시정지 (GPU 부하 감소)
+    _PAUSE_WEBRTC_JS = """
+    (function() {
+        // 모든 video 요소의 srcObject 트랙 중지
+        document.querySelectorAll('video').forEach(function(v) {
+            if (v.srcObject) {
+                v.srcObject.getTracks().forEach(function(t) { t.enabled = false; });
+                v.pause();
+            }
+        });
+        return true;
+    })();
+    """
+
+    # JavaScript: WebRTC 미디어 트랙 재개
+    _RESUME_WEBRTC_JS = """
+    (function() {
+        document.querySelectorAll('video').forEach(function(v) {
+            if (v.srcObject) {
+                v.srcObject.getTracks().forEach(function(t) { t.enabled = true; });
+                v.play().catch(function(){});
+            }
+        });
+        return true;
+    })();
+    """
+
+    def _stop_all_previews_for_liveview(self):
+        """1:1 제어 시작 전 모든 썸네일 미리보기 일시정지
+
+        about:blank 전환 대신 pause_capture(hide) + WebRTC 트랙 비활성화.
+        about:blank로 전환하면 Chromium 렌더 프로세스 정리 중
+        새 WebEngine 생성 시 access violation 발생하므로 안전한 방법 사용.
+        """
+        all_tabs = []
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            all_tabs.append(self.grid_view_tab)
+        if hasattr(self, 'group_grid_tabs'):
+            all_tabs.extend(self.group_grid_tabs.values())
+
+        paused = 0
+        for tab in all_tabs:
+            for thumb in tab.thumbnails:
+                try:
+                    thumb.pause_capture()
+                    # WebRTC 비디오 트랙 비활성화 (GPU 디코딩 중지)
+                    if thumb._webview:
+                        thumb._webview.page().runJavaScript(self._PAUSE_WEBRTC_JS)
+                    paused += 1
+                except Exception:
+                    pass
+        print(f"[MainWindow] 1:1 제어 시작 — 모든 썸네일 일시정지 ({paused}개, WebRTC 트랙 비활성화)")
+
+    def _resume_all_previews_after_liveview(self):
+        """1:1 제어 종료 후 활성 탭의 썸네일 미리보기 재시작"""
+        all_tabs = []
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            all_tabs.append(self.grid_view_tab)
+        if hasattr(self, 'group_grid_tabs'):
+            all_tabs.extend(self.group_grid_tabs.values())
+
+        resumed = 0
+        for tab in all_tabs:
+            if tab._is_visible and tab._live_preview_enabled:
+                for thumb in tab.thumbnails:
+                    try:
+                        # WebRTC 트랙 재활성화 + WebView 표시
+                        if thumb._webview and thumb._is_paused:
+                            thumb._webview.page().runJavaScript(self._RESUME_WEBRTC_JS)
+                        thumb.resume_capture()
+                        resumed += 1
+                    except Exception:
+                        pass
+        print(f"[MainWindow] 1:1 제어 종료 — 썸네일 재개 ({resumed}개)")
 
     def _stop_device_preview(self, device: KVMDevice):
         """특정 장치의 미리보기 중지 (전체 탭 + 그룹 탭 모두 처리)"""
@@ -5264,7 +5930,8 @@ class MainWindow(QMainWindow):
             try:
                 self.manager.add_device(**data)
                 self._load_device_list()
-                self.grid_view_tab.load_devices()  # 그리드 뷰 새로고침
+                if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+                    self.grid_view_tab.load_devices()
                 self.status_bar.showMessage(f"장치 '{data['name']}' 추가됨")
             except Exception as e:
                 QMessageBox.critical(self, "오류", f"장치 추가 실패: {e}")
@@ -5328,88 +5995,138 @@ class MainWindow(QMainWindow):
             if added_count > 0:
                 QMessageBox.information(self, "자동 검색 완료", msg)
 
-    def _on_delete_device(self):
-        if not self.current_device:
+    def _on_delete_device(self, target_device=None):
+        """장치 삭제 — target_device를 직접 전달받거나, 없으면 current_device 사용"""
+        device = target_device or self.current_device
+        if not device:
             return
-        if QMessageBox.question(self, "삭제 확인", f"'{self.current_device.name}' 삭제?",
-                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-            device_name = self.current_device.name
+        try:
+            if QMessageBox.question(self, "삭제 확인",
+                                     f"'{device.name}' ({device.ip}) 삭제?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+                device_name = device.name
 
-            # 서버에서도 삭제 (admin인 경우)
-            try:
-                from api_client import api_client
-                if api_client.is_logged_in and api_client.is_admin:
-                    devices = api_client.admin_get_all_devices()
-                    for d in devices:
-                        if d.get('name') == device_name:
-                            api_client.admin_delete_device(d['id'])
-                            print(f"[Delete] 서버에서 삭제: {device_name}")
-                            break
-            except Exception as e:
-                print(f"[Delete] 서버 삭제 실패 (로컬만 삭제): {e}")
+                # 서버에서도 삭제 (admin인 경우)
+                try:
+                    from api_client import api_client
+                    if api_client.is_logged_in and api_client.is_admin:
+                        devices = api_client.admin_get_all_devices()
+                        for d in devices:
+                            if d.get('name') == device_name:
+                                api_client.admin_delete_device(d['id'])
+                                print(f"[Delete] 서버에서 삭제: {device_name}")
+                                break
+                except Exception as e:
+                    print(f"[Delete] 서버 삭제 실패 (로컬만 삭제): {e}")
 
-            self.manager.remove_device(device_name)
-            self.current_device = None
-            self._load_device_list()
-            self.grid_view_tab.load_devices()
-            self._update_live_tab()
+                self.manager.remove_device(device_name)
+                self.current_device = None
+                self._load_device_list()
+                if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+                    try:
+                        self.grid_view_tab.load_devices()
+                    except Exception as e:
+                        print(f"[Delete] grid_view 갱신 실패: {e}")
+                self._clear_device_info()
+                self.status_bar.showMessage(f"'{device_name}' 삭제됨")
+        except Exception as e:
+            print(f"[MainWindow] 장치 삭제 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "오류", f"장치 삭제 중 오류 발생:\n{e}")
 
     def _on_device_settings(self):
-        if self.current_device:
+        if not self.current_device:
+            return
+        try:
             DeviceSettingsDialog(self.current_device, self).exec()
+        except Exception as e:
+            print(f"[MainWindow] 장치 설정 오류: {e}")
+            QMessageBox.warning(self, "오류", f"장치 설정 열기 오류: {e}")
 
     def _on_connect_device(self):
         if not self.current_device:
             return
-        self.status_bar.showMessage(f"{self.current_device.name} SSH 연결 중...")
-        if self.current_device.connect():
-            self.status_bar.showMessage(f"{self.current_device.name} SSH 연결됨")
-        else:
-            self.status_bar.showMessage(f"{self.current_device.name} SSH 연결 실패")
-        self._load_device_list()
-        self._update_device_info()
+        try:
+            self.status_bar.showMessage(f"{self.current_device.name} SSH 연결 중...")
+            if self.current_device.connect():
+                self.status_bar.showMessage(f"{self.current_device.name} SSH 연결됨")
+            else:
+                self.status_bar.showMessage(f"{self.current_device.name} SSH 연결 실패")
+            self._load_device_list()
+            self._update_device_info()
+        except Exception as e:
+            print(f"[MainWindow] SSH 연결 오류: {e}")
+            self.status_bar.showMessage(f"SSH 연결 오류: {e}")
 
     def _on_disconnect_device(self):
-        if self.current_device:
+        if not self.current_device:
+            return
+        try:
+            device_name = self.current_device.name
             self.current_device.disconnect()
             self._load_device_list()
             self._update_device_info()
-            self.status_bar.showMessage(f"{self.current_device.name} SSH 해제됨")
+            self.status_bar.showMessage(f"{device_name} SSH 해제됨")
+        except Exception as e:
+            print(f"[MainWindow] SSH 해제 오류: {e}")
+            self.status_bar.showMessage(f"SSH 해제 오류: {e}")
 
     def _on_reboot_device(self):
         if not self.current_device:
             return
         if QMessageBox.question(self, "재부팅 확인", f"'{self.current_device.name}' 재부팅?",
                                  QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-            if not self.current_device.is_connected():
-                self.current_device.connect()
-            self.current_device.reboot()
-            self.status_bar.showMessage(f"{self.current_device.name} 재부팅 중...")
+            try:
+                if not self.current_device.is_connected():
+                    self.current_device.connect()
+                self.current_device.reboot()
+                self.status_bar.showMessage(f"{self.current_device.name} 재부팅 중...")
+            except Exception as e:
+                print(f"[MainWindow] 재부팅 오류: {e}")
+                self.status_bar.showMessage(f"재부팅 오류: {e}")
 
     def _on_reconnect_usb(self):
-        if self.current_device:
+        if not self.current_device:
+            return
+        try:
             if not self.current_device.is_connected():
                 self.current_device.connect()
             self.current_device.reconnect_usb()
             self.status_bar.showMessage(f"{self.current_device.name} USB 재연결됨")
+        except Exception as e:
+            print(f"[MainWindow] USB 재연결 오류: {e}")
+            self.status_bar.showMessage(f"USB 재연결 오류: {e}")
 
     def _on_refresh_usb_log(self):
-        if self.current_device and hasattr(self, 'usb_log_text'):
+        if not self.current_device or not hasattr(self, 'usb_log_text'):
+            return
+        try:
             if not self.current_device.is_connected():
                 self.current_device.connect()
             self.usb_log_text.setText(self.current_device.get_dmesg_usb(50))
+        except Exception as e:
+            print(f"[MainWindow] USB 로그 조회 오류: {e}")
 
     def _on_connect_all(self):
-        self.status_bar.showMessage("전체 SSH 연결 중...")
-        results = self.manager.connect_all()
-        success = sum(1 for v in results.values() if v)
-        self.status_bar.showMessage(f"{success}/{len(results)}개 SSH 연결됨")
-        self._load_device_list()
+        try:
+            self.status_bar.showMessage("전체 SSH 연결 중...")
+            results = self.manager.connect_all()
+            success = sum(1 for v in results.values() if v)
+            self.status_bar.showMessage(f"{success}/{len(results)}개 SSH 연결됨")
+            self._load_device_list()
+        except Exception as e:
+            print(f"[MainWindow] 전체 연결 오류: {e}")
+            self.status_bar.showMessage(f"전체 연결 오류: {e}")
 
     def _on_disconnect_all(self):
-        self.manager.disconnect_all()
-        self._load_device_list()
-        self.status_bar.showMessage("전체 SSH 해제됨")
+        try:
+            self.manager.disconnect_all()
+            self._load_device_list()
+            self.status_bar.showMessage("전체 SSH 해제됨")
+        except Exception as e:
+            print(f"[MainWindow] 전체 해제 오류: {e}")
+            self.status_bar.showMessage(f"전체 해제 오류: {e}")
 
     def _on_refresh_all_status(self):
         """상태 새로고침 (백그라운드 스레드에서 실행)"""
@@ -5490,12 +6207,13 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "WellcomLAND 정보",
                           f"<h2>WellcomLAND</h2><p>버전 {__version__}</p>"
                           "<p>다중 KVM 장치 관리 솔루션</p>"
-                          "<hr><p><b>아이온2 모드 (G 키):</b></p>"
-                          "<p>• 마우스 커서 비활성화</p>"
-                          "<p>• 마우스 움직임 = 시점 회전</p>"
-                          "<p>• 무한 회전 (화면 끝에서 안 멈춤)</p>"
-                          "<p>• ESC로 해제</p>"
-                          "<hr><p><small>아이온2 게임과 동일한 조작 방식</small></p>")
+                          "<hr><p><b>기본 단축키:</b></p>"
+                          "<p>• <b>더블클릭</b> — 1:1 실시간 제어</p>"
+                          "<p>• <b>우클릭</b> — 장치 컨텍스트 메뉴</p>"
+                          "<p>• <b>Ctrl+Space</b> — 한/영 전환</p>"
+                          "<p>• <b>Alt+3</b> — 상단 바 토글</p>"
+                          "<p>• <b>F11</b> — 전체 화면</p>"
+                          "<hr><p><small>WellcomLAND by Wellcom LLC</small></p>")
 
     def closeEvent(self, event):
         try:

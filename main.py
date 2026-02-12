@@ -5,33 +5,141 @@ Luckfox PicoKVM 기반
 
 import sys
 import os
+import faulthandler
 
 # 프로젝트 루트 경로 추가
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from version import __version__, __app_name__, __github_repo__
 
-# QtWebEngine 하드웨어 가속 및 입력 지연 최적화 (QApplication 생성 전에 설정 필요)
-os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
-    # GPU 가속
-    '--enable-gpu-rasterization '
-    '--enable-native-gpu-memory-buffers '
-    '--enable-accelerated-video-decode '
-    '--enable-accelerated-mjpeg-decode '
-    '--disable-gpu-driver-bug-workarounds '
-    '--ignore-gpu-blocklist '
-    # WebRTC 최적화
-    '--enable-webrtc-hw-decoding '
-    '--enable-webrtc-hw-encoding '
-    '--disable-webrtc-hw-vp8-encoding '
-    # 입력 지연 최소화
-    '--disable-frame-rate-limit '
-    '--disable-gpu-vsync '
-    # 렌더링 최적화
-    '--enable-zero-copy '
-    '--enable-features=VaapiVideoDecoder '
-    '--canvas-oop-rasterization '
-)
+# ── 로그 리다이렉트 (EXE 환경에서 stdout/stderr → 파일) ──
+_app_dir = os.path.dirname(os.path.abspath(__file__)) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
+_log_dir = os.path.join(_app_dir, "logs")
+os.makedirs(_log_dir, exist_ok=True)
+
+# stdout/stderr를 파일로 복제 (콘솔 출력도 유지)
+class _LogTee:
+    """stdout/stderr를 파일과 원래 스트림에 동시 출력"""
+    def __init__(self, log_path, orig_stream):
+        self._file = open(log_path, 'a', encoding='utf-8', buffering=1)  # line-buffered
+        self._orig = orig_stream
+    def write(self, data):
+        try:
+            self._file.write(data)
+            self._file.flush()  # 크래시 대비 즉시 flush
+        except Exception:
+            pass
+        if self._orig:
+            try:
+                self._orig.write(data)
+            except Exception:
+                pass
+    def flush(self):
+        try:
+            self._file.flush()
+        except Exception:
+            pass
+        if self._orig:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+
+_log_path = os.path.join(_log_dir, "app.log")
+# 로그 파일 크기 제한 (1MB 초과 시 초기화)
+try:
+    if os.path.exists(_log_path) and os.path.getsize(_log_path) > 1_000_000:
+        os.remove(_log_path)
+except Exception:
+    pass
+
+sys.stdout = _LogTee(_log_path, sys.stdout if sys.stdout else None)
+sys.stderr = _LogTee(_log_path, sys.stderr if sys.stderr else None)
+
+# Python logging 모듈의 StreamHandler 패치
+# EXE 환경에서 원래 stderr가 None이면 logging.StreamHandler.stream도 None이 되어
+# "AttributeError: 'NoneType' object has no attribute 'write'" 에러가 대량 발생
+import logging as _logging
+for _handler in _logging.root.handlers[:]:
+    if isinstance(_handler, _logging.StreamHandler) and not _handler.stream:
+        _handler.stream = sys.stderr
+# lastResort 핸들러도 패치
+if hasattr(_logging, 'lastResort') and _logging.lastResort:
+    if isinstance(_logging.lastResort, _logging.StreamHandler) and not _logging.lastResort.stream:
+        _logging.lastResort.stream = sys.stderr
+# 새로 생성되는 StreamHandler를 위해 기본 stream을 sys.stderr로 보장
+_orig_stream_handler_init = _logging.StreamHandler.__init__
+def _patched_stream_handler_init(self, stream=None):
+    _orig_stream_handler_init(self, stream if stream else sys.stderr)
+_logging.StreamHandler.__init__ = _patched_stream_handler_init
+
+# faulthandler: segfault/abort 시 스택트레이스를 파일에 기록
+_fault_path = os.path.join(_log_dir, "fault.log")
+_fault_file = open(_fault_path, 'a', encoding='utf-8')
+faulthandler.enable(file=_fault_file)
+print(f"[Log] 로그 파일: {_log_path}")
+print(f"[Log] Fault 로그: {_fault_path}")
+
+# ── GPU / Chromium 설정 ──
+# EXE(frozen) 환경에서 Chromium GPU 서브프로세스가 DLL 경로 문제로 크래시 발생
+# --in-process-gpu: GPU를 별도 프로세스 대신 메인 프로세스에서 실행 (frozen 호환)
+# --disable-gpu-compositing: GPU 합성 비활성화 (안정성 향상, 비디오 디코딩은 유지)
+_is_frozen = getattr(sys, 'frozen', False)
+
+# GPU 크래시 플래그 확인
+_gpu_crash_flag = os.path.join(_app_dir, "data", ".gpu_crash")
+_had_gpu_crash = os.path.exists(_gpu_crash_flag)
+
+# settings.json의 graphics.software_rendering 설정 확인
+_force_software = False
+_settings_path = os.path.join(_app_dir, "data", "settings.json")
+try:
+    if os.path.exists(_settings_path):
+        import json as _json
+        with open(_settings_path, 'r', encoding='utf-8') as _f:
+            _settings_data = _json.load(_f)
+        if _settings_data.get('graphics', {}).get('software_rendering', False):
+            _force_software = True
+except Exception:
+    pass
+
+# Chromium 플래그 구성
+_chromium_flags = ['--autoplay-policy=no-user-gesture-required']
+
+if _is_frozen:
+    # EXE 환경: GPU 서브프로세스 문제 방지
+    _chromium_flags.append('--in-process-gpu')
+    _chromium_flags.append('--disable-gpu-compositing')
+    print(f"[GPU] frozen 환경 — --in-process-gpu, --disable-gpu-compositing 적용")
+
+if _had_gpu_crash:
+    _flag_reason = "플래그 존재"
+    try:
+        with open(_gpu_crash_flag, 'r') as _f:
+            _flag_reason = _f.read().strip()
+    except Exception:
+        pass
+    print(f"[GPU] 이전 크래시 감지 — 이유: {_flag_reason}")
+    # SwiftShader 소프트웨어 렌더링 추가
+    if '--use-gl=angle' not in ' '.join(_chromium_flags):
+        _chromium_flags.append('--use-gl=angle')
+        _chromium_flags.append('--use-angle=swiftshader')
+    # 크래시 플래그 삭제 (1회 적용)
+    try:
+        with open(_gpu_crash_flag, 'r') as _f:
+            if 'manual=True' not in _f.read():
+                os.remove(_gpu_crash_flag)
+                print(f"[GPU] 크래시 플래그 삭제 (1회 적용)")
+    except Exception:
+        pass
+
+if _force_software:
+    print(f"[GPU] 설정에서 소프트웨어 렌더링 강제")
+    if '--use-gl=angle' not in ' '.join(_chromium_flags):
+        _chromium_flags.append('--use-gl=angle')
+        _chromium_flags.append('--use-angle=swiftshader')
+
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = ' '.join(_chromium_flags)
 
 # 중요: QtWebEngineWidgets는 QApplication 생성 전에 임포트해야 함
 from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
@@ -57,7 +165,8 @@ def check_for_updates(app: QApplication) -> bool:
             return True
 
         token = settings.get('update.github_token', '')
-        checker = UpdateChecker(Path(BASE_DIR), __github_repo__, token or None)
+        checker = UpdateChecker(Path(BASE_DIR), __github_repo__, token or None,
+                                running_version=__version__)
 
         has_update, release_info = checker.check_update()
         if not has_update or not release_info:
@@ -109,8 +218,44 @@ def _restart_application():
     sys.exit(0)
 
 
+def _setup_crash_handler():
+    """전역 예외 핸들러 — 미처리 예외 로깅 및 크래시 방지"""
+    import traceback
+    _orig_excepthook = sys.excepthook
+
+    def _crash_handler(exc_type, exc_value, exc_tb):
+        try:
+            msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            print(f"[CRASH] 미처리 예외:\n{msg}")
+            # 로그 파일에 기록
+            log_dir = os.path.join(_app_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            from datetime import datetime
+            with open(os.path.join(log_dir, "crash.log"), 'a', encoding='utf-8') as f:
+                f.write(f"\n[{datetime.now().isoformat()}] {msg}\n")
+        except Exception:
+            pass
+        # 원래 핸들러 호출 (Qt 내부 예외 처리)
+        _orig_excepthook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _crash_handler
+
+
 def main():
-    print(f"[{__app_name__}] v{__version__} 시작")
+    _setup_crash_handler()
+    from datetime import datetime
+    print(f"\n{'='*60}")
+    print(f"[{__app_name__}] v{__version__} 시작 — {datetime.now().isoformat()}")
+    print(f"[System] Python={sys.version}, frozen={getattr(sys, 'frozen', False)}")
+    print(f"[System] frozen={_is_frozen}, gpu_crash={_had_gpu_crash}, sw_force={_force_software}")
+    print(f"[System] CHROMIUM_FLAGS={os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')}")
+    print(f"{'='*60}")
+
+    # GPU 크래시 플래그: 소프트웨어 모드로 시작한 경우
+    # loading 플래그(자동감지)는 영구 유지 → 사용자가 환경설정에서 직접 해제해야 함
+    # (바로 삭제하면 다음 실행에서 또 GPU 모드 → 크래시 → 무한반복)
+    if _use_software_gl:
+        print("[GPU] 소프트웨어 렌더링 모드 유지 (환경설정에서 해제 가능)")
 
     # High DPI 스케일링 활성화
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -126,8 +271,11 @@ def main():
         app.setWindowIcon(QIcon(ICON_PATH))
         print(f"[App] 아이콘 적용: {ICON_PATH}")
 
-    # OpenGL 소프트웨어 렌더링 비활성화 (하드웨어 가속 강제)
-    app.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, False)
+    # GPU 모드 설정
+    if _use_software_gl:
+        app.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
+        print("[GPU] 소프트웨어 OpenGL 활성화")
+    # else: Qt 기본값 사용 (강제 GPU 비활성화하지 않음)
 
     # 네트워크 우선순위 자동 조정 (Tailscale/APIPA가 기본인 경우)
     try:

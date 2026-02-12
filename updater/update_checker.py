@@ -28,21 +28,36 @@ def _compare_versions(current: str, latest: str) -> bool:
 class UpdateChecker:
     """업데이트 확인 및 적용 관리자"""
 
-    def __init__(self, base_dir: Path, repo: str, token: str = None):
+    def __init__(self, base_dir: Path, repo: str, token: str = None,
+                 running_version: str = None):
         self.base_dir = base_dir
         self.app_dir = base_dir / "app"
         self.temp_dir = base_dir / "temp"
+        self._running_version = running_version
         self.github = GitHubClient(repo, token)
         self.file_manager = FileManager(base_dir)
 
     def get_current_version(self) -> str:
-        """현재 설치된 버전 확인"""
+        """현재 설치된 버전 확인
+
+        우선순위:
+        1. 생성자에서 전달받은 버전 (실행 중인 코드의 __version__)
+        2. version.json (업데이트 후 생성)
+        3. version.py 파일 읽기 (app/ 디렉터리)
+        4. import fallback
+        """
+        # 0) 실행 중인 코드에서 직접 전달받은 버전 (가장 정확)
+        if self._running_version:
+            return self._running_version
+
         # 1) version.json 확인 (업데이트 후 생성됨)
         version_file = self.app_dir / "version.json"
         try:
             if version_file.exists():
                 data = json.loads(version_file.read_text(encoding='utf-8'))
-                return data.get("version", "0.0.0")
+                v = data.get("version", "0.0.0")
+                logger.info(f"버전 감지 (version.json): {v}")
+                return v
         except Exception:
             pass
 
@@ -53,13 +68,18 @@ class UpdateChecker:
                 content = version_py.read_text(encoding='utf-8')
                 for line in content.split('\n'):
                     if line.startswith('__version__'):
-                        return line.split('=')[1].strip().strip('"\'')
-        except Exception:
-            pass
+                        v = line.split('=')[1].strip().strip('"\'')
+                        logger.info(f"버전 감지 (version.py): {v} ({version_py})")
+                        return v
+            else:
+                logger.warning(f"version.py 없음: {version_py}")
+        except Exception as e:
+            logger.warning(f"version.py 읽기 실패: {e}")
 
         # 3) 개발환경: ipkvm/version.py 직접 import
         try:
             from version import __version__
+            logger.info(f"버전 감지 (import): {__version__}")
             return __version__
         except Exception:
             pass
