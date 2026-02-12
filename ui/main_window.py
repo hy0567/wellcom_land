@@ -882,6 +882,46 @@ class KVMThumbnailWidget(QFrame):
         except Exception as e:
             print(f"[Thumbnail] stop_capture 오류: {e}")
 
+    def _destroy_webview_for_liveview(self):
+        """1:1 제어를 위해 WebView 완전 파괴 (GPU 리소스 해제)
+
+        stop_capture()는 about:blank + hide 만 하지만,
+        이 메서드는 WebView 객체 자체를 deleteLater()로 삭제한다.
+        레이아웃에서 WebView를 제거하고 status_label을 복원한다.
+        """
+        try:
+            self._is_active = False
+            self._is_paused = False
+            self._stream_status = "idle"
+            self._update_name_label()
+
+            if self._webview:
+                # 1) WebRTC 연결 해제
+                try:
+                    self._webview.setUrl(QUrl("about:blank"))
+                except Exception:
+                    pass
+
+                # 2) 레이아웃에서 WebView → status_label 교체
+                layout = self.layout()
+                if layout:
+                    layout.replaceWidget(self._webview, self.status_label)
+
+                # 3) WebView 완전 삭제
+                try:
+                    self._webview.hide()
+                    self._webview.setParent(None)
+                    self._webview.deleteLater()
+                except Exception:
+                    pass
+                self._webview = None
+
+            self.status_label.setText("1:1 제어 중...")
+            self.status_label.show()
+            self._update_status_display()
+        except Exception as e:
+            print(f"[Thumbnail] _destroy_webview_for_liveview 오류: {e}")
+
     def pause_capture(self):
         """미리보기 일시정지 (WebView 숨기기만, URL 유지)"""
         try:
@@ -5728,11 +5768,12 @@ class MainWindow(QMainWindow):
     """
 
     def _stop_all_previews_for_liveview(self):
-        """1:1 제어 시작 전 모든 썸네일 미리보기 일시정지
+        """1:1 제어 시작 전 모든 썸네일 WebView 완전 파괴
 
-        about:blank 전환 대신 pause_capture(hide) + WebRTC 트랙 비활성화.
-        about:blank로 전환하면 Chromium 렌더 프로세스 정리 중
-        새 WebEngine 생성 시 access violation 발생하므로 안전한 방법 사용.
+        v1.10.31: pause가 아닌 완전 파괴 방식으로 변경.
+        16개 썸네일 WebView가 메모리에 남아있으면 LiveView WebView 생성 시
+        GPU 리소스 충돌로 access violation 발생 (frozen EXE 환경).
+        WebView를 완전히 삭제하여 GPU 리소스를 확보한 후 LiveView를 시작한다.
         """
         all_tabs = []
         if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
@@ -5740,40 +5781,42 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'group_grid_tabs'):
             all_tabs.extend(self.group_grid_tabs.values())
 
-        paused = 0
+        destroyed = 0
         for tab in all_tabs:
             for thumb in tab.thumbnails:
                 try:
-                    thumb.pause_capture()
-                    # WebRTC 비디오 트랙 비활성화 (GPU 디코딩 중지)
-                    if thumb._webview:
-                        thumb._webview.page().runJavaScript(self._PAUSE_WEBRTC_JS)
-                    paused += 1
-                except Exception:
-                    pass
-        print(f"[MainWindow] 1:1 제어 시작 — 모든 썸네일 일시정지 ({paused}개, WebRTC 트랙 비활성화)")
+                    thumb._destroy_webview_for_liveview()
+                    destroyed += 1
+                except Exception as e:
+                    print(f"[MainWindow] 썸네일 파괴 오류: {e}")
+
+        # deleteLater() 완료 대기 — GPU 리소스 완전 해제 보장
+        QApplication.processEvents()
+        QApplication.processEvents()
+        print(f"[MainWindow] 1:1 제어 시작 — 모든 썸네일 WebView 파괴 ({destroyed}개)")
 
     def _resume_all_previews_after_liveview(self):
-        """1:1 제어 종료 후 활성 탭의 썸네일 미리보기 재시작"""
+        """1:1 제어 종료 후 활성 탭의 썸네일 WebView 재생성 + 미리보기 재시작"""
+        # LiveView WebView 정리 대기
+        QApplication.processEvents()
+        QApplication.processEvents()
+
         all_tabs = []
         if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
             all_tabs.append(self.grid_view_tab)
         if hasattr(self, 'group_grid_tabs'):
             all_tabs.extend(self.group_grid_tabs.values())
 
-        resumed = 0
+        restarted = 0
         for tab in all_tabs:
             if tab._is_visible and tab._live_preview_enabled:
                 for thumb in tab.thumbnails:
                     try:
-                        # WebRTC 트랙 재활성화 + WebView 표시
-                        if thumb._webview and thumb._is_paused:
-                            thumb._webview.page().runJavaScript(self._RESUME_WEBRTC_JS)
-                        thumb.resume_capture()
-                        resumed += 1
-                    except Exception:
-                        pass
-        print(f"[MainWindow] 1:1 제어 종료 — 썸네일 재개 ({resumed}개)")
+                        thumb.start_capture()
+                        restarted += 1
+                    except Exception as e:
+                        print(f"[MainWindow] 썸네일 재시작 오류: {e}")
+        print(f"[MainWindow] 1:1 제어 종료 — 썸네일 WebView 재생성 ({restarted}개)")
 
     def _stop_device_preview(self, device: KVMDevice):
         """특정 장치의 미리보기 중지 (전체 탭 + 그룹 탭 모두 처리)"""
