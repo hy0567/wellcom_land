@@ -2765,26 +2765,105 @@ class LiveViewDialog(QDialog):
         릴레이 접속(Tailscale IP)인 경우 WebRTC ICE candidate 패치 스크립트를
         UserScript로 주입하여 미디어 스트림이 릴레이를 통과하도록 함.
 
-        GPU 크래시 방어: URL 로드 직전에 플래그 파일을 생성하여,
-        로드 중 프로세스가 죽어도 다음 실행에서 소프트웨어 렌더링으로 전환.
+        v1.10.32: 관제 PC에서 다른 서브넷(192.168.1.x) 장치 접속 시
+        로컬 릴레이(127.0.0.1:18xxx)를 통해 접속하여 WebRTC 안정성 확보.
+        다른 서브넷 직접 접속 시 WebRTC UDP 미디어 경로 문제로 access violation 발생.
         """
         web_port = self.device.info.web_port if hasattr(self.device.info, 'web_port') else 80
-        url = f"http://{self.device.ip}:{web_port}"
-        print(f"[LiveView] URL 로드: {url}")
+        device_ip = self.device.ip
 
         # GPU 크래시 방어: URL 로드 전 플래그 생성
-        # 페이지 로드 성공 시 _on_page_loaded에서 제거
         self._set_gpu_loading_flag(True)
 
         # 릴레이 접속 감지 (Tailscale IP로 접속하는 경우)
-        relay_ip = self.device.ip
-        is_relay = relay_ip.startswith('100.')
+        is_tailscale_relay = device_ip.startswith('100.')
 
-        if is_relay:
-            self._inject_ice_patch(relay_ip, web_port)
+        # v1.10.32: 관제 PC에서 다른 서브넷 장치 접속 시 로컬 릴레이 사용
+        # 192.168.1.x 장치에 직접 접속하면 WebRTC UDP 경로 문제로 크래시 발생
+        use_local_relay = False
+        local_relay_port = None
+        if not is_tailscale_relay and not device_ip.startswith('127.'):
+            use_local_relay, local_relay_port = self._check_local_relay(device_ip, web_port)
+
+        if use_local_relay and local_relay_port:
+            url = f"http://127.0.0.1:{local_relay_port}"
+            print(f"[LiveView] URL 로드 (로컬 릴레이): {url} ← {device_ip}:{web_port}")
+            # 로컬 릴레이도 ICE 패치 필요 (KVM의 원본 IP가 ICE candidate에 포함)
+            self._inject_ice_patch('127.0.0.1', local_relay_port)
+            print(f"[LiveView] 로컬 릴레이 ICE 패치 주입 완료")
+        elif is_tailscale_relay:
+            url = f"http://{device_ip}:{web_port}"
+            print(f"[LiveView] URL 로드 (Tailscale 릴레이): {url}")
+            self._inject_ice_patch(device_ip, web_port)
             print(f"[LiveView] 릴레이 접속 — ICE 패치 주입 완료")
+        else:
+            url = f"http://{device_ip}:{web_port}"
+            print(f"[LiveView] URL 로드 (직접): {url}")
 
         self.web_view.setUrl(QUrl(url))
+
+    def _check_local_relay(self, device_ip: str, web_port: int):
+        """관제 PC에서 다른 서브넷 장치에 대한 로컬 릴레이 존재 여부 확인
+
+        Returns: (use_relay: bool, relay_port: int or None)
+        """
+        try:
+            import socket
+
+            # 내 로컬 서브넷 확인
+            local_subnets = set()
+            try:
+                hostname = socket.gethostname()
+                for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                    ip = info[4][0]
+                    if not ip.startswith('100.') and not ip.startswith('127.'):
+                        parts = ip.split('.')
+                        if len(parts) == 4:
+                            local_subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+            except Exception:
+                pass
+
+            # 장치가 같은 서브넷이면 릴레이 불필요
+            device_parts = device_ip.split('.')
+            if len(device_parts) == 4:
+                device_subnet = f"{device_parts[0]}.{device_parts[1]}.{device_parts[2]}"
+                if device_subnet in local_subnets:
+                    return False, None
+
+            # 다른 서브넷 → 로컬 릴레이 포트 계산 (KVMRelayManager 공식)
+            last_octet = int(device_parts[-1])
+            if web_port == 80:
+                relay_port = 18000 + last_octet
+            else:
+                relay_port = 19000 + last_octet
+
+            # 릴레이가 실제로 열려있는지 확인
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.settimeout(0.5)
+            try:
+                test_sock.connect(('127.0.0.1', relay_port))
+                test_sock.close()
+                print(f"[LiveView] 로컬 릴레이 발견: 127.0.0.1:{relay_port} ← {device_ip}:{web_port}")
+                return True, relay_port
+            except (ConnectionRefusedError, OSError):
+                test_sock.close()
+                # 포트 충돌 시 +1000 offset 시도
+                for offset in [1000, 2000]:
+                    try:
+                        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        test_sock.settimeout(0.5)
+                        test_sock.connect(('127.0.0.1', relay_port + offset))
+                        test_sock.close()
+                        print(f"[LiveView] 로컬 릴레이 발견 (offset): 127.0.0.1:{relay_port + offset} ← {device_ip}:{web_port}")
+                        return True, relay_port + offset
+                    except (ConnectionRefusedError, OSError):
+                        test_sock.close()
+                print(f"[LiveView] 로컬 릴레이 없음: {device_ip}:{web_port} (다른 서브넷, 직접 접속)")
+                return False, None
+
+        except Exception as e:
+            print(f"[LiveView] 로컬 릴레이 확인 실패: {e}")
+            return False, None
 
     def _set_gpu_loading_flag(self, create: bool):
         """GPU 크래시 감지용 플래그 파일 관리
