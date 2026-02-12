@@ -2788,9 +2788,10 @@ class LiveViewDialog(QDialog):
         if use_local_relay and local_relay_port:
             url = f"http://127.0.0.1:{local_relay_port}"
             print(f"[LiveView] URL 로드 (로컬 릴레이): {url} ← {device_ip}:{web_port}")
-            # 로컬 릴레이도 ICE 패치 필요 (KVM의 원본 IP가 ICE candidate에 포함)
-            self._inject_ice_patch('127.0.0.1', local_relay_port)
-            print(f"[LiveView] 로컬 릴레이 ICE 패치 주입 완료")
+            # 로컬 릴레이: HTTP signaling만 릴레이, WebRTC UDP는 KVM과 직접 통신
+            # ICE 패치 주입하지 않음 — KVM의 원본 IP(192.168.1.x)가 ICE candidate에
+            # 그대로 사용되어 브라우저가 직접 UDP 연결 (관제 PC는 라우팅으로 도달 가능)
+            print(f"[LiveView] 로컬 릴레이 — ICE 패치 없음 (UDP 직접 통신)")
         elif is_tailscale_relay:
             url = f"http://{device_ip}:{web_port}"
             print(f"[LiveView] URL 로드 (Tailscale 릴레이): {url}")
