@@ -115,17 +115,7 @@ if _is_frozen:
     _chromium_flags.append('--disable-gpu-sandbox')
     _chromium_flags.append('--disable-gpu-shader-disk-cache')
     _chromium_flags.append('--disable-gpu-program-cache')
-    # v1.10.35: GPU 안정화 — ANGLE D3D11 명시 + GPU 래스터화 비활성화
-    # --disable-accelerated-video-decode는 frozen에서 비디오 자체가 안 보임 (코덱 DLL 누락)
-    # 대신 GPU 래스터화만 비활성화하고, GL 백엔드를 D3D11로 명시하여 안정화
-    # --disable-gpu-rasterization: GPU 래스터화 비활성화 (CPU 래스터화 사용)
-    # --use-gl=angle --use-angle=d3d11: ANGLE D3D11 백엔드 명시 (기본값이지만 명시적 지정)
-    # --disable-features=D3D11VideoDecoder: Windows D3D11 비디오 디코더 비활성화, DXVA 사용
-    _chromium_flags.append('--disable-gpu-rasterization')
-    _chromium_flags.append('--use-gl=angle')
-    _chromium_flags.append('--use-angle=d3d11')
-    _chromium_flags.append('--disable-features=D3D11VideoDecoder')
-    print(f"[GPU] frozen 환경 — 샌드박스 비활성화 + GPU 안정화 (D3D11, 래스터화 off)")
+    print(f"[GPU] frozen 환경 — 샌드박스 비활성화 (PyInstaller 호환)")
 
     # frozen 환경에서는 gpu_crash 플래그 무조건 삭제
     # GPU 크래시 시 renderProcessTerminated로 자동 복구하므로 SwiftShader 불필요

@@ -5658,24 +5658,32 @@ class MainWindow(QMainWindow):
             return
 
         # 1:1 제어 시작 전: 모든 썸네일 미리보기 중지 (GPU 부하 경감)
-        # 16개 WebEngine 썸네일 + 1개 LiveView = GPU 과부하 → 크래시 원인
         self._live_control_device = self.current_device.name
         self._stop_all_previews_for_liveview()
 
-        # 다이얼로그 생성 (URL은 __init__에서 로드)
+        # v1.10.36: dialog.exec() 대신 show()로 비동기 실행
+        # exec()는 네스티드 이벤트 루프를 생성하여 Chromium GPU 서브프로세스 크래시 시
+        # access violation이 메인 프로세스로 전파됨.
+        # show()는 메인 이벤트 루프에서 처리되어 renderProcessTerminated로 안전하게 복구.
         try:
-            dialog = LiveViewDialog(self.current_device, self)
-            dialog.exec()
+            self._live_dialog = LiveViewDialog(self.current_device, self)
+            self._live_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            self._live_dialog.finished.connect(self._on_live_dialog_closed)
+            self._live_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            self._live_dialog.show()
         except Exception as e:
-            print(f"[LiveView] 크래시: {e}")
+            print(f"[LiveView] 생성 오류: {e}")
             import traceback
             traceback.print_exc()
-            QMessageBox.critical(self, "LiveView 오류", f"LiveView 실행 중 오류:\n{e}")
-            return
-        finally:
-            # WebView deleteLater() 완료 대기 (이전 WebEngine 정리)
-            # 두 번째 LiveView 열 때 이전 WebEngine과 충돌 방지
-            QApplication.processEvents()
+            self._live_control_device = None
+            self._resume_all_previews_after_liveview()
+
+    def _on_live_dialog_closed(self):
+        """LiveView 다이얼로그 종료 후 정리 (비동기 콜백)"""
+        dialog = getattr(self, '_live_dialog', None)
+
+        # WebView deleteLater() 완료 대기
+        QApplication.processEvents()
 
         # 1:1 제어 종료 — 플래그 해제 + 메인 윈도우 활성화
         self._live_control_device = None
@@ -5683,11 +5691,13 @@ class MainWindow(QMainWindow):
         self.raise_()
 
         # 부분제어로 닫힌 경우 → 미리보기 재시작 하지 않음 (탭 전환에서 처리)
-        if getattr(dialog, '_partial_control_closing', False):
+        if dialog and getattr(dialog, '_partial_control_closing', False):
+            self._live_dialog = None
             return
 
         # 1:1 제어 종료 후: 모든 썸네일 미리보기 재시작
         self._resume_all_previews_after_liveview()
+        self._live_dialog = None
 
     def _apply_partial_crop(self, group: str, region: tuple):
         """부분제어 — 해당 그룹 탭으로 전환하고 크롭 적용
