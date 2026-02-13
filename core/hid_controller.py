@@ -1,5 +1,6 @@
 """
 고속 HID 컨트롤러 - 지속적인 SSH 채널 사용
+자동 재연결 + 명령 큐 크기 제한
 """
 
 import paramiko
@@ -28,6 +29,8 @@ class FastHIDController:
         'up': 0x52, 'down': 0x51, 'left': 0x50, 'right': 0x4F,
     }
 
+    MAX_QUEUE_SIZE = 200  # 명령 큐 최대 크기
+
     def __init__(self, ip: str, port: int = 22, username: str = "root", password: str = "luckfox"):
         self.ip = ip
         self.port = port
@@ -39,10 +42,15 @@ class FastHIDController:
         self._connected = False
         self._lock = threading.Lock()
 
-        # 명령 큐 (비동기 전송용)
-        self._cmd_queue = queue.Queue()
+        # 명령 큐 (비동기 전송용) — 크기 제한
+        self._cmd_queue = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
         self._worker_thread: Optional[threading.Thread] = None
         self._running = False
+
+        # 자동 재연결
+        self._reconnect_attempts = 0
+        self._max_reconnect = 5
+        self._reconnecting = False
 
     def connect(self) -> bool:
         """SSH 연결 및 쉘 채널 열기"""
@@ -71,12 +79,15 @@ class FastHIDController:
                     self.shell.recv(4096)
 
                 self._connected = True
+                self._reconnect_attempts = 0  # 성공 시 리셋
 
-                # 워커 스레드 시작
-                self._running = True
-                self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-                self._worker_thread.start()
+                # 워커 스레드 시작 (이미 실행 중이면 스킵)
+                if not self._running:
+                    self._running = True
+                    self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+                    self._worker_thread.start()
 
+                print(f"[HID] 연결 성공: {self.ip}:{self.port}")
                 return True
 
         except Exception as e:
@@ -84,18 +95,82 @@ class FastHIDController:
             self._connected = False
             return False
 
+    def _reconnect(self):
+        """자동 재연결 시도"""
+        if self._reconnecting or not self._running:
+            return False
+
+        self._reconnecting = True
+        try:
+            # 기존 연결 정리
+            try:
+                if self.shell:
+                    self.shell.close()
+            except Exception:
+                pass
+            try:
+                if self.ssh:
+                    self.ssh.close()
+            except Exception:
+                pass
+            self.shell = None
+            self.ssh = None
+            self._connected = False
+
+            while self._reconnect_attempts < self._max_reconnect and self._running:
+                self._reconnect_attempts += 1
+                delay = min(1.0 * self._reconnect_attempts, 5.0)
+                print(f"[HID] 재연결 시도 {self._reconnect_attempts}/{self._max_reconnect} ({delay:.0f}초 후)")
+                time.sleep(delay)
+
+                if not self._running:
+                    break
+
+                try:
+                    self.ssh = paramiko.SSHClient()
+                    self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    self.ssh.connect(
+                        self.ip, port=self.port,
+                        username=self.username, password=self.password,
+                        timeout=5
+                    )
+                    self.shell = self.ssh.invoke_shell()
+                    self.shell.settimeout(0.1)
+                    time.sleep(0.1)
+                    while self.shell.recv_ready():
+                        self.shell.recv(4096)
+
+                    self._connected = True
+                    self._reconnect_attempts = 0
+                    print(f"[HID] 재연결 성공: {self.ip}")
+                    return True
+                except Exception as e:
+                    print(f"[HID] 재연결 실패: {e}")
+
+            if self._reconnect_attempts >= self._max_reconnect:
+                print(f"[HID] 최대 재연결 횟수 초과 ({self._max_reconnect}회)")
+            return False
+        finally:
+            self._reconnecting = False
+
     def disconnect(self):
         """연결 종료"""
         self._running = False
         if self._worker_thread:
-            self._worker_thread.join(timeout=1)
+            self._worker_thread.join(timeout=2)
 
         with self._lock:
             if self.shell:
-                self.shell.close()
+                try:
+                    self.shell.close()
+                except Exception:
+                    pass
                 self.shell = None
             if self.ssh:
-                self.ssh.close()
+                try:
+                    self.ssh.close()
+                except Exception:
+                    pass
                 self.ssh = None
             self._connected = False
 
@@ -114,8 +189,13 @@ class FastHIDController:
                 print(f"[HID] Worker error: {e}")
 
     def _send_raw(self, cmd: str):
-        """쉘을 통해 명령 전송"""
+        """쉘을 통해 명령 전송 — 실패 시 자동 재연결"""
         if not self._connected or not self.shell:
+            # 재연결 시도
+            if self._running and not self._reconnecting:
+                if self._reconnect():
+                    # 재연결 성공 → 명령 재전송
+                    return self._send_raw(cmd)
             return
 
         try:
@@ -127,6 +207,7 @@ class FastHIDController:
         except Exception as e:
             print(f"[HID] Send error: {e}")
             self._connected = False
+            # 워커 루프에서 다음 명령 시 자동 재연결 시도
 
     def _bytes_to_hex(self, data: bytes) -> str:
         """바이트를 16진수 문자열로 변환"""
@@ -139,7 +220,7 @@ class FastHIDController:
 
         report = struct.pack('Bbb', buttons, dx, dy)
         cmd = f"echo -ne '{self._bytes_to_hex(report)}' > /dev/hidg2"
-        self._cmd_queue.put(cmd)
+        self._enqueue(cmd)
 
     def send_mouse_click(self, button: str = 'left'):
         """마우스 클릭"""
@@ -149,12 +230,12 @@ class FastHIDController:
         # 버튼 누름
         report_down = struct.pack('Bbb', btn, 0, 0)
         cmd_down = f"echo -ne '{self._bytes_to_hex(report_down)}' > /dev/hidg2"
-        self._cmd_queue.put(cmd_down)
+        self._enqueue(cmd_down)
 
         # 버튼 놓음
         report_up = struct.pack('Bbb', 0, 0, 0)
         cmd_up = f"echo -ne '{self._bytes_to_hex(report_up)}' > /dev/hidg2"
-        self._cmd_queue.put(cmd_up)
+        self._enqueue(cmd_up)
 
     def send_key(self, key: str, modifiers: int = 0):
         """키 입력"""
@@ -165,29 +246,49 @@ class FastHIDController:
         # 키 누름
         report_down = struct.pack('BBBBBBBB', modifiers, 0, key_code, 0, 0, 0, 0, 0)
         cmd_down = f"echo -ne '{self._bytes_to_hex(report_down)}' > /dev/hidg0"
-        self._cmd_queue.put(cmd_down)
+        self._enqueue(cmd_down)
 
         # 키 놓음
         report_up = struct.pack('BBBBBBBB', 0, 0, 0, 0, 0, 0, 0, 0)
         cmd_up = f"echo -ne '{self._bytes_to_hex(report_up)}' > /dev/hidg0"
-        self._cmd_queue.put(cmd_up)
+        self._enqueue(cmd_up)
 
     def send_hid_code(self, hid_code: int, modifiers: int = 0):
         """HID 키코드 직접 전송 (KEY_CODES 매핑 없이)"""
         # 키 누름
         report_down = struct.pack('BBBBBBBB', modifiers, 0, hid_code, 0, 0, 0, 0, 0)
         cmd_down = f"echo -ne '{self._bytes_to_hex(report_down)}' > /dev/hidg0"
-        self._cmd_queue.put(cmd_down)
+        self._enqueue(cmd_down)
 
         # 키 놓음
         report_up = struct.pack('BBBBBBBB', 0, 0, 0, 0, 0, 0, 0, 0)
         cmd_up = f"echo -ne '{self._bytes_to_hex(report_up)}' > /dev/hidg0"
-        self._cmd_queue.put(cmd_up)
+        self._enqueue(cmd_up)
+
+    def _enqueue(self, cmd: str):
+        """명령을 큐에 추가 — 큐가 가득 차면 오래된 명령 버림"""
+        try:
+            self._cmd_queue.put_nowait(cmd)
+        except queue.Full:
+            # 큐 가득 참 → 오래된 마우스 이동 명령 절반 버리고 새 명령 추가
+            dropped = 0
+            try:
+                for _ in range(self.MAX_QUEUE_SIZE // 2):
+                    self._cmd_queue.get_nowait()
+                    dropped += 1
+            except queue.Empty:
+                pass
+            if dropped > 0:
+                print(f"[HID] 큐 오버플로 → {dropped}개 명령 폐기")
+            try:
+                self._cmd_queue.put_nowait(cmd)
+            except queue.Full:
+                pass
 
     def flush(self):
         """큐 비우기"""
         while not self._cmd_queue.empty():
             try:
                 self._cmd_queue.get_nowait()
-            except:
+            except queue.Empty:
                 break

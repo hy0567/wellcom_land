@@ -83,7 +83,7 @@ class LoginDialog(QDialog):
         title.setFont(title_font)
         layout.addWidget(title)
 
-        subtitle = QLabel("다중 KVM 장치 관리 솔루션")
+        subtitle = QLabel("지리는 KVM 가주왕")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet("color: #666;")
         layout.addWidget(subtitle)

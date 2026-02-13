@@ -104,40 +104,84 @@ try:
 except Exception:
     pass
 
+# v1.10.41: frozen 환경에서 Chromium 캐시/GPU 캐시 자동 정리
+# v1.10.39에서 SwiftShader abort로 Chromium 상태 파일이 손상될 수 있음
+if _is_frozen:
+    _chromium_cache_dirs = [
+        os.path.join(_app_dir, "QtWebEngine"),
+        os.path.join(_app_dir, "data", "QtWebEngine"),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), "WellcomLAND", "QtWebEngine"),
+    ]
+    for _cache_dir in _chromium_cache_dirs:
+        if os.path.isdir(_cache_dir):
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(_cache_dir, ignore_errors=True)
+                print(f"[GPU] Chromium 캐시 정리: {_cache_dir}")
+            except Exception:
+                pass
+
 # Chromium 플래그 구성
 _chromium_flags = ['--autoplay-policy=no-user-gesture-required']
 
 if _is_frozen:
     # EXE(frozen) 환경: PyInstaller 패키징 + Chromium 호환성
     _chromium_flags.append('--no-sandbox')
-    _chromium_flags.append('--disable-gpu-sandbox')
     _chromium_flags.append('--disable-gpu-shader-disk-cache')
     _chromium_flags.append('--disable-gpu-program-cache')
 
-    # v1.10.37: 원격 데스크톱 세션 감지 → GPU 비활성화
-    # 원격(Chrome Remote Desktop, RDP 등)에서는 가상 GPU 드라이버 사용
-    # → Chromium GPU 비디오 디코딩 시 access violation 발생
-    # GetSystemMetrics(SM_REMOTESESSION) = 0x1000 → 원격 세션
+    # v1.10.55: v1.10.42 수준으로 복원 — 추가 GPU 플래그 없음
+    # ─────────────────────────────────────────────────────────
+    # v1.10.52~54에서 추가했던 플래그들이 WebRTC ICE negotiation을 방해:
+    #   --disable-gpu-rasterization → 제거
+    #   --disable-accelerated-video-decode → 제거
+    #   --disable-features=D3D11VideoDecoder,MediaFoundationVP8Decoding → 제거
+    #   --disable-gpu-watchdog → 제거
+    #
+    # v1.10.54 진단 결과:
+    #   - WS 연결 성공 (WELLCOM_WS_OPEN)
+    #   - RTCPeerConnection 생성 성공 (WELLCOM_RTC_CREATED)
+    #   - 하지만 CONNECTED/TRACK 이벤트 없음 → ICE negotiation 실패
+    #   - 위 플래그들이 Chromium WebRTC 미디어 파이프라인을 방해한 것으로 판단
+    #
+    # v1.10.55 전략: v1.10.42 설정 + GPU 서브프로세스 격리
+    #   - GPU 활성 (기본값) + 추가 제한 없음 → WebRTC 정상 동작
+    #   - --disable-gpu-sandbox 복원: PyInstaller 환경에서 GPU 샌드박스 호환성
+    #   - 크래시 시: renderProcessTerminated → 자동 재연결 (5회, 백오프)
+    #   - StatusThread 일시정지: LiveView 중 GPU 렌더링 경합 방지
+    # ─────────────────────────────────────────────────────────
+    _chromium_flags.append('--disable-gpu-sandbox')
+    print(f"[GPU] frozen 환경 — v1.10.42 수준 복원 (추가 GPU 제한 없음, v1.10.55)")
+
+    # 원격 세션 감지 (로깅 목적)
     _is_remote_session = False
+    _remote_method = ""
     try:
         import ctypes
         SM_REMOTESESSION = 0x1000
-        _is_remote_session = bool(ctypes.windll.user32.GetSystemMetrics(SM_REMOTESESSION))
+        if ctypes.windll.user32.GetSystemMetrics(SM_REMOTESESSION):
+            _is_remote_session = True
+            _remote_method = "Windows RDP"
     except Exception:
         pass
-
+    if not _is_remote_session:
+        try:
+            import subprocess as _sp
+            _tasklist = _sp.check_output(
+                'tasklist /FI "IMAGENAME eq remoting_host.exe" /NH',
+                shell=True, timeout=3, stderr=_sp.DEVNULL
+            ).decode('utf-8', errors='replace')
+            if 'remoting_host.exe' in _tasklist.lower():
+                _is_remote_session = True
+                _remote_method = "Chrome Remote Desktop"
+        except Exception:
+            pass
     if _is_remote_session:
-        # 원격 세션: GPU 완전 비활성화 (소프트웨어 렌더링)
-        # --disable-gpu: Chromium GPU 프로세스 비활성화
-        # --disable-accelerated-video-decode: 비디오 HW 디코딩 비활성화
-        # AA_UseSoftwareOpenGL 대신 Chromium 플래그로 처리 (SwiftShader 미사용)
-        _chromium_flags.append('--disable-gpu')
-        print(f"[GPU] frozen + 원격 세션 감지 — GPU 완전 비활성화 (소프트웨어 렌더링)")
+        print(f"[GPU] 원격 세션 감지: {_remote_method}")
     else:
-        print(f"[GPU] frozen + 로컬 세션 — GPU 활성화 (하드웨어 가속)")
+        print(f"[GPU] 로컬 세션")
 
     # frozen 환경에서는 gpu_crash 플래그 무조건 삭제
-    # GPU 크래시 시 renderProcessTerminated로 자동 복구하므로 SwiftShader 불필요
     if _had_gpu_crash:
         _flag_reason = "플래그 존재"
         try:
@@ -148,7 +192,7 @@ if _is_frozen:
         print(f"[GPU] 이전 크래시 플래그 감지 (무시): {_flag_reason}")
         try:
             os.remove(_gpu_crash_flag)
-            print(f"[GPU] 크래시 플래그 삭제 (GPU 서브프로세스 크래시 격리)")
+            print(f"[GPU] 크래시 플래그 삭제")
         except Exception:
             pass
         _had_gpu_crash = False  # SwiftShader 적용 방지
@@ -310,10 +354,17 @@ def main():
         print(f"[App] 아이콘 적용: {ICON_PATH}")
 
     # GPU 모드 설정
-    if _had_gpu_crash or _force_software:
+    # v1.10.52: frozen 환경에서 AA_UseSoftwareOpenGL 사용 금지!
+    #   - AA_UseSoftwareOpenGL → Mesa opengl32sw.dll 강제 → WebRTC 미디어 파이프라인 차단
+    #   - v1.10.49~51에서 확인: AA_UseSoftwareOpenGL 활성 시 rtc_count:0 (연결 시도조차 안 함)
+    #   - GPU + 하드웨어 GL이 WebRTC에 필수 → AA_UseSoftwareOpenGL 비활성화
+    #   - GPU 크래시는 서브프로세스 격리 + renderProcessTerminated로 자동 복구
+    if _is_frozen:
+        # AA_UseSoftwareOpenGL 사용하지 않음 — WebRTC 연결을 위해 하드웨어 GL 필수
+        print("[GPU] 하드웨어 OpenGL 유지 (frozen — WebRTC 필수, v1.10.52)")
+    elif _had_gpu_crash or _force_software:
         app.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
-        print("[GPU] 소프트웨어 OpenGL 활성화")
-    # else: Qt 기본값 사용 (강제 GPU 비활성화하지 않음)
+        print("[GPU] 소프트웨어 OpenGL 활성화 (크래시/설정)")
 
     # 네트워크 우선순위 자동 조정 (Tailscale/APIPA가 기본인 경우)
     try:
@@ -418,69 +469,15 @@ def main():
     except Exception as e:
         print(f"[Relay] KVM 릴레이 초기화 실패 (무시): {e}")
 
-    # MCP 디버그 서버 시작 (mcp 패키지 미설치 시 자동 비활성화)
-    def _mcp_log(msg):
-        """MCP 로그를 파일에 기록 (EXE에서 print가 안 보일 수 있으므로)"""
-        print(msg)
-        try:
-            mcp_log_path = os.path.join(os.environ.get('WELLCOMLAND_BASE_DIR', '.'), 'logs', 'mcp_debug.log')
-            os.makedirs(os.path.dirname(mcp_log_path), exist_ok=True)
-            with open(mcp_log_path, 'a', encoding='utf-8') as f:
-                import time as _t
-                f.write(f"[{_t.strftime('%H:%M:%S')}] {msg}\n")
-        except Exception:
-            pass
-
-    _mcp_log("[MCP] === MCP 서버 초기화 시작 ===")
-    _mcp_log(f"[MCP] frozen={getattr(sys, 'frozen', False)}, python={sys.version}")
-
+    # 원격 디버그 HTTP 서버 시작 (순수 stdlib — 외부 패키지 불필요)
+    # Tailscale IP로 원격 접근: http://<Tailscale_IP>:5111/
     try:
-        # EXE 환경에서 시스템 Python 패키지 접근
-        if getattr(sys, 'frozen', False):
-            import glob
-            added_paths = []
-            for pattern in [
-                os.path.expandvars(r'%LOCALAPPDATA%\Python\*\Lib\site-packages'),
-                os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\*\Lib\site-packages'),
-            ]:
-                for sp in glob.glob(pattern):
-                    if sp not in sys.path:
-                        sys.path.insert(0, sp)
-                        added_paths.append(sp)
-                    # pywin32 네이티브 DLL 경로 (pywintypes 등)
-                    for sub in ['pywin32_system32', 'win32', 'win32\\lib']:
-                        dll_dir = os.path.join(sp, sub)
-                        if os.path.isdir(dll_dir):
-                            if dll_dir not in sys.path:
-                                sys.path.insert(0, dll_dir)
-                            os.environ['PATH'] = dll_dir + ';' + os.environ.get('PATH', '')
-            for pattern in [
-                os.path.expandvars(r'%LOCALAPPDATA%\Python\*\Lib'),
-                os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\*\Lib'),
-            ]:
-                for sp in glob.glob(pattern):
-                    if sp not in sys.path and os.path.isdir(sp):
-                        sys.path.insert(0, sp)
-                        added_paths.append(sp)
-            _mcp_log(f"[MCP] 시스템 Python 경로 추가: {added_paths}")
-        else:
-            _mcp_log("[MCP] 개발 환경 (non-frozen)")
-
-        _mcp_log("[MCP] mcp_debug 모듈 import 시도...")
         from mcp_debug import start_server, install_log_capture
-        _mcp_log("[MCP] mcp_debug import 성공")
-
         install_log_capture()
-        _mcp_log("[MCP] 로그 캡처 설치 완료")
-
         start_server(window, port=5111)
-        _mcp_log("[MCP] 디버그 서버 시작: http://localhost:5111/sse")
-    except ImportError as e:
-        _mcp_log(f"[MCP] ImportError: {e}")
+        print(f"[Debug] 원격 디버그 서버 시작: http://0.0.0.0:5111/")
     except Exception as e:
-        _mcp_log(f"[MCP] 시작 실패: {e}")
-        import traceback
-        _mcp_log(traceback.format_exc())
+        print(f"[Debug] 디버그 서버 시작 실패 (무시): {e}")
 
     sys.exit(app.exec())
 

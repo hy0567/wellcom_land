@@ -1,6 +1,6 @@
 """
 WellcomLAND 관리자 패널
-사용자 관리 + 기기 관리 + 기기 할당
+사용자 관리 + 기기 관리 + 기기 할당 + MAC 수집
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QMessageBox, QDialog,
     QFormLayout, QLineEdit, QComboBox, QCheckBox,
     QDialogButtonBox, QListWidget, QListWidgetItem, QSpinBox,
+    QProgressDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -31,6 +32,112 @@ class LoadThread(QThread):
             self.load_failed.emit(str(e))
 
 
+class MACCollectThread(QThread):
+    """MAC 주소 수집 스레드 — 병렬 SSH 접속으로 MAC 수집 (10 워커)"""
+    progress = pyqtSignal(int, int, str)      # current, total, device_name
+    collect_done = pyqtSignal(int, int, int)   # success, failed, skipped
+    device_mac = pyqtSignal(int, str)          # device_id, mac_address
+
+    MAX_WORKERS = 10  # 병렬 SSH 워커 수
+
+    def __init__(self, devices: list):
+        super().__init__()
+        self._devices = devices
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def _collect_single(self, dev: dict) -> tuple:
+        """단일 장치 MAC 수집 (병렬 워커용)
+        Returns: (device_id, mac_or_none, error_or_none)
+        """
+        import paramiko
+        device_id = dev.get('id', 0)
+        ip = dev.get('ip', '')
+        name = dev.get('name', '')
+        ssh = None
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                ip,
+                port=dev.get('port', 22),
+                username=dev.get('username', 'root'),
+                password=dev.get('password', 'luckfox'),
+                timeout=5,
+                auth_timeout=5,
+            )
+            _, stdout, _ = ssh.exec_command("cat /sys/class/net/eth0/address 2>/dev/null")
+            mac = stdout.read().decode().strip().upper()
+            if mac and ':' in mac:
+                return device_id, mac, None
+            else:
+                return device_id, None, "invalid MAC"
+        except Exception as e:
+            return device_id, None, f"{name} ({ip}): {e}"
+        finally:
+            if ssh:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+
+    def run(self):
+        try:
+            import paramiko
+        except ImportError:
+            print("[MAC] paramiko 모듈이 없습니다")
+            self.collect_done.emit(0, 0, 0)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        success = 0
+        failed = 0
+        skipped = 0
+        total = len(self._devices)
+
+        # 수집 대상 필터 (이미 MAC 있으면 스킵)
+        targets = []
+        for dev in self._devices:
+            if dev.get('serial_id'):
+                skipped += 1
+            else:
+                targets.append(dev)
+
+        if not targets:
+            self.collect_done.emit(success, failed, skipped)
+            return
+
+        # 병렬 수집 (최대 10 워커)
+        workers = min(self.MAX_WORKERS, len(targets))
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self._collect_single, dev): dev for dev in targets}
+            for future in as_completed(futures):
+                if self._stopped:
+                    break
+                completed += 1
+                dev = futures[future]
+                self.progress.emit(skipped + completed, total, dev.get('name', ''))
+
+                try:
+                    device_id, mac, error = future.result(timeout=10)
+                    if mac:
+                        self.device_mac.emit(device_id, mac)
+                        success += 1
+                    else:
+                        if error:
+                            print(f"[MAC] 수집 실패: {error}")
+                        failed += 1
+                except Exception as e:
+                    print(f"[MAC] future 오류: {e}")
+                    failed += 1
+
+        self.collect_done.emit(success, failed, skipped)
+
+
 class AdminPanel(QWidget):
     """관리자 패널 (탭 위젯 내부)"""
 
@@ -42,6 +149,19 @@ class AdminPanel(QWidget):
         self._threads = []
         self._init_ui()
         self._load_all_data()
+
+    def _track_thread(self, thread: QThread):
+        """스레드를 추적 리스트에 추가하고, 완료 시 자동 제거"""
+        self._threads.append(thread)
+        thread.finished.connect(lambda: self._cleanup_thread(thread))
+
+    def _cleanup_thread(self, thread: QThread):
+        """완료된 스레드를 리스트에서 제거"""
+        try:
+            if thread in self._threads:
+                self._threads.remove(thread)
+        except Exception:
+            pass
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -69,9 +189,9 @@ class AdminPanel(QWidget):
         add_btn.clicked.connect(self._on_add_user)
         btn_layout.addWidget(add_btn)
 
-        refresh_btn = QPushButton("새로고침")
-        refresh_btn.clicked.connect(self._load_users)
-        btn_layout.addWidget(refresh_btn)
+        self.user_refresh_btn = QPushButton("새로고침")
+        self.user_refresh_btn.clicked.connect(self._load_users)
+        btn_layout.addWidget(self.user_refresh_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
@@ -89,11 +209,34 @@ class AdminPanel(QWidget):
         return tab
 
     def _load_users(self):
-        t = LoadThread(api_client.admin_get_users)
+        self.user_refresh_btn.setEnabled(False)
+        self.user_refresh_btn.setText("로딩 중...")
+
+        def fetch_users_with_count():
+            users = api_client.admin_get_users()
+            # 서버 응답에 device_count가 없으면 직접 조회
+            for user in users:
+                if user.get('device_count') is None:
+                    try:
+                        assigned = api_client.admin_get_user_devices(user['id'])
+                        user['device_count'] = len(assigned)
+                    except Exception:
+                        user['device_count'] = 0
+            return users
+
+        t = LoadThread(fetch_users_with_count)
         t.data_loaded.connect(self._on_users_loaded)
-        t.load_failed.connect(lambda e: print(f"[Admin] 사용자 로드 실패: {e}"))
-        self._threads.append(t)
+        t.load_failed.connect(lambda e: (
+            print(f"[Admin] 사용자 로드 실패: {e}"),
+            self._restore_user_refresh_btn()
+        ))
+        t.finished.connect(self._restore_user_refresh_btn)
+        self._track_thread(t)
         t.start()
+
+    def _restore_user_refresh_btn(self):
+        self.user_refresh_btn.setEnabled(True)
+        self.user_refresh_btn.setText("새로고침")
 
     def _on_users_loaded(self, users: list):
         self.user_table.setRowCount(len(users))
@@ -130,11 +273,19 @@ class AdminPanel(QWidget):
                     cloud_item.setForeground(Qt.GlobalColor.darkYellow)
             self.user_table.setItem(row, 5, cloud_item)
 
-            # 기기 할당 버튼 (할당 수 표시)
+            # 기기 할당 버튼 (할당 수 표시 + 색상 강조)
             device_count = user.get('device_count', 0)
             assign_btn = QPushButton(f"기기 할당 ({device_count})")
             if device_count == 0:
-                assign_btn.setStyleSheet("color: #888;")
+                assign_btn.setStyleSheet(
+                    "QPushButton { color: #888; border: 1px solid #ccc; padding: 2px 8px; }"
+                    "QPushButton:hover { background: #f0f0f0; }"
+                )
+            else:
+                assign_btn.setStyleSheet(
+                    "QPushButton { color: #2196F3; font-weight: bold; border: 1px solid #2196F3; padding: 2px 8px; }"
+                    "QPushButton:hover { background: #E3F2FD; }"
+                )
             assign_btn.clicked.connect(lambda checked, uid=user['id'], uname=user['username']: self._on_assign_devices(uid, uname))
             self.user_table.setCellWidget(row, 6, assign_btn)
 
@@ -217,14 +368,23 @@ class AdminPanel(QWidget):
         add_btn.clicked.connect(self._on_add_device)
         btn_layout.addWidget(add_btn)
 
-        sync_btn = QPushButton("🔄 로컬 기기 동기화")
+        sync_btn = QPushButton("로컬 기기 동기화")
         sync_btn.setToolTip("로컬에서 추가한 기기를 서버에 동기화합니다")
         sync_btn.clicked.connect(self._on_sync_local_devices)
         btn_layout.addWidget(sync_btn)
 
-        refresh_btn = QPushButton("새로고침")
-        refresh_btn.clicked.connect(self._load_devices)
-        btn_layout.addWidget(refresh_btn)
+        mac_btn = QPushButton("MAC 수집")
+        mac_btn.setToolTip("SSH로 각 기기에 접속하여 MAC 주소를 수집합니다")
+        mac_btn.setStyleSheet(
+            "QPushButton { color: #4CAF50; font-weight: bold; }"
+            "QPushButton:hover { background: #E8F5E9; }"
+        )
+        mac_btn.clicked.connect(self._on_collect_mac)
+        btn_layout.addWidget(mac_btn)
+
+        self.device_refresh_btn = QPushButton("새로고침")
+        self.device_refresh_btn.clicked.connect(self._load_devices)
+        btn_layout.addWidget(self.device_refresh_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
@@ -241,51 +401,100 @@ class AdminPanel(QWidget):
         return tab
 
     def _load_devices(self):
-        t = LoadThread(api_client.admin_get_all_devices)
+        self.device_refresh_btn.setEnabled(False)
+        self.device_refresh_btn.setText("로딩 중...")
+
+        # admin이면 전체 기기, 아니면 내 기기 목록 사용
+        def _fetch_devices():
+            if api_client.is_admin:
+                return api_client.admin_get_all_devices()
+            else:
+                return api_client.get_my_devices()
+
+        t = LoadThread(_fetch_devices)
         t.data_loaded.connect(self._on_devices_loaded)
-        t.load_failed.connect(lambda e: print(f"[Admin] 기기 로드 실패: {e}"))
-        self._threads.append(t)
+        t.load_failed.connect(self._on_devices_load_failed)
+        t.finished.connect(self._restore_device_refresh_btn)
+        self._track_thread(t)
         t.start()
 
+    def _on_devices_load_failed(self, error: str):
+        print(f"[Admin] 기기 로드 실패: {error}")
+        self._restore_device_refresh_btn()
+        # 테이블에 에러 상태 표시
+        self.device_table.setRowCount(1)
+        error_item = QTableWidgetItem(f"기기 목록 로드 실패: {error}")
+        error_item.setForeground(Qt.GlobalColor.red)
+        self.device_table.setItem(0, 0, error_item)
+        self.device_table.setSpan(0, 0, 1, 8)
+
+    def _restore_device_refresh_btn(self):
+        self.device_refresh_btn.setEnabled(True)
+        self.device_refresh_btn.setText("새로고침")
+
     def _on_devices_loaded(self, devices: list):
-        self.device_table.setRowCount(len(devices))
         self._devices = devices
 
-        for row, dev in enumerate(devices):
-            self.device_table.setItem(row, 0, QTableWidgetItem(str(dev['id'])))
-            self.device_table.setItem(row, 1, QTableWidgetItem(dev['name']))
-            self.device_table.setItem(row, 2, QTableWidgetItem(dev['ip']))
+        # 로컬 DB에서 MAC 주소 보충 (서버에 serial_id가 없을 경우)
+        local_macs = {}
+        try:
+            from core.database import Database
+            db = Database()
+            for ld in db.get_all_devices():
+                if ld.get('mac_address'):
+                    local_macs[ld['name']] = ld['mac_address']
+        except Exception as e:
+            print(f"[Admin] 로컬 MAC 조회 실패: {e}")
 
-            mac = dev.get('serial_id') or '-'
-            mac_item = QTableWidgetItem(mac)
-            if mac == '-':
-                mac_item.setForeground(Qt.GlobalColor.gray)
-            self.device_table.setItem(row, 3, mac_item)
+        # ★ 배치 렌더링: setUpdatesEnabled(False)로 50+ 장치 UI 프리즈 방지
+        self.device_table.setUpdatesEnabled(False)
+        self.device_table.setSortingEnabled(False)
+        try:
+            self.device_table.setRowCount(len(devices))
 
-            self.device_table.setItem(row, 4, QTableWidgetItem(dev.get('group_name') or 'default'))
+            for row, dev in enumerate(devices):
+                self.device_table.setItem(row, 0, QTableWidgetItem(str(dev['id'])))
+                self.device_table.setItem(row, 1, QTableWidgetItem(dev['name']))
+                self.device_table.setItem(row, 2, QTableWidgetItem(dev['ip']))
 
-            status_item = QTableWidgetItem("활성" if dev['is_active'] else "비활성")
-            if not dev['is_active']:
-                status_item.setForeground(Qt.GlobalColor.red)
-            self.device_table.setItem(row, 5, status_item)
+                # MAC: 서버 serial_id → 로컬 DB mac_address → '-'
+                mac = dev.get('serial_id') or local_macs.get(dev['name']) or '-'
+                mac_item = QTableWidgetItem(mac)
+                if mac == '-':
+                    mac_item.setForeground(Qt.GlobalColor.gray)
+                else:
+                    mac_item.setForeground(Qt.GlobalColor.darkGreen)
+                self.device_table.setItem(row, 3, mac_item)
 
-            self.device_table.setItem(row, 6, QTableWidgetItem(str(dev['web_port'])))
+                self.device_table.setItem(row, 4, QTableWidgetItem(dev.get('group_name') or 'default'))
 
-            # 작업 버튼
-            action_widget = QWidget()
-            action_layout = QHBoxLayout(action_widget)
-            action_layout.setContentsMargins(2, 2, 2, 2)
+                status_item = QTableWidgetItem("활성" if dev['is_active'] else "비활성")
+                if not dev['is_active']:
+                    status_item.setForeground(Qt.GlobalColor.red)
+                self.device_table.setItem(row, 5, status_item)
 
-            edit_btn = QPushButton("수정")
-            edit_btn.clicked.connect(lambda checked, d=dev: self._on_edit_device(d))
-            action_layout.addWidget(edit_btn)
+                self.device_table.setItem(row, 6, QTableWidgetItem(str(dev['web_port'])))
 
-            del_btn = QPushButton("삭제")
-            del_btn.setStyleSheet("color: red;")
-            del_btn.clicked.connect(lambda checked, did=dev['id'], dname=dev['name']: self._on_delete_device(did, dname))
-            action_layout.addWidget(del_btn)
+                # 작업 버튼 (admin만 수정/삭제 가능)
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(2, 2, 2, 2)
 
-            self.device_table.setCellWidget(row, 7, action_widget)
+                if api_client.is_admin:
+                    edit_btn = QPushButton("수정")
+                    edit_btn.clicked.connect(lambda checked, d=dev: self._on_edit_device(d))
+                    action_layout.addWidget(edit_btn)
+
+                if api_client.is_admin:
+                    del_btn = QPushButton("삭제")
+                    del_btn.setStyleSheet("color: red;")
+                    del_btn.clicked.connect(lambda checked, did=dev['id'], dname=dev['name']: self._on_delete_device(did, dname))
+                    action_layout.addWidget(del_btn)
+
+                self.device_table.setCellWidget(row, 7, action_widget)
+        finally:
+            self.device_table.setSortingEnabled(True)
+            self.device_table.setUpdatesEnabled(True)
 
     def _on_add_device(self):
         dlg = DeviceFormDialog(self)
@@ -317,8 +526,8 @@ class AdminPanel(QWidget):
                         record = db.get_device_by_name(old_name)
                         if record:
                             db.update_device(record['id'], name=new_name)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[Admin] 로컬 DB 이름 변경 실패: {e}")
 
                 # 변경 시그널 발행 → 메인 윈도우 UI 갱신
                 self.device_changed.emit()
@@ -391,6 +600,81 @@ class AdminPanel(QWidget):
 
         except Exception as e:
             QMessageBox.warning(self, "오류", f"동기화 실패: {e}")
+
+    def _on_collect_mac(self):
+        """MAC 주소 일괄 수집 (SSH 접속)"""
+        if not hasattr(self, '_devices') or not self._devices:
+            QMessageBox.information(self, "MAC 수집", "기기 목록이 없습니다. 먼저 새로고침하세요.")
+            return
+
+        # MAC 미수집 기기 수 확인
+        no_mac = [d for d in self._devices if not d.get('serial_id')]
+        if not no_mac:
+            QMessageBox.information(self, "MAC 수집", "모든 기기의 MAC 주소가 이미 수집되었습니다.")
+            return
+
+        reply = QMessageBox.question(
+            self, "MAC 수집",
+            f"MAC 미수집 기기 {len(no_mac)}개에 SSH 접속하여\nMAC 주소를 수집하시겠습니까?\n\n"
+            f"(이미 MAC이 있는 기기는 건너뜁니다)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 프로그레스 다이얼로그
+        self._mac_progress = QProgressDialog("MAC 수집 준비 중...", "취소", 0, len(self._devices), self)
+        self._mac_progress.setWindowTitle("MAC 수집")
+        self._mac_progress.setMinimumDuration(0)
+        self._mac_progress.show()
+
+        # 수집 스레드 시작
+        self._mac_thread = MACCollectThread(self._devices)
+        self._mac_thread.progress.connect(self._on_mac_progress)
+        self._mac_thread.device_mac.connect(self._on_mac_collected)
+        self._mac_thread.collect_done.connect(self._on_mac_finished)
+        self._mac_progress.canceled.connect(self._mac_thread.stop)
+        self._track_thread(self._mac_thread)
+        self._mac_thread.start()
+
+    def _on_mac_progress(self, current: int, total: int, name: str):
+        if hasattr(self, '_mac_progress') and self._mac_progress:
+            self._mac_progress.setValue(current)
+            self._mac_progress.setLabelText(f"[{current}/{total}] {name} 수집 중...")
+
+    def _on_mac_collected(self, device_id: int, mac: str):
+        """MAC 수집 성공 → 로컬 DB + 서버에 업데이트"""
+        # 1) 로컬 DB에 저장 (기기 이름으로 찾기)
+        try:
+            from core.database import Database
+            db = Database()
+            # server device_id로는 로컬 DB를 조회 불가하므로 이름으로 찾기
+            dev = next((d for d in self._devices if d.get('id') == device_id), None)
+            if dev:
+                local = db.get_device_by_name(dev['name'])
+                if local:
+                    db.update_device(local['id'], mac_address=mac)
+                    print(f"[MAC] 로컬 DB 저장: {dev['name']} = {mac}")
+        except Exception as e:
+            print(f"[MAC] 로컬 DB 저장 실패: {e}")
+
+        # 2) 서버에도 시도 (실패해도 무시 — 서버 재배포 전이면 400 에러)
+        try:
+            api_client.admin_update_device(device_id, {'serial_id': mac})
+            print(f"[MAC] 서버 저장: ID {device_id} = {mac}")
+        except Exception as e:
+            print(f"[MAC] 서버 저장 실패 (로컬만 저장됨): {e}")
+
+    def _on_mac_finished(self, success: int, failed: int, skipped: int):
+        if hasattr(self, '_mac_progress') and self._mac_progress:
+            self._mac_progress.close()
+            self._mac_progress = None
+
+        msg = f"MAC 수집 완료!\n\n수집 성공: {success}개\n수집 실패: {failed}개\n기존 보유: {skipped}개"
+        QMessageBox.information(self, "MAC 수집 결과", msg)
+
+        # 기기 목록 새로고침
+        self._load_devices()
 
     @staticmethod
     def _format_size(size_bytes: int) -> str:

@@ -181,33 +181,57 @@ class KVMDevice:
         return self.usb_status
 
     def get_system_info(self) -> dict:
-        """Get system information"""
+        """Get system information (단일 SSH 호출로 병합)"""
         info = {}
 
-        # Uptime
-        out, _ = self._exec_command("uptime")
-        info['uptime'] = out
+        # 4개 명령을 단일 호출로 병합 (SSH 오버헤드 75% 감소)
+        combined_cmd = (
+            "echo '---UPTIME---' && uptime && "
+            "echo '---MEM---' && free -m | grep Mem && "
+            "echo '---TEMP---' && cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null && "
+            "echo '---USB---' && cat /sys/class/udc/*/state 2>/dev/null"
+        )
+        out, _ = self._exec_command(combined_cmd, timeout=5)
 
-        # Memory
-        out, _ = self._exec_command("free -m | grep Mem")
         if out:
-            parts = out.split()
-            if len(parts) >= 3:
-                info['memory_total'] = int(parts[1])
-                info['memory_used'] = int(parts[2])
+            sections = out.split('---')
+            for section in sections:
+                section = section.strip()
+                if section.startswith('UPTIME---'):
+                    info['uptime'] = section.replace('UPTIME---', '').strip()
+                elif section.startswith('MEM---'):
+                    mem_line = section.replace('MEM---', '').strip()
+                    if mem_line:
+                        parts = mem_line.split()
+                        if len(parts) >= 3:
+                            try:
+                                info['memory_total'] = int(parts[1])
+                                info['memory_used'] = int(parts[2])
+                            except (ValueError, IndexError):
+                                pass
+                elif section.startswith('TEMP---'):
+                    temp_str = section.replace('TEMP---', '').strip()
+                    if temp_str:
+                        try:
+                            info['temperature'] = int(temp_str.split('\n')[0]) / 1000
+                        except (ValueError, IndexError):
+                            pass
+                elif section.startswith('USB---'):
+                    usb_str = section.replace('USB---', '').strip()
+                    if "configured" in usb_str:
+                        self.usb_status = USBStatus.CONFIGURED
+                    elif "connected" in usb_str:
+                        self.usb_status = USBStatus.CONNECTED
+                    elif "not attached" in usb_str or not usb_str:
+                        self.usb_status = USBStatus.NOT_ATTACHED
+                    else:
+                        self.usb_status = USBStatus.DISCONNECTED
+                    info['usb_status'] = self.usb_status.value
 
-        # Temperature
-        out, _ = self._exec_command("cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null")
-        if out:
-            try:
-                info['temperature'] = int(out) / 1000
-            except:
-                pass
+        if 'usb_status' not in info:
+            info['usb_status'] = self.usb_status.value
 
-        # USB Status
-        info['usb_status'] = self.get_usb_status().value
-
-        # MAC / Hostname
+        # MAC / Hostname (캐시됨, SSH 호출 불필요)
         info['mac_address'] = self.mac_address
         info['hostname'] = self.hostname
 

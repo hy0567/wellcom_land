@@ -71,6 +71,13 @@ class Database:
 
             conn.commit()
 
+            # mac_address 컬럼 자동 마이그레이션
+            try:
+                cursor.execute("ALTER TABLE devices ADD COLUMN mac_address TEXT DEFAULT NULL")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # 이미 존재
+
     # ==================== Device CRUD ====================
 
     def add_device(self, name: str, ip: str, port: int = 22, web_port: int = 80,
@@ -88,7 +95,7 @@ class Database:
 
     def update_device(self, device_id: int, **kwargs):
         """Update device information"""
-        allowed_fields = ['name', 'ip', 'port', 'web_port', 'username', 'password', 'group_name']
+        allowed_fields = ['name', 'ip', 'port', 'web_port', 'username', 'password', 'group_name', 'mac_address']
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
 
         if not updates:

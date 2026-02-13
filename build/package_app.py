@@ -59,6 +59,7 @@ APP_FILES = [
     'vision/training/capture_dataset.py',
     'vision/training/auto_label.py',
     'vision/training/labeler.py',
+    'mcp_debug.py',
 ]
 
 

@@ -139,6 +139,7 @@ class StatusUpdateThread(QThread):
         super().__init__()
         self.manager = manager
         self.running = True
+        self._paused = False  # v1.10.45: LiveView 중 일시정지
         self._server_status_cache = {}  # kvm_name → is_online (서버 API 캐시)
         self._server_check_counter = 0  # 서버 API 호출 주기 카운터
 
@@ -147,6 +148,13 @@ class StatusUpdateThread(QThread):
         self.msleep(5000)
 
         while self.running:
+            # v1.10.45: LiveView 활성 중 일시정지
+            # TCP 체크 + signal emit이 메인 스레드 UI 갱신을 트리거하여
+            # GPU WebView 렌더링과 경합 → access violation 방지
+            if self._paused:
+                self.msleep(1000)
+                continue
+
             try:
                 # 매 6회(30초)마다 서버 API에서 온라인 상태 갱신
                 self._server_check_counter += 1
@@ -156,7 +164,10 @@ class StatusUpdateThread(QThread):
 
                 # TCP 포트 체크 (병렬)
                 status = self._check_status_parallel()
-                self.status_updated.emit(status)
+
+                # 일시정지 상태면 emit 스킵 (pause 호출과 emit 사이 경합 방지)
+                if not self._paused:
+                    self.status_updated.emit(status)
             except Exception as e:
                 print(f"상태 업데이트 오류: {e}")
 
@@ -239,6 +250,22 @@ class StatusUpdateThread(QThread):
                         results[device.name] = {'online': False}
 
         return results
+
+    def pause(self):
+        """v1.10.45: LiveView 활성 중 상태 체크 일시정지
+
+        TCP 체크 + status_updated.emit()이 메인 스레드에서 UI 갱신을 트리거하여
+        GPU WebView 렌더링과 경합하는 것을 방지.
+        """
+        self._paused = True
+        import time as _t
+        print(f"[StatusThread] 일시정지 (LiveView 활성) — {_t.strftime('%H:%M:%S')}")
+
+    def resume(self):
+        """v1.10.45: LiveView 종료 후 상태 체크 재개"""
+        self._paused = False
+        import time as _t
+        print(f"[StatusThread] 재개 (LiveView 종료) — {_t.strftime('%H:%M:%S')}")
 
     def stop(self):
         self.running = False
@@ -431,7 +458,7 @@ class KVMThumbnailWidget(QFrame):
                 style = document.createElement('style');
                 style.id = '_thumbCSS';
                 style.textContent = `
-                    html, body, #root {
+                    html, body {
                         margin: 0 !important;
                         padding: 0 !important;
                         width: 100% !important;
@@ -439,7 +466,8 @@ class KVMThumbnailWidget(QFrame):
                         overflow: hidden !important;
                         background: #000 !important;
                     }
-                    #root > * { display: none !important; }
+                    /* v1.14: #root>* display:none 제거 — React DOM 유지 */
+                    /* video를 z-index로 최상위 표시하므로 숨길 필요 없음 */
                     video {
                         display: block !important;
                         position: fixed !important;
@@ -485,21 +513,27 @@ class KVMThumbnailWidget(QFrame):
             blocker.id = '_inputBlocker';
             document.body.appendChild(blocker);
 
+            // 명명된 핸들러를 전역에 저장 (UNDO 시 removeEventListener 가능)
+            window._thumbBlockHandler = function(e) {
+                e.stopPropagation();
+                e.preventDefault();
+            };
+
             // 모든 입력 이벤트 차단
             var events = ['keydown', 'keyup', 'keypress', 'mousedown', 'mouseup',
                           'click', 'dblclick', 'mousemove', 'wheel', 'contextmenu',
                           'touchstart', 'touchmove', 'touchend'];
+            window._thumbBlockedEvents = events;
             events.forEach(function(evt) {
-                document.addEventListener(evt, function(e) {
-                    e.stopPropagation();
-                    e.preventDefault();
-                }, true);
+                document.addEventListener(evt, window._thumbBlockHandler, true);
             });
 
             _inputBlocked = true;
         }
 
         // 3. video 요소 처리
+        // v1.14: DOM 이동(appendChild) 제거 — CSS z-index만으로 처리
+        // appendChild는 React DOM 트리를 파괴하여 GPU 렌더링 경합 유발
         function setupVideo() {
             if (_videoDone) return true;
 
@@ -507,18 +541,15 @@ class KVMThumbnailWidget(QFrame):
             if (!video || !video.srcObject) return false;
             if (video.readyState < 2) return false;
 
-            if (video.parentElement !== document.body) {
-                document.body.appendChild(video);
-                video.play().catch(function(){});
-            }
-
+            video.play().catch(function(){});
             _videoDone = true;
             return true;
         }
 
-        // 4-1. 썸네일 저FPS 모드: pause/play 사이클 (CPU 대폭 절약)
+        // 4-1. 썸네일 저FPS 모드: pause/play 사이클 (GPU/CPU 절약)
+        // v1.13: 5초 간격으로 변경 (2초→5초) — 관제 PC 부하 경감
         // WebRTC 수신 트랙은 applyConstraints가 무시되므로
-        // video를 주기적으로 pause→play 반복하여 실질 FPS를 ~1fps로 제한
+        // video를 주기적으로 pause→play 반복하여 실질 ~0.2fps로 제한
         var _fpsLimitId = null;
         function startLowFpsMode() {
             if (_fpsLimitId) return;
@@ -527,18 +558,18 @@ class KVMThumbnailWidget(QFrame):
 
             function tick() {
                 if (!video || !video.srcObject) return;
-                // 잠깐 play → 200ms 후 pause (초당 ~1프레임만 렌더)
+                // 잠깐 play → 150ms 후 pause (5초마다 1프레임만 렌더)
                 video.play().catch(function(){});
                 setTimeout(function() {
                     if (video && video.srcObject) {
                         video.pause();
                     }
-                }, 200);
-                _fpsLimitId = setTimeout(tick, 2000);
+                }, 150);
+                _fpsLimitId = setTimeout(tick, 5000);
             }
             // 최초 1회 play 후 사이클 시작
             video.play().catch(function(){});
-            _fpsLimitId = setTimeout(tick, 2000);
+            _fpsLimitId = setTimeout(tick, 5000);
         }
 
         // 4. 저품질 설정 (10% = 약 660Kbps)
@@ -640,6 +671,98 @@ class KVMThumbnailWidget(QFrame):
 
         setTimeout(loop, 2000);
 
+    })();
+    """
+
+    # THUMBNAIL_JS 해제용 JS (LiveView 전환 시 실행)
+    # 저FPS 타이머 중지, 입력차단 해제, CSS 제거, 화질 복원
+    UNDO_THUMBNAIL_JS = """
+    (function() {
+        'use strict';
+
+        // 1. 저FPS 타이머 중지 + 비디오 재생
+        // THUMBNAIL_JS의 _fpsLimitId는 클로저 내부이므로
+        // 모든 setTimeout/setInterval을 정리하는 대신
+        // 비디오를 강제 play하고 pause 이벤트를 차단
+        var video = document.querySelector('video');
+        if (video) {
+            video.play().catch(function(){});
+            // pause 호출을 일시적으로 무력화 (저FPS 타이머가 pause 호출 방지)
+            video._origPause = video.pause;
+            video.pause = function() {};  // 저FPS 타이머의 pause 차단
+            // 1초 후 원래 pause 복원 (타이머 만료 후)
+            setTimeout(function() {
+                if (video._origPause) {
+                    video.pause = video._origPause;
+                    delete video._origPause;
+                }
+            }, 6000);
+        }
+
+        // 2. _thumbCSS 스타일 제거
+        var thumbCSS = document.getElementById('_thumbCSS');
+        if (thumbCSS) thumbCSS.remove();
+
+        // 3. _cropStyle 제거 (크롭 CSS)
+        var cropStyle = document.getElementById('_cropStyle');
+        if (cropStyle) cropStyle.remove();
+
+        // 4. _inputBlocker 오버레이 제거 + 이벤트 리스너 제거
+        var blocker = document.getElementById('_inputBlocker');
+        if (blocker) blocker.remove();
+
+        // capture phase 이벤트 리스너 제거 (THUMBNAIL_JS에서 등록한 것)
+        if (window._thumbBlockHandler && window._thumbBlockedEvents) {
+            window._thumbBlockedEvents.forEach(function(evt) {
+                document.removeEventListener(evt, window._thumbBlockHandler, true);
+            });
+            delete window._thumbBlockHandler;
+            delete window._thumbBlockedEvents;
+            console.log('[WellcomLAND] 입력 차단 이벤트 리스너 제거 완료');
+        }
+
+        // 5. 화질 복원 (factor 1.0 = 100%)
+        var root = document.querySelector('#root');
+        if (root) {
+            var fiberKey = Object.keys(root).find(function(k) {
+                return k.startsWith('__reactFiber$');
+            });
+            if (fiberKey) {
+                var fiber = root[fiberKey];
+                var visited = new Set();
+                var queue = [fiber];
+                while (queue.length > 0) {
+                    var current = queue.shift();
+                    if (!current || visited.has(current)) continue;
+                    visited.add(current);
+                    if (current.memoizedState) {
+                        var state = current.memoizedState;
+                        while (state) {
+                            if (state.memoizedState && state.memoizedState.rpcDataChannel) {
+                                var rpc = state.memoizedState.rpcDataChannel;
+                                if (rpc.readyState === 'open') {
+                                    rpc.send(JSON.stringify({
+                                        jsonrpc: '2.0', id: Date.now(),
+                                        method: 'setStreamQualityFactor',
+                                        params: { factor: 1.0 }
+                                    }));
+                                }
+                            }
+                            state = state.next;
+                        }
+                    }
+                    if (current.child) queue.push(current.child);
+                    if (current.sibling) queue.push(current.sibling);
+                    if (visited.size > 200) break;
+                }
+            }
+        }
+
+        // 6. 플래그 리셋
+        window._thumbReady = false;
+
+        console.log('[WellcomLAND] UNDO_THUMBNAIL_JS 완료 — LiveView 전환 준비');
+        return true;
     })();
     """
 
@@ -888,6 +1011,8 @@ class KVMThumbnailWidget(QFrame):
         stop_capture()는 about:blank + hide 만 하지만,
         이 메서드는 WebView 객체 자체를 deleteLater()로 삭제한다.
         레이아웃에서 WebView를 제거하고 status_label을 복원한다.
+
+        v1.10.47: stop() + signal disconnect + 렌더 프로세스 시그널 해제
         """
         try:
             self._is_active = False
@@ -896,18 +1021,32 @@ class KVMThumbnailWidget(QFrame):
             self._update_name_label()
 
             if self._webview:
-                # 1) WebRTC 연결 해제
+                # 1) 로드 중지 + 시그널 해제 (재진입 방지)
+                try:
+                    self._webview.loadFinished.disconnect(self._on_load_finished)
+                except Exception:
+                    pass
+                try:
+                    self._webview.page().renderProcessTerminated.disconnect(self._on_render_terminated)
+                except Exception:
+                    pass
+                try:
+                    self._webview.stop()
+                except Exception:
+                    pass
+
+                # 2) WebRTC 연결 해제
                 try:
                     self._webview.setUrl(QUrl("about:blank"))
                 except Exception:
                     pass
 
-                # 2) 레이아웃에서 WebView → status_label 교체
+                # 3) 레이아웃에서 WebView → status_label 교체
                 layout = self.layout()
                 if layout:
                     layout.replaceWidget(self._webview, self.status_label)
 
-                # 3) WebView 완전 삭제
+                # 4) WebView 완전 삭제
                 try:
                     self._webview.hide()
                     self._webview.setParent(None)
@@ -921,6 +1060,98 @@ class KVMThumbnailWidget(QFrame):
             self._update_status_display()
         except Exception as e:
             print(f"[Thumbnail] _destroy_webview_for_liveview 오류: {e}")
+
+    def detach_webview_for_liveview(self):
+        """WebView를 썸네일에서 분리하여 반환 (WebRTC 연결 유지)
+
+        LiveView에서 기존 WebRTC 스트림을 재사용하기 위해
+        WebView 객체를 파괴하지 않고 부모에서 분리만 한다.
+        반환된 WebView는 LiveViewDialog에서 사용 후 reattach_webview()로 복원.
+        """
+        try:
+            if not self._webview:
+                return None
+
+            wv = self._webview
+
+            # 시그널 해제 (썸네일 핸들러 분리)
+            try:
+                wv.loadFinished.disconnect(self._on_load_finished)
+            except Exception:
+                pass
+            try:
+                wv.page().renderProcessTerminated.disconnect(self._on_render_terminated)
+            except Exception:
+                pass
+
+            # 레이아웃에서 제거 (파괴하지 않음!)
+            layout = self.layout()
+            if layout:
+                layout.replaceWidget(wv, self.status_label)
+
+            wv.setParent(None)  # 부모 해제 (deleteLater 방지)
+
+            self._webview = None
+            self._is_active = False
+            self._is_paused = False
+            self._stream_status = "idle"
+            self._update_name_label()
+
+            self.status_label.setText("1:1 제어 중...")
+            self.status_label.show()
+            self._update_status_display()
+
+            print(f"[Thumbnail] detach_webview: {self.device.name} — WebView 분리 (WebRTC 유지)")
+            return wv  # WebRTC 연결 유지된 WebView 반환
+        except Exception as e:
+            print(f"[Thumbnail] detach_webview 오류: {e}")
+            return None
+
+    def reattach_webview(self, wv):
+        """LiveView에서 반환된 WebView를 썸네일에 다시 삽입
+
+        WebRTC 연결이 유지된 상태에서 썸네일 크기/설정으로 복원하고
+        THUMBNAIL_JS를 재적용하여 저FPS/저화질 모드로 전환.
+        """
+        try:
+            if self._webview:
+                print(f"[Thumbnail] reattach_webview 건너뜀 (이미 WebView 있음): {self.device.name}")
+                return
+
+            self._webview = wv
+
+            # 썸네일 크기/입력 설정 복원
+            wv.setFixedSize(196, 125)
+            wv.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            wv.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+            # 시그널 재연결
+            wv.loadFinished.connect(self._on_load_finished)
+            wv.page().renderProcessTerminated.connect(self._on_render_terminated)
+
+            # 레이아웃에 삽입
+            layout = self.layout()
+            if layout:
+                layout.replaceWidget(self.status_label, wv)
+            self.status_label.hide()
+            wv.show()
+
+            self._is_active = True
+            self._is_paused = False
+            self._stream_status = "connected"
+            self._update_name_label()
+
+            # THUMBNAIL_JS 재적용 (저FPS, 저화질, 입력차단)
+            wv.page().runJavaScript(self.THUMBNAIL_JS)
+            # 크롭 설정이 있으면 재적용
+            if self._crop_region:
+                print(f"[Thumbnail] reattach: 크롭 폴링 재시작: {self.device.name}")
+                QTimer.singleShot(500, lambda: self._poll_and_inject_crop(0))
+
+            print(f"[Thumbnail] reattach_webview: {self.device.name} — WebView 재삽입 완료")
+        except Exception as e:
+            print(f"[Thumbnail] reattach_webview 오류: {e}")
+            self._webview = None
 
     def pause_capture(self):
         """미리보기 일시정지 (WebView 숨기기만, URL 유지)"""
@@ -2284,63 +2515,20 @@ class LiveViewDialog(QDialog):
     })();
     """
 
-    # PicoKVM UI 정리 - 비디오 스트림만 표시
+    # v1.10.56: PicoKVM UI 정리 — CSS만 사용, DOM 구조 변경 없음
+    # 이전 CLEAN_UI_JS는 body>*:not(video) {display:none} 으로 #root를 숨기고
+    # video를 body 직접 자식으로 appendChild 하는 등 DOM 구조를 파괴하여
+    # React 렌더 트리 + Chromium GPU 렌더링 경합 → CrBrowserMain access violation 유발.
+    # v1.10.56: CSS z-index overlay만 사용하여 video를 최상위로 올리되
+    # DOM 트리는 건드리지 않음 → GPU 렌더링 안정성 유지.
     CLEAN_UI_JS = """
     (function() {
         'use strict';
 
-        // 스타일 주입
         var style = document.createElement('style');
         style.id = 'wellcomland-clean-ui';
         style.textContent = `
-            /* 상단 헤더 숨김 */
-            header, .header, nav, .navbar, .nav-bar,
-            [class*="header"], [class*="Header"],
-            [class*="navbar"], [class*="Navbar"] {
-                display: none !important;
-            }
-
-            /* 사이드바/메뉴 숨김 */
-            aside, .sidebar, .side-bar, .menu,
-            [class*="sidebar"], [class*="Sidebar"],
-            [class*="menu"], [class*="Menu"] {
-                display: none !important;
-            }
-
-            /* 푸터 숨김 */
-            footer, .footer, [class*="footer"], [class*="Footer"] {
-                display: none !important;
-            }
-
-            /* 툴바/버튼 영역 숨김 */
-            .toolbar, .tool-bar, .buttons, .controls,
-            [class*="toolbar"], [class*="Toolbar"],
-            [class*="button-bar"], [class*="control-bar"] {
-                display: none !important;
-            }
-
-            /* PicoKVM 특정 요소 숨김 */
-            .kvm-header, .kvm-footer, .kvm-sidebar,
-            .connection-status, .device-info,
-            [class*="status-bar"], [class*="info-bar"] {
-                display: none !important;
-            }
-
-            /* 비디오/캔버스 전체화면 */
-            video, canvas, #stream, .stream,
-            [class*="stream"], [class*="video"],
-            [class*="canvas"], [class*="display"] {
-                position: fixed !important;
-                top: 0 !important;
-                left: 0 !important;
-                width: 100vw !important;
-                height: 100vh !important;
-                object-fit: contain !important;
-                z-index: 9999 !important;
-                background: #000 !important;
-            }
-
-            /* body 배경 검정 */
+            /* body 배경 검정, 오버플로 숨김 */
             body {
                 background: #000 !important;
                 overflow: hidden !important;
@@ -2348,27 +2536,28 @@ class LiveViewDialog(QDialog):
                 padding: 0 !important;
             }
 
-            /* 모든 다른 요소 숨김 (비디오 제외) */
-            body > *:not(video):not(canvas):not(#stream):not(.stream):not(script):not(style) {
-                display: none !important;
+            /* 비디오/캔버스를 fixed 오버레이로 최상위 표시 */
+            /* DOM 이동 없이 z-index만으로 최상위 레이어 */
+            video, canvas {
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100vw !important;
+                height: 100vh !important;
+                object-fit: contain !important;
+                z-index: 99999 !important;
+                background: #000 !important;
             }
         `;
 
-        // 기존 스타일 제거 후 추가
         var existing = document.getElementById('wellcomland-clean-ui');
         if (existing) existing.remove();
         document.head.appendChild(style);
 
-        // 비디오/캔버스 요소 찾기
         var video = document.querySelector('video') ||
-                    document.querySelector('canvas#stream') ||
-                    document.querySelector('canvas') ||
-                    document.querySelector('[class*="stream"]');
-
+                    document.querySelector('canvas');
         if (video) {
-            // 비디오를 body 직접 자식으로 이동
-            document.body.appendChild(video);
-            console.log('[WellcomLAND] UI 정리 완료 - 비디오 전체화면');
+            console.log('[WellcomLAND] UI 정리 완료 - CSS 오버레이 (DOM 변경 없음, v1.10.56)');
             return true;
         }
 
@@ -2386,9 +2575,11 @@ class LiveViewDialog(QDialog):
     })();
     """
 
-    def __init__(self, device: KVMDevice, parent=None):
+    def __init__(self, device: KVMDevice, parent=None, existing_webview=None):
         super().__init__(parent)
         self.device = device
+        self._existing_webview = existing_webview  # 썸네일에서 가져온 WebView (WebRTC 유지)
+        self._reusable_webview = None  # 닫을 때 반환할 WebView
         self.setWindowTitle(f"{device.name} ({device.ip})")
 
         # 마지막 창 크기 복원 (설정에서 기억 활성화된 경우)
@@ -2398,7 +2589,8 @@ class LiveViewDialog(QDialog):
         else:
             w, h = 1920, 1080
         self.resize(w, h)
-        print(f"[LiveView] __init__ 시작: {device.name} ({device.ip}) [{w}x{h}]")
+        reuse_tag = " [WebView 재사용]" if existing_webview else ""
+        print(f"[LiveView] __init__ 시작: {device.name} ({device.ip}) [{w}x{h}]{reuse_tag}")
 
         # HID 컨트롤러 (SSH 직접 접속 — 릴레이 접속 시 사용 불가)
         self._is_relay = device.ip.startswith('100.')
@@ -2426,10 +2618,17 @@ class LiveViewDialog(QDialog):
         self._page_loaded = False
         print(f"[LiveView] _init_ui 호출 전")
         self._init_ui()
-        print(f"[LiveView] _init_ui 완료, _load_kvm_url 호출")
-        # URL 로드 (WebView 생성 후 바로 시작)
-        self._load_kvm_url()
-        print(f"[LiveView] __init__ 완료")
+        print(f"[LiveView] _init_ui 완료")
+
+        if existing_webview:
+            # 기존 WebView 재사용 — URL 재로드 없이 JS만 전환
+            self._setup_reused_webview()
+            print(f"[LiveView] __init__ 완료 [WebView 재사용 — WebRTC 유지]")
+        else:
+            # 새 WebView — 기존 로직대로 URL 로드
+            print(f"[LiveView] _load_kvm_url 호출")
+            self._load_kvm_url()
+            print(f"[LiveView] __init__ 완료")
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -2481,7 +2680,7 @@ class LiveViewDialog(QDialog):
         control_bar.addWidget(self.btn_mouse_mode)
 
         self.btn_game_mode = QPushButton("아이온2")
-        self.btn_game_mode.setToolTip("Alt+F1: 시작 (자동 Rel 전환)\nAlt+F2: 해제 (자동 Abs 복원)\nALT: 커서 일시 표시")
+        self.btn_game_mode.setToolTip("Ctrl+F1: 시작 (자동 Rel 전환)\nCtrl+F2: 해제 (자동 Abs 복원)\nALT: 커서 일시 표시")
         self.btn_game_mode.setStyleSheet(f"{_btn_style} background-color:#FF5722; color:white; font-weight:bold;")
         self.btn_game_mode.clicked.connect(self._toggle_game_mode)
         control_bar.addWidget(self.btn_game_mode)
@@ -2619,7 +2818,7 @@ class LiveViewDialog(QDialog):
         layout.addWidget(self.shortcut_bar)
 
         # 아이온2 모드 안내 바 - 더 컴팩트
-        self.game_mode_bar = QLabel("  아이온2 모드 | 클릭: 잠금 | ALT: 커서 | Alt+F2: 해제")
+        self.game_mode_bar = QLabel("  아이온2 모드 | 클릭: 잠금 | ALT: 커서 | Ctrl+F2: 해제")
         self.game_mode_bar.setStyleSheet("""
             background-color: #4CAF50;
             color: white;
@@ -2632,10 +2831,17 @@ class LiveViewDialog(QDialog):
         layout.addWidget(self.game_mode_bar)
 
         # 웹뷰 (KVM 화면) - 최대 공간 사용 + 성능 최적화
-        self.web_view = QWebEngineView()
-        self.aion2_page = Aion2WebPage(self.web_view)
-        self.web_view.setPage(self.aion2_page)
+        if self._existing_webview:
+            # 썸네일에서 가져온 WebView 재사용 (WebRTC 연결 유지)
+            self.web_view = self._existing_webview
+            self.aion2_page = self.web_view.page()  # 기존 Page 유지 (setPage 금지 — WebRTC 끊김 방지)
+        else:
+            # 새 WebView 생성 (기존 로직)
+            self.web_view = QWebEngineView()
+            self.aion2_page = Aion2WebPage(self.web_view)
+            self.web_view.setPage(self.aion2_page)
 
+        # 설정 적용 (새 WebView든 재사용이든 동일하게)
         settings = self.web_view.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
@@ -2650,6 +2856,13 @@ class LiveViewDialog(QDialog):
         settings.setAttribute(QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript, True)
         # PicoKVM 페이지의 이미지는 필요 (CLEAN_UI_JS에서 비디오 찾기 전까지)
         # settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, False)
+
+        # 재사용 WebView: 크기 제약 해제 + 입력 허용
+        if self._existing_webview:
+            self.web_view.setMinimumSize(0, 0)
+            self.web_view.setMaximumSize(16777215, 16777215)  # QWIDGETSIZE_MAX
+            self.web_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            self.web_view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
 
         layout.addWidget(self.web_view, 1)  # stretch factor 1 - 최대 공간
 
@@ -2706,13 +2919,16 @@ class LiveViewDialog(QDialog):
         self._max_reconnect = 5
         self._reconnect_timer = None
 
+        # v1.10.54: 타이틀 변경 감시 즉시 연결 (WS/RTC 이벤트 수신)
+        self.web_view.page().titleChanged.connect(self._on_webrtc_title_changed)
+
         # ── 글로벌 단축키 (QShortcut) ──
         # WebEngineView가 포커스를 가져가도 다이얼로그 레벨에서 키를 잡음
-        sc_start = QShortcut(QKeySequence("Alt+F1"), self)
+        sc_start = QShortcut(QKeySequence("Ctrl+F1"), self)
         sc_start.setContext(Qt.ShortcutContext.WindowShortcut)
         sc_start.activated.connect(lambda: self._start_game_mode() if not self.game_mode_active else None)
 
-        sc_stop = QShortcut(QKeySequence("Alt+F2"), self)
+        sc_stop = QShortcut(QKeySequence("Ctrl+F2"), self)
         sc_stop.setContext(Qt.ShortcutContext.WindowShortcut)
         sc_stop.activated.connect(lambda: self._stop_game_mode() if self.game_mode_active else None)
 
@@ -2759,6 +2975,63 @@ class LiveViewDialog(QDialog):
         self.control_widget.setVisible(self.control_bar_visible)
         self.shortcut_bar.setVisible(self.control_bar_visible)
 
+    def _setup_reused_webview(self):
+        """썸네일에서 가져온 WebView를 LiveView용으로 전환 (WebRTC 유지)
+
+        THUMBNAIL_JS의 저FPS/저화질/입력차단을 해제하고
+        CLEAN_UI_JS를 적용하여 전체 화면 제어 모드로 전환.
+        URL 재로드 없이 JS만 교체하므로 WebRTC 스트림이 끊기지 않음.
+        """
+        import time as _t
+        print(f"[LiveView] _setup_reused_webview 시작 — {_t.strftime('%H:%M:%S')}")
+
+        # GPU 크래시 방어 플래그 (이미 스트리밍 중이므로 streaming 플래그)
+        self._set_gpu_loading_flag(True)
+
+        # 0. 썸네일에서 비활성화된 설정 복원
+        settings = self.web_view.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, True)
+
+        # 1. UNDO_THUMBNAIL_JS 실행 — 저FPS/저화질/입력차단 해제
+        self.web_view.page().runJavaScript(
+            KVMThumbnailWidget.UNDO_THUMBNAIL_JS,
+            lambda result: print(f"[LiveView] UNDO_THUMBNAIL_JS 완료: {result}")
+        )
+
+        # 2. 페이지 완전 새로고침 (500ms 후)
+        # THUMBNAIL_JS가 DOM에 남긴 이벤트 리스너/상태 오염을 완전히 제거하기 위해
+        # 페이지를 reload하여 KVM 웹 앱을 깨끗하게 재시작.
+        # WebRTC는 같은 렌더 프로세스에서 재연결되므로 새 WebView 생성보다 훨씬 빠름.
+        def _reload_and_setup():
+            # 페이지 로드 완료 후 CLEAN_UI_JS 적용
+            def _on_reloaded(ok):
+                if ok:
+                    self._page_loaded = True
+                    if hasattr(self, '_loading_overlay') and self._loading_overlay:
+                        self._loading_overlay.hide()
+                    self.status_label.setText(f"{self.device.name} - 연결됨")
+                    self._set_gpu_streaming_flag()
+                    self._inject_debug_monitors()
+                    QTimer.singleShot(500, self._clean_kvm_ui)
+                    QTimer.singleShot(2000, self._inject_webrtc_monitor)
+                    print(f"[LiveView] 페이지 reload 완료 + 설정 적용 — {_t.strftime('%H:%M:%S')}")
+                else:
+                    print(f"[LiveView] 페이지 reload 실패")
+
+            # 기존 loadFinished 시그널에 일회성 콜백 연결
+            def _once_loaded(ok):
+                try:
+                    self.web_view.loadFinished.disconnect(_once_loaded)
+                except Exception:
+                    pass
+                _on_reloaded(ok)
+
+            self.web_view.loadFinished.connect(_once_loaded)
+            self.web_view.reload()
+            print(f"[LiveView] 페이지 reload 시작 (WebRTC 재연결)")
+
+        QTimer.singleShot(500, _reload_and_setup)
+
     def _load_kvm_url(self):
         """KVM URL 로드 시작
 
@@ -2771,6 +3044,9 @@ class LiveViewDialog(QDialog):
 
         # GPU 크래시 방어: URL 로드 전 플래그 생성
         self._set_gpu_loading_flag(True)
+
+        # v1.10.54: DocumentCreation 시점에 디버그 모니터 삽입 (앱 JS보다 먼저 실행)
+        self._inject_early_debug_monitor()
 
         # 릴레이 접속 감지 (Tailscale IP로 접속하는 경우)
         relay_ip = self.device.ip
@@ -2857,6 +3133,113 @@ class LiveViewDialog(QDialog):
             print(f"[LiveView] GPU 스트리밍 플래그 설정 (크래시 시 소프트웨어 렌더링 전환)")
         except Exception as e:
             print(f"[LiveView] GPU 스트리밍 플래그 설정 오류: {e}")
+
+    def _inject_early_debug_monitor(self):
+        """DocumentCreation 시점에 WS/RTC/에러 모니터 삽입 (앱 JS보다 먼저)
+        v1.10.54: WebSocket, RTCPeerConnection 생성을 추적하여 로그에 기록
+        title 변경으로 Python 측에 이벤트 전달
+        """
+        from PyQt6.QtWebEngineCore import QWebEngineScript
+
+        monitor_js = """
+(function() {
+    'use strict';
+    if (window.__wellcom_early_monitor) return;
+    window.__wellcom_early_monitor = true;
+    window.__rtc_count = 0;
+    window.__ws_count = 0;
+    window.__ws_instances = [];
+    window.__rtc_instances = [];
+    window.__page_errors = [];
+    window.__console_errors = [];
+
+    // WebSocket 가로채기
+    var _OrigWS = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+        window.__ws_count++;
+        console.log('[EARLY] WebSocket #' + window.__ws_count + ' -> ' + url);
+        var ws = protocols ? new _OrigWS(url, protocols) : new _OrigWS(url);
+        var wsInfo = {url: url, created: new Date().toISOString(), state: 'connecting'};
+        window.__ws_instances.push(wsInfo);
+        ws.addEventListener('open', function() {
+            wsInfo.state = 'open';
+            console.log('[EARLY] WS open: ' + url);
+            document.title = 'WELLCOM_WS_OPEN_' + window.__ws_count;
+        });
+        ws.addEventListener('error', function() {
+            wsInfo.state = 'error';
+            console.log('[EARLY] WS error: ' + url);
+            document.title = 'WELLCOM_WS_ERROR_' + window.__ws_count;
+        });
+        ws.addEventListener('close', function(e) {
+            wsInfo.state = 'closed';
+            console.log('[EARLY] WS close: ' + url + ' code=' + e.code + ' reason=' + e.reason);
+            document.title = 'WELLCOM_WS_CLOSE_' + e.code;
+        });
+        return ws;
+    };
+    window.WebSocket.prototype = _OrigWS.prototype;
+    window.WebSocket.CONNECTING = _OrigWS.CONNECTING;
+    window.WebSocket.OPEN = _OrigWS.OPEN;
+    window.WebSocket.CLOSING = _OrigWS.CLOSING;
+    window.WebSocket.CLOSED = _OrigWS.CLOSED;
+
+    // RTCPeerConnection 가로채기
+    var _OrigRTC = window.RTCPeerConnection;
+    window.RTCPeerConnection = function() {
+        window.__rtc_count++;
+        console.log('[EARLY] RTCPeerConnection #' + window.__rtc_count);
+        document.title = 'WELLCOM_RTC_CREATED_' + window.__rtc_count;
+        var pc = new _OrigRTC(...arguments);
+        window.__rtc_instances.push({created: new Date().toISOString()});
+        pc.addEventListener('connectionstatechange', function() {
+            console.log('[EARLY] RTC connectionState: ' + pc.connectionState);
+            document.title = 'WELLCOM_RTC_' + pc.connectionState.toUpperCase();
+        });
+        pc.addEventListener('iceconnectionstatechange', function() {
+            console.log('[EARLY] RTC iceConnectionState: ' + pc.iceConnectionState);
+        });
+        pc.addEventListener('track', function(e) {
+            console.log('[EARLY] RTC track received: ' + e.track.kind);
+            document.title = 'WELLCOM_RTC_TRACK_' + e.track.kind;
+        });
+        return pc;
+    };
+    window.RTCPeerConnection.prototype = _OrigRTC.prototype;
+    if (_OrigRTC.generateCertificate) {
+        window.RTCPeerConnection.generateCertificate = _OrigRTC.generateCertificate;
+    }
+
+    // 에러 캡처
+    window.addEventListener('error', function(e) {
+        window.__page_errors.push({
+            msg: e.message, file: (e.filename||'').split('/').pop(), line: e.lineno
+        });
+        console.log('[EARLY] Error: ' + e.message + ' @' + (e.filename||'').split('/').pop() + ':' + e.lineno);
+    });
+    var _origErr = console.error;
+    console.error = function() {
+        var msg = Array.from(arguments).map(String).join(' ');
+        window.__console_errors.push({msg: msg, time: new Date().toISOString()});
+        _origErr.apply(console, arguments);
+    };
+
+    console.log('[EARLY] Debug monitors installed at DocumentCreation');
+})();
+"""
+        script = QWebEngineScript()
+        script.setName("wellcomland-debug-monitor")
+        script.setSourceCode(monitor_js)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(False)
+
+        # 기존 모니터 제거 후 재등록
+        scripts = self.web_view.page().scripts()
+        for old in scripts.find("wellcomland-debug-monitor"):
+            scripts.remove(old)
+        scripts.insert(script)
+        print("[LiveView] DocumentCreation 디버그 모니터 삽입 완료")
 
     def _inject_ice_patch(self, relay_ip: str, relay_port: int):
         """WebRTC ICE candidate를 릴레이 IP로 교체하는 UserScript 주입
@@ -2987,8 +3370,12 @@ class LiveViewDialog(QDialog):
         scripts.insert(script)
 
     def _on_page_loaded(self, ok):
+        import time as _t
+        import threading
         self._page_loaded = True
-        print(f"[LiveView] _on_page_loaded: ok={ok}")
+        thread_names = [t.name for t in threading.enumerate()]
+        print(f"[LiveView] _on_page_loaded: ok={ok} — {_t.strftime('%H:%M:%S')}")
+        print(f"[LiveView] 페이지 로드 시점 스레드 ({len(thread_names)}): {', '.join(thread_names)}")
         # 로딩 오버레이 숨기기
         if hasattr(self, '_loading_overlay') and self._loading_overlay:
             self._loading_overlay.hide()
@@ -2999,6 +3386,8 @@ class LiveViewDialog(QDialog):
             # closeEvent에서만 제거 (정상 종료 시)
             # 크래시 시 streaming=True 플래그가 남아 다음 실행에서 소프트웨어 렌더링 전환
             self._set_gpu_streaming_flag()
+            # v1.10.54: 즉시 WebSocket/RTC 모니터 삽입 (페이지 로드 직후)
+            self._inject_debug_monitors()
             # UI 정리 (비디오만 표시) - 약간의 지연 후 실행
             QTimer.singleShot(500, self._clean_kvm_ui)
             # WebRTC 연결 상태 모니터링 주입
@@ -3007,6 +3396,9 @@ class LiveViewDialog(QDialog):
             QTimer.singleShot(3000, self._log_webrtc_phase)
             QTimer.singleShot(8000, self._log_webrtc_phase)
             QTimer.singleShot(15000, self._log_webrtc_phase)
+            # 30초, 60초 후 추가 진단
+            QTimer.singleShot(30000, self._log_webrtc_phase)
+            QTimer.singleShot(60000, self._log_webrtc_phase)
         else:
             self.status_label.setText(f"{self.device.name} - 연결 실패")
             # 로드 실패: GPU 플래그 제거 (네트워크 실패는 GPU 문제 아님)
@@ -3020,6 +3412,8 @@ class LiveViewDialog(QDialog):
         (function() {
             var info = {};
             // video 요소 상태
+            var videos = document.querySelectorAll('video');
+            info.video_count = videos.length;
             var v = document.querySelector('video');
             if (v) {
                 info.video = {
@@ -3027,7 +3421,9 @@ class LiveViewDialog(QDialog):
                     paused: v.paused,
                     width: v.videoWidth,
                     height: v.videoHeight,
-                    srcObj: !!v.srcObject
+                    srcObj: !!v.srcObject,
+                    currentTime: v.currentTime,
+                    networkState: v.networkState
                 };
             }
             // canvas 요소 상태
@@ -3036,10 +3432,26 @@ class LiveViewDialog(QDialog):
                 info.canvas = { width: c.width, height: c.height };
             }
             // RTCPeerConnection 상태
-            if (window._origRTCPeerConnection || window.RTCPeerConnection) {
-                var pcs = window._wellcom_pcs || [];
-                info.rtc_count = pcs.length;
-            }
+            info.rtc_available = typeof RTCPeerConnection !== 'undefined';
+            var pcs = window._wellcom_pcs || [];
+            info.rtc_count = pcs.length;
+            info.rtc_monitor_count = window.__rtc_count || 0;
+            // WebSocket 상태
+            info.ws_monitor_count = window.__ws_count || 0;
+            info.ws_instances = (window.__ws_instances || []).map(function(w) {
+                return {url: w.url, created: w.created};
+            });
+            // 페이지 에러
+            info.page_errors = (window.__page_errors || []).slice(-5);
+            info.console_errors = (window.__console_errors || []).slice(-5);
+            // DOM 상태
+            var root = document.getElementById('root');
+            info.root_children = root ? root.children.length : 0;
+            info.body_text = document.body.innerText.substring(0, 300);
+            // mediaDevices
+            info.mediaDevices = !!navigator.mediaDevices;
+            // 현재 URL
+            info.url = window.location.href;
             return JSON.stringify(info);
         })();
         """
@@ -3048,15 +3460,113 @@ class LiveViewDialog(QDialog):
         except Exception:
             pass
 
+    def _log_webrtc_phase_result(self, result):
+        """WebRTC 종합 진단 결과 (확장 버전)"""
+        if result:
+            print(f"[LiveView] WebRTC 종합진단: {result}")
+
     def _on_webrtc_phase_result(self, result):
         if result:
             print(f"[LiveView] WebRTC 상태: {result}")
 
+    def _inject_debug_monitors(self):
+        """페이지 로드 직후 WebSocket/RTCPeerConnection/에러 모니터 삽입
+        v1.10.54: 페이지의 WebSocket/RTC 생성을 가로채서 로그에 기록
+        """
+        inject_js = """
+        (function() {
+            if (window.__wellcom_monitors) return 'already';
+            window.__rtc_count = 0;
+            window.__ws_count = 0;
+            window.__page_errors = [];
+            window.__console_errors = [];
+            window.__ws_instances = [];
+            window.__rtc_instances = [];
+
+            // RTCPeerConnection 가로채기
+            var _OrigRTC = window.RTCPeerConnection;
+            window.RTCPeerConnection = function() {
+                window.__rtc_count++;
+                var pc = new _OrigRTC(...arguments);
+                window.__rtc_instances.push({created: new Date().toISOString()});
+                console.log('[MONITOR] RTCPeerConnection #' + window.__rtc_count);
+                pc.addEventListener('connectionstatechange', function() {
+                    console.log('[MONITOR] RTC state: ' + pc.connectionState);
+                });
+                pc.addEventListener('track', function(e) {
+                    console.log('[MONITOR] Track: ' + e.track.kind);
+                });
+                return pc;
+            };
+            window.RTCPeerConnection.prototype = _OrigRTC.prototype;
+
+            // WebSocket 가로채기
+            var _OrigWS = window.WebSocket;
+            window.WebSocket = function(url, protocols) {
+                window.__ws_count++;
+                console.log('[MONITOR] WebSocket #' + window.__ws_count + ' -> ' + url);
+                var ws = protocols ? new _OrigWS(url, protocols) : new _OrigWS(url);
+                window.__ws_instances.push({url: url, created: new Date().toISOString(), readyState: 0});
+                ws.addEventListener('open', function() {
+                    console.log('[MONITOR] WS open: ' + url);
+                });
+                ws.addEventListener('error', function(e) {
+                    console.log('[MONITOR] WS error: ' + url);
+                });
+                ws.addEventListener('close', function(e) {
+                    console.log('[MONITOR] WS close: ' + url + ' code=' + e.code);
+                });
+                ws.addEventListener('message', function(e) {
+                    if (!window.__ws_first_msg) {
+                        window.__ws_first_msg = true;
+                        console.log('[MONITOR] WS first message from: ' + url + ' len=' + (e.data ? e.data.length : 0));
+                    }
+                });
+                return ws;
+            };
+            window.WebSocket.prototype = _OrigWS.prototype;
+            window.WebSocket.CONNECTING = _OrigWS.CONNECTING;
+            window.WebSocket.OPEN = _OrigWS.OPEN;
+            window.WebSocket.CLOSING = _OrigWS.CLOSING;
+            window.WebSocket.CLOSED = _OrigWS.CLOSED;
+
+            // 에러 캡처
+            window.addEventListener('error', function(e) {
+                window.__page_errors.push({
+                    msg: e.message, file: (e.filename||'').split('/').pop(), line: e.lineno,
+                    time: new Date().toISOString()
+                });
+                console.log('[MONITOR] Error: ' + e.message);
+            });
+            var _origErr = console.error;
+            console.error = function() {
+                var args = Array.from(arguments).map(String).join(' ');
+                window.__console_errors.push({msg: args, time: new Date().toISOString()});
+                _origErr.apply(console, arguments);
+            };
+
+            window.__wellcom_monitors = true;
+            return 'monitors installed';
+        })();
+        """
+        try:
+            self.web_view.page().runJavaScript(inject_js, self._on_monitors_injected)
+        except Exception as e:
+            print(f"[LiveView] 모니터 삽입 오류: {e}")
+
+    def _on_monitors_injected(self, result):
+        print(f"[LiveView] 디버그 모니터 삽입: {result}")
+
     def _on_render_process_terminated(self, status, exit_code):
         """렌더 프로세스 크래시 감지 → 자동 재연결 + GPU 크래시 플래그"""
+        import time as _t
+        import threading
         status_names = {0: "정상 종료", 1: "비정상 종료", 2: "강제 종료"}
         reason = status_names.get(status, f"알 수 없음({status})")
-        print(f"[LiveView] 렌더 프로세스 종료: {reason} (exit_code={exit_code})")
+        print(f"\n[LiveView] ⚠ 렌더 프로세스 종료: {reason} (exit_code={exit_code}) — {_t.strftime('%H:%M:%S')}")
+        thread_names = [t.name for t in threading.enumerate()]
+        print(f"[LiveView] 크래시 시점 스레드 ({len(thread_names)}): {', '.join(thread_names)}")
+        print(f"[LiveView] CHROMIUM_FLAGS={os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', 'N/A')}")
         self.status_label.setText(f"{self.device.name} - 연결 끊김")
         self.status_label.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 11px;")
 
@@ -3145,15 +3655,25 @@ class LiveViewDialog(QDialog):
         })();
         """
         self.web_view.page().runJavaScript(js)
-        # 타이틀 변경 감시 시작
-        self.web_view.page().titleChanged.connect(self._on_webrtc_title_changed)
+        # v1.10.54: titleChanged는 __init__에서 이미 연결됨 — 중복 연결 제거
 
     def _on_webrtc_title_changed(self, title: str):
-        """WebRTC 상태 변경 감지 (title로 전달)"""
-        if not title.startswith('WELLCOM_RTC_'):
+        """WebRTC/WebSocket 상태 변경 감지 (title로 전달)
+        v1.10.54: WELLCOM_WS_*, WELLCOM_RTC_* 모두 처리
+        """
+        if not title.startswith('WELLCOM_'):
+            return
+        print(f"[LiveView] 타이틀 이벤트: {title}")
+        if title.startswith('WELLCOM_WS_'):
+            # WebSocket 이벤트 로그
+            return
+        if title.startswith('WELLCOM_RTC_CREATED_'):
+            # RTC 생성 이벤트 로그
+            return
+        if title.startswith('WELLCOM_RTC_TRACK_'):
+            # 트랙 수신 이벤트
             return
         state = title.replace('WELLCOM_RTC_', '')
-        print(f"[LiveView] WebRTC 상태 변경: {state}")
         if state in ('DISCONNECTED', 'FAILED', 'CLOSED'):
             self.status_label.setText(f"{self.device.name} - WebRTC 끊김")
             self.status_label.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 11px;")
@@ -3679,7 +4199,7 @@ class LiveViewDialog(QDialog):
 
         # UI 업데이트
         self.game_mode_bar.show()
-        self.btn_game_mode.setText("해제 (Alt+F2)")
+        self.btn_game_mode.setText("해제 (Ctrl+F2)")
         self.btn_game_mode.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
@@ -3700,7 +4220,7 @@ class LiveViewDialog(QDialog):
         """아이온2 모드 JavaScript 실행 결과"""
         if not result:
             # Pointer Lock 실패 시 대체 메시지
-            self.game_mode_bar.setText("  화면 클릭하여 마우스 잠금 | ALT: 커서 | Alt+F2: 해제")
+            self.game_mode_bar.setText("  화면 클릭하여 마우스 잠금 | ALT: 커서 | Ctrl+F2: 해제")
 
     def _stop_game_mode(self):
         """아이온2 모드 중지 + 자동 Abs 복원"""
@@ -3715,7 +4235,7 @@ class LiveViewDialog(QDialog):
 
         # UI 업데이트
         self.game_mode_bar.hide()
-        self.btn_game_mode.setText("아이온2 (Alt+F1)")
+        self.btn_game_mode.setText("아이온2 (Ctrl+F1)")
         self.btn_game_mode.setStyleSheet("""
             QPushButton {
                 background-color: #FF5722;
@@ -4258,9 +4778,12 @@ class LiveViewDialog(QDialog):
             self._region_overlay.setGeometry(self.web_view.rect())
 
     def closeEvent(self, event):
+        import time as _t
+        print(f"\n[LiveView] closeEvent 시작 — {self.device.name} — {_t.strftime('%H:%M:%S')}")
+
         # GPU 플래그 정리 (정상 종료 — 크래시 아님)
         self._set_gpu_loading_flag(False)
-        print("[LiveView] 정상 종료 — GPU 플래그 제거")
+        print("[LiveView] ① GPU 로딩 플래그 제거")
 
         # 마지막 창 크기 저장
         if app_settings.get('liveview.remember_resolution', True):
@@ -4268,7 +4791,7 @@ class LiveViewDialog(QDialog):
             app_settings.set('liveview.last_width', size.width(), False)
             app_settings.set('liveview.last_height', size.height(), False)
             app_settings.save()
-            print(f"[LiveView] 창 크기 저장: {size.width()}x{size.height()}")
+            print(f"[LiveView] ② 창 크기 저장: {size.width()}x{size.height()}")
 
         # 재연결 방지 (닫는 중에 재연결 시도 안 함)
         self._max_reconnect = 0
@@ -4278,6 +4801,7 @@ class LiveViewDialog(QDialog):
             self._stop_recording()
         if self.vision_controller:
             self.vision_controller.cleanup()
+        print("[LiveView] ③ 게임모드/녹화/Vision 정리 완료")
 
         # 시그널 해제 (재연결 트리거 방지)
         try:
@@ -4292,20 +4816,58 @@ class LiveViewDialog(QDialog):
             self.aion2_page.renderProcessTerminated.disconnect(self._on_render_process_terminated)
         except Exception:
             pass
+        print("[LiveView] ④ 시그널 해제 완료")
 
-        # WebView 정리 (WebRTC 연결 해제 + Chromium 리소스 반환)
-        try:
-            self.web_view.stop()
-            self.web_view.setUrl(QUrl("about:blank"))
-            # 이벤트 처리: about:blank 전환이 시작되도록
-            QApplication.processEvents()
-            self.web_view.setParent(None)
-            self.web_view.deleteLater()
-            print("[LiveView] WebView 정리 완료")
-        except Exception as e:
-            print(f"[LiveView] WebView 정리 오류: {e}")
-        self.hid.disconnect()
+        # WebView 정리
+        if self._existing_webview:
+            # 재사용 모드: WebView를 파괴하지 않고 보존 (썸네일에 반환 예정)
+            try:
+                # CLEAN_UI_JS 스타일 제거
+                self.web_view.page().runJavaScript("""
+                    var s = document.getElementById('wellcomland-clean-ui');
+                    if (s) s.remove();
+                """)
+                # 레이아웃에서 분리만 (파괴 금지)
+                layout = self.layout()
+                if layout:
+                    layout.removeWidget(self.web_view)
+                self.web_view.setParent(None)
+                self._reusable_webview = self.web_view
+                print("[LiveView] ⑤ WebView 보존 완료 (썸네일 반환 대기)")
+            except Exception as e:
+                print(f"[LiveView] ⑤ WebView 보존 오류: {e}")
+                self._reusable_webview = None
+        else:
+            # 일반 모드: WebView 완전 파괴 (기존 로직)
+            # v1.10.38: processEvents() 제거 — 재진입 위험 방지
+            try:
+                self.web_view.stop()
+                self.web_view.setUrl(QUrl("about:blank"))
+                self.web_view.setParent(None)
+                self.web_view.deleteLater()
+                print("[LiveView] ⑤ WebView 정리 완료 (deleteLater 예약)")
+            except Exception as e:
+                print(f"[LiveView] ⑤ WebView 정리 오류: {e}")
+
+        # v1.10.44: HID disconnect를 백그라운드에서 실행
+        # SSH 접속 불가 IP(다른 서브넷)에서 _worker_thread.join(timeout=2) 블로킹 방지
+        import threading
+        threading.Thread(target=self._safe_hid_disconnect, daemon=True).start()
+        print(f"[LiveView] ⑥ HID 비동기 해제 시작")
+
+        # 활성 스레드 목록 기록
+        thread_names = [t.name for t in threading.enumerate()]
+        print(f"[LiveView] closeEvent 완료 — 스레드 ({len(thread_names)}): {', '.join(thread_names)}")
+
         super().closeEvent(event)
+
+    def _safe_hid_disconnect(self):
+        """HID 연결 해제 (백그라운드 스레드에서 안전하게 실행)"""
+        try:
+            self.hid.disconnect()
+            print("[LiveView] HID 연결 해제 완료")
+        except Exception as e:
+            print(f"[LiveView] HID 연결 해제 오류 (무시): {e}")
 
 
 class VisionSettingsDialog(QDialog):
@@ -5317,17 +5879,27 @@ class MainWindow(QMainWindow):
         self.status_thread = StatusUpdateThread(self.manager)
         self.status_thread.status_updated.connect(self._on_status_updated)
         self.status_thread.start()
+        print(f"[MainWindow] StatusUpdateThread 시작 (장치 {len(self.manager.get_all_devices())}개 모니터링)")
 
     def _on_status_updated(self, status: dict):
+        # v1.10.46: LiveView 활성 중이면 UI 갱신 스킵 (이중 안전장치)
+        if getattr(self, '_live_control_device', None):
+            print(f"[StatusUpdate] ⚠ LiveView 활성 중 signal 수신 — UI 갱신 스킵 (device={self._live_control_device})")
+            return
+
         # 상태 결과를 장치에 반영
         try:
+            changed = []
             for device_name, device_status in status.items():
                 device = self.manager.get_device(device_name)
                 if device:
-                    if device_status.get('online', False):
-                        device.status = DeviceStatus.ONLINE
-                    else:
-                        device.status = DeviceStatus.OFFLINE
+                    new_status = DeviceStatus.ONLINE if device_status.get('online', False) else DeviceStatus.OFFLINE
+                    if device.status != new_status:
+                        changed.append(f"{device_name}:{new_status.name}")
+                        device.status = new_status
+
+            if changed:
+                print(f"[StatusUpdate] 상태 변경: {', '.join(changed)}")
 
             self._load_device_list()
             if self.current_device:
@@ -5337,6 +5909,8 @@ class MainWindow(QMainWindow):
                 self.grid_view_tab.update_device_status()
         except Exception as e:
             print(f"[MainWindow] 상태 업데이트 처리 오류: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _on_grid_device_selected(self, device: KVMDevice):
         """그리드 뷰에서 장치 클릭 - 선택만"""
@@ -5652,52 +6226,213 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "이름 변경 실패",
                                 f"'{new_name}' 이름이 이미 존재하거나 변경에 실패했습니다.")
 
+    def _check_device_reachable(self, device) -> bool:
+        """1:1 제어 전 장치 접근 가능 여부 사전 체크
+
+        v1.10.44: 서브넷이 다른 장비(릴레이 미설정)에 직접 접속 시
+        WebView 타임아웃 + HID SSH 블로킹으로 프로그램 종료되는 문제 방지.
+
+        Returns: True=접근 가능, False=접근 불가(메시지 표시)
+        """
+        import socket
+
+        ip = device.ip
+        web_port = getattr(device.info, 'web_port', 80)
+
+        # Tailscale(100.x) / localhost는 항상 허용
+        if ip.startswith('100.') or ip.startswith('127.'):
+            return True
+
+        # TCP 포트 빠른 체크 (1.5초 타임아웃)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.5)
+            result = sock.connect_ex((ip, web_port))
+            sock.close()
+            if result == 0:
+                return True
+        except Exception:
+            pass
+
+        # 접근 불가 → 사용자에게 안내
+        QMessageBox.warning(
+            self, "접속 불가",
+            f"'{device.name}' ({ip}:{web_port})에 접속할 수 없습니다.\n\n"
+            f"서브넷이 다른 장비는 릴레이 설정이 필요합니다.\n"
+            f"미리보기는 가능하지만 1:1 제어는 직접 접근이 필요합니다."
+        )
+        return False
+
+    def _find_device_thumbnail(self, device_name):
+        """장치 이름으로 썸네일 위젯 찾기 (모든 탭 검색)"""
+        all_tabs = []
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            all_tabs.append(self.grid_view_tab)
+        if hasattr(self, 'group_grid_tabs'):
+            all_tabs.extend(self.group_grid_tabs.values())
+
+        for tab in all_tabs:
+            for thumb in tab.thumbnails:
+                if thumb.device.name == device_name:
+                    return thumb
+        return None
+
     def _on_start_live_control(self):
         if not self.current_device:
             QMessageBox.warning(self, "경고", "장치를 먼저 선택해주세요.")
             return
 
-        # 1:1 제어 시작 전: 모든 썸네일 미리보기 중지 (GPU 부하 경감)
-        self._live_control_device = self.current_device.name
-        self._stop_all_previews_for_liveview()
+        device = self.current_device
+        import time as _t
+        print(f"\n[LiveView] ═══ 1:1 제어 시작 ═══ {device.name} ({device.ip}) — {_t.strftime('%H:%M:%S')}")
 
-        # v1.10.36: dialog.exec() 대신 show()로 비동기 실행
-        # exec()는 네스티드 이벤트 루프를 생성하여 Chromium GPU 서브프로세스 크래시 시
-        # access violation이 메인 프로세스로 전파됨.
-        # show()는 메인 이벤트 루프에서 처리되어 renderProcessTerminated로 안전하게 복구.
+        # v1.10.44: 접근 불가 IP 사전 체크 (서브넷이 다른 장비)
+        # 릴레이 치환이 안 된 다른 서브넷 장비에 직접 접속 시 프로그램 종료 방지
+        if not self._check_device_reachable(device):
+            print(f"[LiveView] ✗ 접근 불가 — 1:1 제어 취소")
+            return
+
+        # v1.10.45: 상태 모니터링 스레드 일시정지
+        # TCP 체크 + signal emit이 메인 스레드 UI 갱신 → GPU 렌더링 경합 → access violation 방지
+        if hasattr(self, 'status_thread') and self.status_thread:
+            self.status_thread.pause()
+            print(f"[LiveView] StatusThread 일시정지 완료")
+
+        # 활성 스레드 목록 기록 (디버깅용)
+        import threading
+        thread_names = [t.name for t in threading.enumerate()]
+        print(f"[LiveView] 활성 스레드 ({len(thread_names)}): {', '.join(thread_names)}")
+
+        self._live_control_device = device.name
+
+        # 대상 장치의 썸네일에서 WebView 분리 시도 (WebRTC 재사용)
+        detached_wv = None
+        thumb = self._find_device_thumbnail(device.name)
+        if thumb and thumb._webview:
+            detached_wv = thumb.detach_webview_for_liveview()
+            if detached_wv:
+                print(f"[LiveView] WebView 분리 성공 — WebRTC 재사용 모드")
+
+        if detached_wv:
+            # v1.15: 나머지 장치는 파괴하지 않고 일시정지 (GPU 부하 경감 + 빠른 복귀)
+            self._pause_other_previews_for_liveview(device.name)
+            print(f"[LiveView] 300ms 대기 후 LiveView 생성 예약 (WebView 재사용)")
+            QTimer.singleShot(300, lambda: self._create_live_dialog(device, detached_wv))
+        else:
+            # 기존 로직: 모든 썸네일 파괴 후 새 WebView로 생성
+            self._stop_all_previews_for_liveview()
+            print(f"[LiveView] 1200ms 대기 후 LiveView 생성 예약 (새 WebView)")
+            QTimer.singleShot(1200, lambda: self._create_live_dialog(device))
+
+    def _create_live_dialog(self, device, existing_webview=None):
+        """LiveView 다이얼로그 실제 생성 (지연 호출)
+
+        v1.10.36: dialog.exec() 대신 show()로 비동기 실행
+        v1.10.38: _stop_all_previews 후 지연하여 GPU 리소스 해제 보장
+        v1.10.47: pending deleteLater() 강제 처리 후 WebView 생성
+        v1.10.56: GPU 리소스 완전 해제를 위해 processEvents 3회 + gc 호출
+        v1.15: existing_webview 전달 시 WebRTC 재사용 모드
+        """
+        import time as _t
+        print(f"[LiveView] _create_live_dialog 시작 — {_t.strftime('%H:%M:%S')}")
+
+        # v1.10.56: 썸네일 WebView의 deleteLater() + GPU 리소스 완전 해제
+        # processEvents를 여러 번 호출하여 pending deletion이 확실히 처리되도록
+        # 이 시점에는 LiveView WebView가 아직 없으므로 재진입 위험 없음
         try:
-            self._live_dialog = LiveViewDialog(self.current_device, self)
+            import gc
+            QApplication.processEvents()
+            QApplication.processEvents()
+            gc.collect()
+            QApplication.processEvents()
+            print(f"[LiveView] pending 이벤트 3회 처리 + gc.collect 완료 (v1.10.56)")
+        except Exception as e:
+            print(f"[LiveView] processEvents 오류 (무시): {e}")
+
+        try:
+            self._live_dialog = LiveViewDialog(device, self, existing_webview=existing_webview)
             self._live_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
             self._live_dialog.finished.connect(self._on_live_dialog_closed)
             self._live_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
             self._live_dialog.show()
+            reuse_tag = " [WebView 재사용]" if existing_webview else ""
+            print(f"[LiveView] 다이얼로그 표시 완료{reuse_tag} — {_t.strftime('%H:%M:%S')}")
         except Exception as e:
             print(f"[LiveView] 생성 오류: {e}")
             import traceback
             traceback.print_exc()
             self._live_control_device = None
+            # 에러 시 StatusThread 재개
+            if hasattr(self, 'status_thread') and self.status_thread:
+                self.status_thread.resume()
             self._resume_all_previews_after_liveview()
 
     def _on_live_dialog_closed(self):
-        """LiveView 다이얼로그 종료 후 정리 (비동기 콜백)"""
+        """LiveView 다이얼로그 종료 후 정리 (비동기 콜백)
+
+        v1.10.38: processEvents() 제거 — 재진입 위험 방지.
+        deleteLater()는 메인 이벤트 루프에서 자연스럽게 처리됨.
+        썸네일 재시작은 QTimer.singleShot으로 약간 지연하여
+        WebView 정리가 완료된 후 실행되도록 보장.
+        v1.15: WebView 재사용 시 썸네일에 즉시 반환.
+        """
+        import time as _t
+        print(f"\n[LiveView] ═══ 1:1 제어 종료 ═══ — {_t.strftime('%H:%M:%S')}")
         dialog = getattr(self, '_live_dialog', None)
 
-        # WebView deleteLater() 완료 대기
-        QApplication.processEvents()
+        # WebView 재사용: 다이얼로그에서 보존된 WebView 가져오기
+        reusable_wv = None
+        device_name = None
+        if dialog:
+            reusable_wv = getattr(dialog, '_reusable_webview', None)
+            device_name = dialog.device.name if hasattr(dialog, 'device') else None
 
         # 1:1 제어 종료 — 플래그 해제 + 메인 윈도우 활성화
         self._live_control_device = None
         self.activateWindow()
         self.raise_()
 
+        # v1.10.45: 상태 모니터링 스레드 재개
+        if hasattr(self, 'status_thread') and self.status_thread:
+            self.status_thread.resume()
+            print(f"[LiveView] StatusThread 재개 완료")
+
+        # 활성 스레드 목록 기록 (디버깅용)
+        import threading
+        thread_names = [t.name for t in threading.enumerate()]
+        print(f"[LiveView] 활성 스레드 ({len(thread_names)}): {', '.join(thread_names)}")
+
         # 부분제어로 닫힌 경우 → 미리보기 재시작 하지 않음 (탭 전환에서 처리)
         if dialog and getattr(dialog, '_partial_control_closing', False):
+            print(f"[LiveView] 부분제어 종료 — 미리보기 재시작 스킵")
             self._live_dialog = None
             return
 
-        # 1:1 제어 종료 후: 모든 썸네일 미리보기 재시작
-        self._resume_all_previews_after_liveview()
         self._live_dialog = None
+
+        # WebView 재사용: 대상 장치 썸네일에 WebView 반환 + 나머지 일시정지 해제
+        if reusable_wv and device_name:
+            thumb = self._find_device_thumbnail(device_name)
+            if thumb:
+                thumb.reattach_webview(reusable_wv)
+                print(f"[LiveView] WebView 썸네일 반환 완료 — {device_name}")
+                # 나머지 장치는 일시정지 해제 (즉시 재개 — URL 재로드 없음)
+                self._resume_other_previews_after_liveview()
+                print(f"[LiveView] 모든 썸네일 즉시 복원 완료 (v1.15)")
+                return
+            else:
+                print(f"[LiveView] 썸네일을 찾을 수 없음 — WebView 파괴: {device_name}")
+                # 썸네일을 찾지 못하면 WebView 파괴
+                try:
+                    reusable_wv.stop()
+                    reusable_wv.setUrl(QUrl("about:blank"))
+                    reusable_wv.deleteLater()
+                except Exception:
+                    pass
+
+        # 기존 로직: 1200ms 대기 후 모든 썸네일 재시작
+        print(f"[LiveView] 1200ms 후 썸네일 재시작 예약 (v1.14)")
+        QTimer.singleShot(1200, self._resume_all_previews_after_liveview)
 
     def _apply_partial_crop(self, group: str, region: tuple):
         """부분제어 — 해당 그룹 탭으로 전환하고 크롭 적용
@@ -5773,13 +6508,72 @@ class MainWindow(QMainWindow):
     })();
     """
 
+    def _pause_other_previews_for_liveview(self, target_device_name):
+        """1:1 제어 시작 전 대상 장치 외 나머지 썸네일 일시정지 (WebView 유지)
+
+        v1.15: 파괴 대신 일시정지 — WebRTC 트랙 비활성 + video pause.
+        복귀 시 _resume_other_previews_after_liveview()로 즉시 재개.
+        """
+        all_tabs = []
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            all_tabs.append(self.grid_view_tab)
+        if hasattr(self, 'group_grid_tabs'):
+            all_tabs.extend(self.group_grid_tabs.values())
+
+        paused = 0
+        for tab in all_tabs:
+            for thumb in tab.thumbnails:
+                if thumb.device.name == target_device_name:
+                    continue  # 대상 장치는 건너뜀 (이미 detach됨)
+                try:
+                    if thumb._webview and thumb._is_active:
+                        # WebRTC 트랙 비활성 (GPU 디코딩 중지)
+                        thumb._webview.page().runJavaScript(self._PAUSE_WEBRTC_JS)
+                        thumb.pause_capture()
+                        paused += 1
+                except Exception as e:
+                    print(f"[MainWindow] 썸네일 일시정지 오류: {e}")
+
+        import time as _t
+        print(f"[LiveView] 썸네일 {paused}개 일시정지 완료 — {_t.strftime('%H:%M:%S')}")
+
+    def _resume_other_previews_after_liveview(self):
+        """1:1 제어 종료 후 일시정지된 썸네일 재개 (WebRTC 트랙 재활성)
+
+        v1.15: 재생성 대신 재개 — URL 재로드 없이 즉시 복원.
+        """
+        all_tabs = []
+        if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
+            all_tabs.append(self.grid_view_tab)
+        if hasattr(self, 'group_grid_tabs'):
+            all_tabs.extend(self.group_grid_tabs.values())
+
+        resumed = 0
+        for tab in all_tabs:
+            if tab._is_visible and tab._live_preview_enabled:
+                for thumb in tab.thumbnails:
+                    try:
+                        if thumb._is_paused and thumb._webview:
+                            # WebRTC 트랙 재활성 + video play
+                            thumb._webview.page().runJavaScript(self._RESUME_WEBRTC_JS)
+                            thumb.resume_capture()
+                            resumed += 1
+                        elif not thumb._is_active:
+                            # 활성화되지 않은 썸네일은 새로 시작
+                            thumb.start_capture()
+                            resumed += 1
+                    except Exception as e:
+                        print(f"[MainWindow] 썸네일 재개 오류: {e}")
+
+        import time as _t
+        print(f"[LiveView] 썸네일 {resumed}개 재개 완료 — {_t.strftime('%H:%M:%S')}")
+
     def _stop_all_previews_for_liveview(self):
         """1:1 제어 시작 전 모든 썸네일 WebView 완전 파괴
 
         v1.10.31: pause가 아닌 완전 파괴 방식으로 변경.
-        16개 썸네일 WebView가 메모리에 남아있으면 LiveView WebView 생성 시
-        GPU 리소스 충돌로 access violation 발생 (frozen EXE 환경).
-        WebView를 완전히 삭제하여 GPU 리소스를 확보한 후 LiveView를 시작한다.
+        v1.10.38: processEvents() 제거 — 재진입 위험 방지.
+        deleteLater()는 메인 이벤트 루프에서 자연스럽게 처리됨.
         """
         all_tabs = []
         if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
@@ -5796,17 +6590,16 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[MainWindow] 썸네일 파괴 오류: {e}")
 
-        # deleteLater() 완료 대기 — GPU 리소스 완전 해제 보장
-        QApplication.processEvents()
-        QApplication.processEvents()
-        print(f"[MainWindow] 1:1 제어 시작 — 모든 썸네일 WebView 파괴 ({destroyed}개)")
+        import time as _t
+        print(f"[LiveView] 썸네일 WebView {destroyed}개 파괴 완료 — {_t.strftime('%H:%M:%S')}")
 
     def _resume_all_previews_after_liveview(self):
-        """1:1 제어 종료 후 활성 탭의 썸네일 WebView 재생성 + 미리보기 재시작"""
-        # LiveView WebView 정리 대기
-        QApplication.processEvents()
-        QApplication.processEvents()
+        """1:1 제어 종료 후 활성 탭의 썸네일 WebView 재생성 + 미리보기 재시작
 
+        v1.10.38: processEvents() 제거 — 재진입 위험 방지.
+        _on_live_dialog_closed에서 QTimer.singleShot(500ms)으로 호출하여
+        LiveView WebView 정리가 완료된 후 실행됨.
+        """
         all_tabs = []
         if hasattr(self, 'grid_view_tab') and self.grid_view_tab:
             all_tabs.append(self.grid_view_tab)
@@ -5822,7 +6615,8 @@ class MainWindow(QMainWindow):
                         restarted += 1
                     except Exception as e:
                         print(f"[MainWindow] 썸네일 재시작 오류: {e}")
-        print(f"[MainWindow] 1:1 제어 종료 — 썸네일 WebView 재생성 ({restarted}개)")
+        import time as _t
+        print(f"[LiveView] 썸네일 WebView {restarted}개 재시작 완료 — {_t.strftime('%H:%M:%S')}")
 
     def _stop_device_preview(self, device: KVMDevice):
         """특정 장치의 미리보기 중지 (전체 탭 + 그룹 탭 모두 처리)"""

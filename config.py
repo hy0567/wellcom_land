@@ -142,6 +142,9 @@ class Settings:
             'authkey': '',  # 서버에서 받은 authkey (회사 공용)
             'joined': False,  # tailnet 참여 완료 여부
         },
+        'graphics': {
+            'software_rendering': False,
+        },
         'vision': {
             'model_path': '',
             'confidence': 0.5,

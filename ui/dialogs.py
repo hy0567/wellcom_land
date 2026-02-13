@@ -542,12 +542,9 @@ class AppSettingsDialog(QDialog):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # 탭 위젯
-        tabs = QTabWidget()
-
-        # 일반 설정 탭
-        general_tab = QWidget()
-        general_layout = QFormLayout(general_tab)
+        # 일반 설정
+        general_group = QGroupBox("일반")
+        general_layout = QFormLayout(general_group)
 
         self.confirm_delete_check = QCheckBox("장치 삭제 시 확인")
         general_layout.addRow("", self.confirm_delete_check)
@@ -555,59 +552,49 @@ class AppSettingsDialog(QDialog):
         self.auto_scan_check = QCheckBox("시작 시 자동 스캔")
         general_layout.addRow("", self.auto_scan_check)
 
-        tabs.addTab(general_tab, "일반")
+        layout.addWidget(general_group)
 
-        # SSH 설정 탭
-        ssh_tab = QWidget()
-        ssh_layout = QFormLayout(ssh_tab)
+        # 1:1 제어 설정
+        live_group = QGroupBox("1:1 제어")
+        live_layout = QFormLayout(live_group)
 
-        self.ssh_user_edit = QLineEdit()
-        ssh_layout.addRow("기본 사용자명:", self.ssh_user_edit)
+        self.remember_resolution_check = QCheckBox("마지막 창 크기 기억")
+        live_layout.addRow("", self.remember_resolution_check)
 
-        self.ssh_password_edit = QLineEdit()
-        self.ssh_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        ssh_layout.addRow("기본 비밀번호:", self.ssh_password_edit)
+        # 해상도 표시 (현재 저장된 값)
+        saved_w = settings.get('liveview.last_width', 1920)
+        saved_h = settings.get('liveview.last_height', 1080)
+        self.resolution_label = QLabel(f"현재 저장: {saved_w} x {saved_h}")
+        self.resolution_label.setStyleSheet("color: #888; font-size: 11px;")
+        live_layout.addRow("", self.resolution_label)
 
-        self.ssh_port_spin = QSpinBox()
-        self.ssh_port_spin.setRange(1, 65535)
-        ssh_layout.addRow("기본 SSH 포트:", self.ssh_port_spin)
+        layout.addWidget(live_group)
 
-        self.ssh_timeout_spin = QSpinBox()
-        self.ssh_timeout_spin.setRange(1, 60)
-        self.ssh_timeout_spin.setSuffix(" 초")
-        ssh_layout.addRow("연결 타임아웃:", self.ssh_timeout_spin)
+        # 그래픽 설정
+        gpu_group = QGroupBox("그래픽")
+        gpu_layout = QFormLayout(gpu_group)
 
-        tabs.addTab(ssh_tab, "SSH")
+        self.software_gl_check = QCheckBox("소프트웨어 렌더링 (GPU 문제 시)")
+        self.software_gl_check.setToolTip(
+            "1:1 제어 시 프로그램이 강제종료되는 경우 활성화하세요.\n"
+            "GPU 대신 CPU로 렌더링하여 안정성이 향상됩니다.\n"
+            "변경 후 프로그램을 재시작해야 적용됩니다."
+        )
+        gpu_layout.addRow("", self.software_gl_check)
 
-        # 아이온2 모드 설정 탭
-        aion2_tab = QWidget()
-        aion2_layout = QFormLayout(aion2_tab)
+        # 현재 상태 표시
+        import os
+        from config import DATA_DIR
+        _flag = os.path.join(DATA_DIR, ".gpu_crash")
+        if os.path.exists(_flag):
+            gpu_status = QLabel("⚠ GPU 크래시 감지됨 — 현재 소프트웨어 렌더링 중")
+            gpu_status.setStyleSheet("color: #FFC107; font-size: 11px;")
+        else:
+            gpu_status = QLabel("현재: GPU 하드웨어 가속")
+            gpu_status.setStyleSheet("color: #4CAF50; font-size: 11px;")
+        gpu_layout.addRow("", gpu_status)
 
-        self.aion2_sensitivity_spin = QSpinBox()
-        self.aion2_sensitivity_spin.setRange(1, 30)
-        aion2_layout.addRow("기본 감도 (x0.1):", self.aion2_sensitivity_spin)
-
-        self.aion2_immediate_check = QCheckBox("즉시 전송 모드 (최소 지연)")
-        aion2_layout.addRow("", self.aion2_immediate_check)
-
-        tabs.addTab(aion2_tab, "아이온2 모드")
-
-        # 자동 검색 설정 탭
-        discovery_tab = QWidget()
-        discovery_layout = QFormLayout(discovery_tab)
-
-        self.discovery_ports_edit = QLineEdit()
-        self.discovery_ports_edit.setPlaceholderText("예: 80, 8080")
-        discovery_layout.addRow("스캔 포트:", self.discovery_ports_edit)
-
-        self.discovery_timeout_spin = QSpinBox()
-        self.discovery_timeout_spin.setRange(1, 10)
-        self.discovery_timeout_spin.setSuffix(" 초")
-        discovery_layout.addRow("스캔 타임아웃:", self.discovery_timeout_spin)
-
-        tabs.addTab(discovery_tab, "자동 검색")
-
-        layout.addWidget(tabs)
+        layout.addWidget(gpu_group)
 
         # 버튼
         button_layout = QHBoxLayout()
@@ -635,21 +622,16 @@ class AppSettingsDialog(QDialog):
         self.confirm_delete_check.setChecked(settings.get('general.confirm_delete', True))
         self.auto_scan_check.setChecked(settings.get('discovery.auto_scan_on_start', False))
 
-        # SSH
-        self.ssh_user_edit.setText(settings.get('ssh.default_user', 'root'))
-        self.ssh_password_edit.setText(settings.get('ssh.default_password', 'luckfox'))
-        self.ssh_port_spin.setValue(settings.get('ssh.default_port', 22))
-        self.ssh_timeout_spin.setValue(settings.get('ssh.timeout', 10))
+        # 1:1 제어
+        self.remember_resolution_check.setChecked(settings.get('liveview.remember_resolution', True))
 
-        # 아이온2
-        sensitivity = settings.get('aion2.sensitivity', 1.0)
-        self.aion2_sensitivity_spin.setValue(int(sensitivity * 10))
-        self.aion2_immediate_check.setChecked(settings.get('aion2.immediate_mode', True))
-
-        # 자동 검색
-        ports = settings.get('discovery.ports', [80, 8080])
-        self.discovery_ports_edit.setText(", ".join(str(p) for p in ports))
-        self.discovery_timeout_spin.setValue(int(settings.get('discovery.timeout', 1.5)))
+        # 그래픽
+        import os
+        from config import DATA_DIR
+        _flag = os.path.join(DATA_DIR, ".gpu_crash")
+        self.software_gl_check.setChecked(
+            settings.get('graphics.software_rendering', False) or os.path.exists(_flag)
+        )
 
     def _save_settings(self):
         """설정 저장"""
@@ -657,28 +639,42 @@ class AppSettingsDialog(QDialog):
         settings.set('general.confirm_delete', self.confirm_delete_check.isChecked(), False)
         settings.set('discovery.auto_scan_on_start', self.auto_scan_check.isChecked(), False)
 
-        # SSH
-        settings.set('ssh.default_user', self.ssh_user_edit.text(), False)
-        settings.set('ssh.default_password', self.ssh_password_edit.text(), False)
-        settings.set('ssh.default_port', self.ssh_port_spin.value(), False)
-        settings.set('ssh.timeout', self.ssh_timeout_spin.value(), False)
+        # 1:1 제어
+        settings.set('liveview.remember_resolution', self.remember_resolution_check.isChecked(), False)
 
-        # 아이온2
-        settings.set('aion2.sensitivity', self.aion2_sensitivity_spin.value() / 10.0, False)
-        settings.set('aion2.immediate_mode', self.aion2_immediate_check.isChecked(), False)
-
-        # 자동 검색
-        try:
-            ports = [int(p.strip()) for p in self.discovery_ports_edit.text().split(",") if p.strip()]
-            settings.set('discovery.ports', ports, False)
-        except ValueError:
-            pass
-        settings.set('discovery.timeout', float(self.discovery_timeout_spin.value()), False)
+        # 그래픽 — 소프트웨어 렌더링 토글
+        sw_render = self.software_gl_check.isChecked()
+        import os
+        from config import DATA_DIR
+        _flag = os.path.join(DATA_DIR, ".gpu_crash")
+        _was_sw = os.path.exists(_flag)
+        settings.set('graphics.software_rendering', sw_render, False)
+        if sw_render:
+            # 플래그 파일 생성 (다음 실행에서 소프트웨어 렌더링)
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(_flag, 'w') as f:
+                    f.write("manual=True\n")
+            except Exception:
+                pass
+        else:
+            # 플래그 파일 제거 (다음 실행에서 GPU 모드)
+            try:
+                if os.path.exists(_flag):
+                    os.remove(_flag)
+            except Exception:
+                pass
 
         # 저장
         settings.save()
 
-        QMessageBox.information(self, "설정 저장", "설정이 저장되었습니다.")
+        # 그래픽 설정 변경 시 재시작 안내
+        if sw_render != _was_sw:
+            QMessageBox.information(self, "설정 저장",
+                "설정이 저장되었습니다.\n\n"
+                "그래픽 설정 변경은 프로그램을 재시작해야 적용됩니다.")
+        else:
+            QMessageBox.information(self, "설정 저장", "설정이 저장되었습니다.")
         self.accept()
 
     def _reset_settings(self):

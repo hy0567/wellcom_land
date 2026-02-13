@@ -1,33 +1,36 @@
 """
-WellcomLAND MCP 디버그 서버
-- WellcomLAND 내부 상태를 Claude Code에서 실시간 조회 가능
-- SSE transport로 localhost에서 실행
-- 개발/디버깅 전용 (빌드 배포에 포함하지 않음)
+WellcomLAND 원격 디버그 서버 (내장 HTTP)
+- 외부 패키지 의존 없음 (순수 Python stdlib만 사용)
+- Tailscale IP로 원격 접근 가능 (0.0.0.0 바인딩)
+- 실시간 로그/상태/스레드/GPU 정보 조회
 
 사용법:
-  1. pip install "mcp[cli]"
-  2. WellcomLAND 실행 (자동으로 MCP 서버 시작)
-  3. Claude Code에서 MCP 도구 사용
+  1. WellcomLAND 실행 (자동으로 디버그 서버 시작)
+  2. 브라우저/curl: http://<Tailscale_IP>:5111/
+  3. curl http://<IP>:5111/api/logs?n=200
+  4. curl http://<IP>:5111/api/devices
+  5. curl http://<IP>:5111/api/status
 """
 
 import sys
+import os
 import json
 import time
 import threading
 import collections
-import asyncio
-import base64
-from io import BytesIO
-from typing import Optional
-
-from mcp.server.fastmcp import FastMCP
+import traceback
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 # ─── 전역 상태 ───────────────────────────────────────
-_main_window = None  # MainWindow 참조 (main.py에서 설정)
-_log_buffer = collections.deque(maxlen=1000)  # 최근 1000줄 로그
+_main_window = None
+_log_buffer = collections.deque(maxlen=2000)  # 최근 2000줄 로그
 _server_thread = None
+_start_time = time.time()
 
-# ─── stdout 캡처 ─────────────────────────────────────
+
+# ─── stdout/stderr 캡처 ──────────────────────────────
 class _LogTee:
     """stdout을 원래 출력 + 링 버퍼에 동시 기록"""
     def __init__(self, original):
@@ -51,29 +54,22 @@ class _LogTee:
     def isatty(self):
         return False
 
-    # 기타 file-like 속성 위임
     def __getattr__(self, name):
         return getattr(self.original, name)
 
 
 def install_log_capture():
-    """stdout/stderr 캡처 시작 (main.py에서 호출)"""
+    """stdout/stderr 캡처 시작"""
     if not isinstance(sys.stdout, _LogTee):
         sys.stdout = _LogTee(sys.stdout)
     if not isinstance(sys.stderr, _LogTee):
         sys.stderr = _LogTee(sys.stderr)
 
 
-# ─── Qt 메인 스레드에서 안전하게 실행 ─────────────────
-class _MainThreadInvoker(threading.Thread):
-    """Qt 시그널 없이 메인 스레드 큐를 폴링하여 실행하는 헬퍼"""
-    pass
-
-
-def _run_on_main_thread(func):
-    """Qt 메인 스레드에서 함수 실행하고 결과 반환 (thread-safe)"""
+# ─── Qt 메인 스레드 안전 실행 ─────────────────────────
+def _run_on_main_thread(func, timeout=5.0):
+    """Qt 메인 스레드에서 함수 실행 (thread-safe)"""
     if _main_window is None:
-        _write_log("[MCP] _run_on_main_thread: _main_window is None")
         return None
 
     result_holder = [None]
@@ -85,538 +81,665 @@ def _run_on_main_thread(func):
             result_holder[0] = func()
         except Exception as e:
             error_holder[0] = str(e)
-            _write_log(f"[MCP] _run_on_main_thread wrapper error: {e}")
         finally:
             event.set()
 
     try:
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(0, wrapper)
-        waited = event.wait(timeout=5.0)  # 최대 5초 대기
+        waited = event.wait(timeout=timeout)
 
         if not waited:
-            _write_log("[MCP] _run_on_main_thread: TIMEOUT (5s) — wrapper never executed")
-            # Timeout 시 직접 실행 시도 (메인 스레드 아니지만 read-only라면 OK)
+            # 타임아웃 시 직접 실행 (read-only 함수면 안전)
             try:
                 result_holder[0] = func()
-                _write_log("[MCP] _run_on_main_thread: fallback direct call succeeded")
             except Exception as e2:
-                _write_log(f"[MCP] _run_on_main_thread: fallback also failed: {e2}")
-                return f"Error: timeout + fallback failed: {e2}"
+                return {"error": f"timeout + fallback failed: {e2}"}
 
         if error_holder[0]:
-            return f"Error: {error_holder[0]}"
+            return {"error": error_holder[0]}
         return result_holder[0]
     except Exception as e:
-        _write_log(f"[MCP] _run_on_main_thread exception: {e}")
-        return f"Error: {e}"
+        return {"error": str(e)}
 
 
-# ─── MCP 서버 정의 ────────────────────────────────────
-mcp = FastMCP("WellcomLAND Debug", host="127.0.0.1", port=5111)
+# ─── 데이터 수집 함수들 ──────────────────────────────
 
-
-@mcp.tool()
-def list_devices() -> str:
-    """모든 KVM 장치 목록과 상태를 반환합니다.
-
-    각 장치의 이름, IP, 포트, 온라인/오프라인 상태, 그룹 정보를 포함합니다.
-    """
+def _get_devices():
+    """장치 목록"""
     def _get():
         if not _main_window or not hasattr(_main_window, 'manager'):
-            return json.dumps({"error": "MainWindow not available"})
-
+            return []
         devices = _main_window.manager.get_all_devices()
-        result = []
-        for d in devices:
-            result.append({
-                "name": d.name,
-                "ip": d.ip,
-                "web_port": getattr(d.info, 'web_port', 80),
-                "status": str(d.status).split('.')[-1] if hasattr(d.status, 'name') else str(d.status),
-                "group": getattr(d.info, 'group', 'default') or 'default',
-            })
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return [{
+            "name": d.name,
+            "ip": d.ip,
+            "web_port": getattr(d.info, 'web_port', 80),
+            "port": getattr(d.info, 'port', 22),
+            "status": d.status.name if hasattr(d.status, 'name') else str(d.status),
+            "group": getattr(d.info, 'group', 'default') or 'default',
+            "is_relay": d.ip.startswith('100.'),
+            "kvm_local_ip": getattr(d.info, '_kvm_local_ip', None),
+        } for d in devices]
+    return _run_on_main_thread(_get) or []
 
-    return _run_on_main_thread(_get) or '[]'
+
+def _get_app_status():
+    """앱 전체 상태"""
+    from version import __version__
+    uptime = time.time() - _start_time
+
+    def _get():
+        info = {
+            "version": __version__,
+            "uptime_seconds": int(uptime),
+            "uptime_human": f"{int(uptime//3600)}h {int((uptime%3600)//60)}m {int(uptime%60)}s",
+            "frozen": getattr(sys, 'frozen', False),
+            "python": sys.version.split()[0],
+            "pid": os.getpid(),
+            "log_buffer_size": len(_log_buffer),
+        }
+
+        # 메모리 사용량
+        try:
+            import resource
+            info["memory_mb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        except ImportError:
+            try:
+                # Windows
+                import ctypes
+                from ctypes import wintypes
+                class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+                pmc = PROCESS_MEMORY_COUNTERS()
+                pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+                handle = ctypes.windll.kernel32.GetCurrentProcess()
+                if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
+                    info["memory_mb"] = round(pmc.WorkingSetSize / (1024 * 1024), 1)
+                    info["peak_memory_mb"] = round(pmc.PeakWorkingSetSize / (1024 * 1024), 1)
+            except Exception:
+                pass
+
+        if _main_window:
+            # LiveView 상태
+            info["live_control_device"] = getattr(_main_window, '_live_control_device', None)
+            info["live_dialog_open"] = getattr(_main_window, '_live_dialog', None) is not None
+
+            # StatusThread 상태
+            st = getattr(_main_window, 'status_thread', None)
+            if st:
+                info["status_thread"] = {
+                    "running": getattr(st, 'running', None),
+                    "paused": getattr(st, '_paused', None),
+                    "alive": st.isRunning() if hasattr(st, 'isRunning') else None,
+                }
+
+            # 장치 수
+            if hasattr(_main_window, 'manager'):
+                info["device_count"] = len(_main_window.manager.get_all_devices())
+
+        return info
+
+    return _run_on_main_thread(_get) or {"version": __version__, "error": "MainWindow not ready"}
 
 
-@mcp.tool()
-def get_thumbnail_states() -> str:
-    """모든 GridViewTab의 썸네일 WebView 상태를 상세 반환합니다.
+def _get_threads():
+    """활성 스레드 목록"""
+    threads = []
+    for t in threading.enumerate():
+        threads.append({
+            "name": t.name,
+            "daemon": t.daemon,
+            "alive": t.is_alive(),
+            "ident": t.ident,
+        })
+    return threads
 
-    각 썸네일의 _is_active, _is_paused, _stream_status, _crop_region,
-    WebView 존재 여부, URL 등을 포함합니다.
-    """
+
+def _get_thumbnails():
+    """썸네일 상태"""
     def _get():
         if not _main_window:
-            return json.dumps({"error": "MainWindow not available"})
+            return {}
 
         result = {}
+        tabs = []
+        if hasattr(_main_window, 'grid_view_tab') and _main_window.grid_view_tab:
+            tabs.append(("전체 목록", _main_window.grid_view_tab))
+        if hasattr(_main_window, 'group_grid_tabs'):
+            for gname, gtab in _main_window.group_grid_tabs.items():
+                tabs.append((gname, gtab))
 
-        # 전체 목록 탭
-        if hasattr(_main_window, 'grid_view_tab'):
-            tab = _main_window.grid_view_tab
+        for tab_name, tab in tabs:
             tab_info = {
-                "tab_name": "전체 목록",
-                "is_visible": tab._is_visible,
-                "load_in_progress": tab._load_in_progress,
-                "crop_region": tab._crop_region,
-                "thumbnail_count": len(tab.thumbnails),
-                "thumbnails": []
+                "is_visible": getattr(tab, '_is_visible', None),
+                "load_in_progress": getattr(tab, '_load_in_progress', None),
+                "crop_region": getattr(tab, '_crop_region', None),
+                "preview_enabled": getattr(tab, '_live_preview_enabled', None),
+                "thumbnails": [],
             }
-            for thumb in tab.thumbnails:
+            for thumb in getattr(tab, 'thumbnails', []):
                 t = {
                     "device": thumb.device.name,
-                    "is_active": thumb._is_active,
-                    "is_paused": thumb._is_paused,
-                    "stream_status": thumb._stream_status,
-                    "crop_region": thumb._crop_region,
-                    "has_webview": thumb._webview is not None,
-                    "use_preview": thumb._use_preview,
+                    "ip": thumb.device.ip,
+                    "active": getattr(thumb, '_is_active', None),
+                    "stream": getattr(thumb, '_stream_status', None),
+                    "has_webview": getattr(thumb, '_webview', None) is not None,
+                    "crop": getattr(thumb, '_crop_region', None),
                 }
                 if thumb._webview:
                     try:
                         t["url"] = thumb._webview.url().toString()
                     except Exception:
-                        t["url"] = "N/A"
+                        pass
                 tab_info["thumbnails"].append(t)
-            result["전체 목록"] = tab_info
+            result[tab_name] = tab_info
+        return result
 
-        # 그룹 탭들
-        if hasattr(_main_window, 'group_grid_tabs'):
-            for group_name, tab in _main_window.group_grid_tabs.items():
-                tab_info = {
-                    "tab_name": group_name,
-                    "is_visible": tab._is_visible,
-                    "load_in_progress": tab._load_in_progress,
-                    "crop_region": tab._crop_region,
-                    "thumbnail_count": len(tab.thumbnails),
-                    "thumbnails": []
-                }
-                for thumb in tab.thumbnails:
-                    t = {
-                        "device": thumb.device.name,
-                        "is_active": thumb._is_active,
-                        "is_paused": thumb._is_paused,
-                        "stream_status": thumb._stream_status,
-                        "crop_region": thumb._crop_region,
-                        "has_webview": thumb._webview is not None,
-                        "use_preview": thumb._use_preview,
-                    }
-                    if thumb._webview:
-                        try:
-                            t["url"] = thumb._webview.url().toString()
-                        except Exception:
-                            t["url"] = "N/A"
-                    tab_info["thumbnails"].append(t)
-                result[group_name] = tab_info
-
-        return json.dumps(result, ensure_ascii=False, indent=2)
-
-    return _run_on_main_thread(_get) or '{}'
+    return _run_on_main_thread(_get) or {}
 
 
-@mcp.tool()
-def get_tab_info() -> str:
-    """현재 탭 위젯의 상태를 반환합니다.
+def _get_gpu_info():
+    """GPU 관련 설정/상태"""
+    info = {
+        "frozen": getattr(sys, 'frozen', False),
+        "chromium_flags": os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', ''),
+    }
+    # GPU 크래시 플래그
+    try:
+        from config import DATA_DIR
+        flag_path = os.path.join(DATA_DIR, ".gpu_crash")
+        info["gpu_crash_flag"] = os.path.exists(flag_path)
+        if os.path.exists(flag_path):
+            with open(flag_path, 'r') as f:
+                info["gpu_crash_content"] = f.read().strip()
+    except Exception:
+        pass
+    # 소프트웨어 렌더링 설정
+    info["software_opengl"] = bool(os.environ.get('QT_OPENGL', ''))
+    info["angle_platform"] = os.environ.get('QT_OPENGL_ANGLE_PLATFORM', '')
+    return info
 
-    현재 활성 탭 인덱스, 각 탭의 이름, 타입, 가시성 등을 포함합니다.
-    """
+
+def _get_relay_info():
+    """릴레이 상태"""
     def _get():
-        if not _main_window or not hasattr(_main_window, 'tab_widget'):
-            return json.dumps({"error": "MainWindow not available"})
+        result = {"relays": []}
+        try:
+            from main import _kvm_relay
+            if _kvm_relay:
+                for name, proxy in getattr(_kvm_relay, '_tcp_proxies', {}).items():
+                    result["relays"].append({
+                        "name": name,
+                        "type": "TCP",
+                        "listen_port": getattr(proxy, '_listen_port', None),
+                        "target": f"{getattr(proxy, '_target_host', '?')}:{getattr(proxy, '_target_port', '?')}",
+                        "running": getattr(proxy, '_running', None),
+                    })
+                for name, relay in getattr(_kvm_relay, '_udp_relays', {}).items():
+                    result["relays"].append({
+                        "name": name,
+                        "type": "UDP",
+                        "listen_port": getattr(relay, '_listen_port', None),
+                        "running": getattr(relay, '_running', None),
+                    })
+                result["heartbeat_running"] = getattr(_kvm_relay, '_running', None)
+        except Exception as e:
+            result["error"] = str(e)
+        return result
 
-        tw = _main_window.tab_widget
-        result = {
-            "current_index": tw.currentIndex(),
-            "current_tab_text": tw.tabText(tw.currentIndex()),
-            "tab_count": tw.count(),
-            "tabs": []
-        }
-
-        for i in range(tw.count()):
-            widget = tw.widget(i)
-            tab_data = {
-                "index": i,
-                "text": tw.tabText(i),
-                "type": type(widget).__name__,
-                "is_current": i == tw.currentIndex(),
-            }
-
-            # GridViewTab 추가 정보
-            if hasattr(widget, 'thumbnails'):
-                tab_data["thumbnail_count"] = len(widget.thumbnails)
-                tab_data["is_visible"] = widget._is_visible
-                tab_data["load_in_progress"] = widget._load_in_progress
-                tab_data["crop_region"] = widget._crop_region
-                tab_data["live_preview_enabled"] = widget._live_preview_enabled
-
-                # 상태 요약
-                active = sum(1 for t in widget.thumbnails if t._is_active)
-                connected = sum(1 for t in widget.thumbnails if t._stream_status == "connected")
-                tab_data["active_count"] = active
-                tab_data["connected_count"] = connected
-
-            result["tabs"].append(tab_data)
-
-        return json.dumps(result, ensure_ascii=False, indent=2)
-
-    return _run_on_main_thread(_get) or '{}'
+    return _run_on_main_thread(_get) or {"relays": []}
 
 
-@mcp.tool()
-def get_app_logs(last_n: int = 100) -> str:
-    """최근 앱 로그를 반환합니다.
+def _get_network_info():
+    """네트워크 정보"""
+    info = {"interfaces": []}
+    try:
+        hostname = socket.gethostname()
+        info["hostname"] = hostname
+        for ai in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = ai[4][0]
+            info["interfaces"].append({
+                "ip": ip,
+                "is_tailscale": ip.startswith('100.'),
+                "is_lan": ip.startswith('192.168.') or ip.startswith('10.'),
+            })
+    except Exception as e:
+        info["error"] = str(e)
+    return info
 
-    Args:
-        last_n: 반환할 최근 로그 줄 수 (기본 100, 최대 1000)
-    """
-    n = min(max(1, last_n), 1000)
-    logs = list(_log_buffer)
-    recent = logs[-n:] if len(logs) > n else logs
-    return '\n'.join(recent) if recent else '(로그 없음)'
+
+def _read_log_file(filename='app.log', last_n=200):
+    """로그 파일 직접 읽기"""
+    try:
+        base_dir = os.environ.get('WELLCOMLAND_BASE_DIR', '.')
+        log_path = os.path.join(base_dir, 'logs', filename)
+        if not os.path.exists(log_path):
+            return f"(파일 없음: {log_path})"
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        return ''.join(lines[-last_n:])
+    except Exception as e:
+        return f"Error: {e}"
 
 
-@mcp.tool()
-def take_screenshot() -> str:
-    """MainWindow의 스크린샷을 찍어 base64 PNG로 반환합니다.
+def _read_fault_log():
+    """fault.log 읽기 (크래시 로그)"""
+    return _read_log_file('fault.log', last_n=100)
 
-    반환값은 data:image/png;base64,... 형식의 문자열입니다.
-    """
-    def _get():
-        if not _main_window:
-            return "Error: MainWindow not available"
+
+# ─── LiveView JavaScript 실행 ──────────────────────
+_js_result = {"value": None, "error": None, "done": False}
+
+
+def _run_js_on_liveview(code, timeout=8.0):
+    """LiveView WebView에서 JavaScript 실행 후 결과 반환"""
+    global _js_result
+    _js_result = {"value": None, "error": None, "done": False}
+
+    def _exec():
+        try:
+            dialog = getattr(_main_window, '_live_dialog', None)
+            if not dialog:
+                _js_result["error"] = "LiveView dialog not open"
+                _js_result["done"] = True
+                return
+            page = getattr(dialog, 'aion2_page', None)
+            if not page:
+                _js_result["error"] = "No aion2_page"
+                _js_result["done"] = True
+                return
+
+            def _callback(result):
+                _js_result["value"] = result
+                _js_result["done"] = True
+
+            page.runJavaScript(code, _callback)
+        except Exception as e:
+            _js_result["error"] = str(e)
+            _js_result["done"] = True
+
+    # Qt 메인 스레드에서 실행
+    try:
+        from PyQt6.QtCore import QTimer
+        event = threading.Event()
+
+        def _on_main():
+            _exec()
+            # runJavaScript는 비동기 — 별도로 완료 대기
+            def _check():
+                if _js_result["done"]:
+                    event.set()
+                else:
+                    QTimer.singleShot(100, _check)
+            QTimer.singleShot(100, _check)
+
+        QTimer.singleShot(0, _on_main)
+        event.wait(timeout=timeout)
+        if not _js_result["done"]:
+            return {"error": "timeout", "code": code}
+        return _js_result
+    except Exception as e:
+        return {"error": str(e), "code": code}
+
+
+# ─── HTTP 핸들러 ────────────────────────────────────
+class DebugHandler(BaseHTTPRequestHandler):
+    """경량 REST API 핸들러"""
+
+    def log_message(self, format, *args):
+        """HTTP 로그 억제 (너무 많으면 성능 저하)"""
+        pass
+
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        body = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        self.wfile.write(body.encode('utf-8'))
+
+    def _send_text(self, text, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(text.encode('utf-8'))
+
+    def _send_html(self, html, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(html.encode('utf-8'))
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip('/')
+        params = parse_qs(parsed.query)
 
         try:
-            from PyQt6.QtCore import QBuffer, QIODevice
-            from PyQt6.QtWidgets import QApplication
+            # 대시보드
+            if path == '' or path == '/':
+                self._send_html(self._dashboard_html())
 
-            screen = QApplication.primaryScreen()
-            if not screen:
-                return "Error: No screen available"
+            # === API 엔드포인트 ===
+            elif path == '/api/status':
+                self._send_json(_get_app_status())
 
-            # MainWindow 영역만 캡처
-            geometry = _main_window.geometry()
-            pixmap = screen.grabWindow(0,
-                                       geometry.x(), geometry.y(),
-                                       geometry.width(), geometry.height())
+            elif path == '/api/devices':
+                self._send_json(_get_devices())
 
-            # PNG → base64
-            buffer = QBuffer()
-            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-            pixmap.save(buffer, "PNG")
-            png_data = buffer.data().data()
-            b64 = base64.b64encode(png_data).decode('ascii')
+            elif path == '/api/threads':
+                self._send_json(_get_threads())
 
-            return f"data:image/png;base64,{b64}"
-        except Exception as e:
-            return f"Error: {e}"
+            elif path == '/api/thumbnails':
+                self._send_json(_get_thumbnails())
 
-    return _run_on_main_thread(_get) or 'Error: timeout'
+            elif path == '/api/gpu':
+                self._send_json(_get_gpu_info())
 
+            elif path == '/api/relay':
+                self._send_json(_get_relay_info())
 
-@mcp.tool()
-def force_start_capture(device_name: str) -> str:
-    """특정 장치의 썸네일 캡처를 강제로 시작합니다.
+            elif path == '/api/network':
+                self._send_json(_get_network_info())
 
-    Args:
-        device_name: KVM 장치 이름
-    """
-    def _do():
-        if not _main_window:
-            return "Error: MainWindow not available"
+            elif path == '/api/logs':
+                n = int(params.get('n', ['200'])[0])
+                logs = list(_log_buffer)
+                recent = logs[-n:] if len(logs) > n else logs
+                self._send_text('\n'.join(recent) if recent else '(로그 없음)')
 
-        # 모든 탭에서 해당 장치 찾기
-        all_tabs = [_main_window.grid_view_tab] + list(_main_window.group_grid_tabs.values())
-        found = False
-        for tab in all_tabs:
-            for thumb in tab.thumbnails:
-                if thumb.device.name == device_name:
-                    thumb.start_capture()
-                    found = True
-
-        return f"OK: {device_name} 캡처 시작" if found else f"Error: '{device_name}' 장치를 찾을 수 없음"
-
-    return _run_on_main_thread(_do) or 'Error: timeout'
-
-
-@mcp.tool()
-def force_stop_capture(device_name: str) -> str:
-    """특정 장치의 썸네일 캡처를 강제로 중지합니다.
-
-    Args:
-        device_name: KVM 장치 이름
-    """
-    def _do():
-        if not _main_window:
-            return "Error: MainWindow not available"
-
-        all_tabs = [_main_window.grid_view_tab] + list(_main_window.group_grid_tabs.values())
-        found = False
-        for tab in all_tabs:
-            for thumb in tab.thumbnails:
-                if thumb.device.name == device_name:
-                    thumb.stop_capture()
-                    found = True
-
-        return f"OK: {device_name} 캡처 중지" if found else f"Error: '{device_name}' 장치를 찾을 수 없음"
-
-    return _run_on_main_thread(_do) or 'Error: timeout'
-
-
-@mcp.tool()
-def apply_crop(tab_name: str, x: float, y: float, w: float, h: float) -> str:
-    """특정 탭에 크롭 영역을 적용합니다.
-
-    Args:
-        tab_name: 탭 이름 ("전체 목록" 또는 그룹 이름)
-        x: 크롭 시작 X (0.0~1.0)
-        y: 크롭 시작 Y (0.0~1.0)
-        w: 크롭 너비 (0.0~1.0)
-        h: 크롭 높이 (0.0~1.0)
-    """
-    def _do():
-        if not _main_window:
-            return "Error: MainWindow not available"
-
-        region = (x, y, w, h)
-
-        if tab_name == "전체 목록":
-            tab = _main_window.grid_view_tab
-        else:
-            tab = _main_window.group_grid_tabs.get(tab_name)
-
-        if not tab:
-            return f"Error: '{tab_name}' 탭을 찾을 수 없음"
-
-        tab._crop_region = region
-        for thumb in tab.thumbnails:
-            if thumb._is_active and thumb._webview:
-                thumb._crop_region = region
-                thumb._poll_and_inject_crop(0)
-
-        return f"OK: '{tab_name}' 탭에 크롭 적용 ({x:.2f}, {y:.2f}, {w:.2f}, {h:.2f})"
-
-    return _run_on_main_thread(_do) or 'Error: timeout'
-
-
-@mcp.tool()
-def clear_crop(tab_name: str) -> str:
-    """특정 탭의 크롭을 해제합니다.
-
-    Args:
-        tab_name: 탭 이름 ("전체 목록" 또는 그룹 이름)
-    """
-    def _do():
-        if not _main_window:
-            return "Error: MainWindow not available"
-
-        if tab_name == "전체 목록":
-            tab = _main_window.grid_view_tab
-        else:
-            tab = _main_window.group_grid_tabs.get(tab_name)
-
-        if not tab:
-            return f"Error: '{tab_name}' 탭을 찾을 수 없음"
-
-        tab._crop_region = None
-        for thumb in tab.thumbnails:
-            thumb._crop_region = None
-            if thumb._webview:
-                thumb._clear_crop_css()
-
-        return f"OK: '{tab_name}' 탭 크롭 해제"
-
-    return _run_on_main_thread(_do) or 'Error: timeout'
-
-
-@mcp.tool()
-def run_js_on_thumbnail(device_name: str, js_code: str) -> str:
-    """특정 장치의 썸네일 WebView에서 JavaScript를 실행합니다.
-
-    Args:
-        device_name: KVM 장치 이름
-        js_code: 실행할 JavaScript 코드
-    """
-    result_holder = [None]
-    event = threading.Event()
-
-    def _do():
-        if not _main_window:
-            result_holder[0] = "Error: MainWindow not available"
-            event.set()
-            return
-
-        all_tabs = [_main_window.grid_view_tab] + list(_main_window.group_grid_tabs.values())
-        for tab in all_tabs:
-            for thumb in tab.thumbnails:
-                if thumb.device.name == device_name and thumb._webview:
-                    def on_result(val):
-                        result_holder[0] = json.dumps(val, ensure_ascii=False, default=str)
-                        event.set()
-
-                    thumb._webview.page().runJavaScript(js_code, on_result)
+            elif path == '/api/logs/file':
+                n = int(params.get('n', ['200'])[0])
+                filename = params.get('f', ['app.log'])[0]
+                # 보안: 파일명에 경로 구분자 금지
+                if '/' in filename or '\\' in filename or '..' in filename:
+                    self._send_json({"error": "invalid filename"}, 400)
                     return
+                self._send_text(_read_log_file(filename, n))
 
-        result_holder[0] = f"Error: '{device_name}' 장치의 WebView를 찾을 수 없음"
-        event.set()
+            elif path == '/api/logs/fault':
+                self._send_text(_read_fault_log())
 
-    from PyQt6.QtCore import QTimer
-    QTimer.singleShot(0, _do)
-    event.wait(timeout=10.0)
+            elif path == '/api/js':
+                # LiveView WebView에서 JavaScript 실행
+                code = params.get('code', [''])[0]
+                if not code:
+                    self._send_json({"error": "missing 'code' parameter"}, 400)
+                    return
+                result = _run_js_on_liveview(code)
+                self._send_json(result)
 
-    return result_holder[0] or 'Error: timeout'
+            elif path == '/api/webrtc_diag':
+                # WebRTC 종합 진단 — LiveView에서 자동 실행
+                diag_js = """
+(function() {
+    var result = {};
+
+    // 1. video 엘리먼트
+    var videos = document.querySelectorAll('video');
+    result.video_count = videos.length;
+    result.videos = [];
+    videos.forEach(function(v, i) {
+        result.videos.push({
+            index: i,
+            readyState: v.readyState,
+            paused: v.paused,
+            width: v.videoWidth,
+            height: v.videoHeight,
+            srcObj: !!v.srcObject,
+            src: v.src || '',
+            currentTime: v.currentTime,
+            networkState: v.networkState
+        });
+    });
+
+    // 2. RTCPeerConnection 존재 여부
+    result.rtc_available = typeof RTCPeerConnection !== 'undefined';
+    result.rtc_count = window.__rtc_count || 0;
+
+    // 3. WebSocket 상태
+    result.ws_count = window.__ws_count || 0;
+
+    // 4. 페이지 에러
+    result.page_errors = window.__page_errors || [];
+
+    // 5. DOM 주요 요소
+    var root = document.getElementById('root');
+    result.root_html_length = root ? root.innerHTML.length : 0;
+    result.root_children = root ? root.children.length : 0;
+
+    // 6. React 앱 상태 탐색
+    result.body_text_preview = document.body.innerText.substring(0, 500);
+
+    // 7. navigator.mediaDevices
+    result.mediaDevices_available = !!navigator.mediaDevices;
+    result.getUserMedia_available = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    result.getDisplayMedia_available = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+
+    // 8. console 에러 캡처 (이미 오버라이드된 경우)
+    result.console_errors = window.__console_errors || [];
+
+    return JSON.stringify(result);
+})()
+"""
+                result = _run_js_on_liveview(diag_js)
+                # 결과가 JSON 문자열이면 파싱
+                if result.get("value") and isinstance(result["value"], str):
+                    try:
+                        result["parsed"] = json.loads(result["value"])
+                    except Exception:
+                        pass
+                self._send_json(result)
+
+            elif path == '/api/js_inject_monitors':
+                # WebRTC/WebSocket/에러 모니터 삽입
+                inject_js = """
+(function() {
+    // 이미 삽입됐으면 스킵
+    if (window.__debug_monitors_installed) return 'already installed';
+
+    window.__rtc_count = 0;
+    window.__ws_count = 0;
+    window.__page_errors = [];
+    window.__console_errors = [];
+    window.__rtc_instances = [];
+    window.__ws_instances = [];
+
+    // RTCPeerConnection 가로채기
+    var _OrigRTC = window.RTCPeerConnection;
+    window.RTCPeerConnection = function() {
+        window.__rtc_count++;
+        var pc = new _OrigRTC(...arguments);
+        window.__rtc_instances.push({
+            created: new Date().toISOString(),
+            config: arguments[0]
+        });
+        console.log('[DEBUG] RTCPeerConnection created #' + window.__rtc_count);
+        var origSetRemote = pc.setRemoteDescription.bind(pc);
+        pc.setRemoteDescription = function(desc) {
+            console.log('[DEBUG] setRemoteDescription type=' + desc.type);
+            return origSetRemote(desc);
+        };
+        pc.addEventListener('iceconnectionstatechange', function() {
+            console.log('[DEBUG] ICE state: ' + pc.iceConnectionState);
+        });
+        pc.addEventListener('connectionstatechange', function() {
+            console.log('[DEBUG] Connection state: ' + pc.connectionState);
+        });
+        pc.addEventListener('track', function(e) {
+            console.log('[DEBUG] Track received: ' + e.track.kind);
+        });
+        return pc;
+    };
+    window.RTCPeerConnection.prototype = _OrigRTC.prototype;
+
+    // WebSocket 가로채기
+    var _OrigWS = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+        window.__ws_count++;
+        console.log('[DEBUG] WebSocket #' + window.__ws_count + ' → ' + url);
+        var ws = protocols ? new _OrigWS(url, protocols) : new _OrigWS(url);
+        window.__ws_instances.push({url: url, created: new Date().toISOString()});
+        ws.addEventListener('open', function() { console.log('[DEBUG] WS open: ' + url); });
+        ws.addEventListener('error', function(e) { console.log('[DEBUG] WS error: ' + url); });
+        ws.addEventListener('close', function(e) { console.log('[DEBUG] WS close: ' + url + ' code=' + e.code); });
+        return ws;
+    };
+    window.WebSocket.prototype = _OrigWS.prototype;
+    // Copy static properties
+    window.WebSocket.CONNECTING = _OrigWS.CONNECTING;
+    window.WebSocket.OPEN = _OrigWS.OPEN;
+    window.WebSocket.CLOSING = _OrigWS.CLOSING;
+    window.WebSocket.CLOSED = _OrigWS.CLOSED;
+
+    // 에러 캡처
+    window.addEventListener('error', function(e) {
+        window.__page_errors.push({
+            message: e.message,
+            filename: e.filename,
+            lineno: e.lineno,
+            time: new Date().toISOString()
+        });
+    });
+
+    // console.error 캡처
+    var _origError = console.error;
+    console.error = function() {
+        window.__console_errors.push({
+            args: Array.from(arguments).map(String),
+            time: new Date().toISOString()
+        });
+        _origError.apply(console, arguments);
+    };
+
+    window.__debug_monitors_installed = true;
+    return 'monitors installed';
+})()
+"""
+                result = _run_js_on_liveview(inject_js)
+                self._send_json(result)
+
+            elif path == '/api/all':
+                # 전체 상태 한 번에 가져오기
+                self._send_json({
+                    "status": _get_app_status(),
+                    "devices": _get_devices(),
+                    "threads": _get_threads(),
+                    "gpu": _get_gpu_info(),
+                    "relay": _get_relay_info(),
+                    "network": _get_network_info(),
+                })
+
+            else:
+                self._send_json({"error": "not found", "endpoints": [
+                    "/", "/api/status", "/api/devices", "/api/threads",
+                    "/api/thumbnails", "/api/gpu", "/api/relay", "/api/network",
+                    "/api/logs?n=200", "/api/logs/file?f=app.log&n=200",
+                    "/api/logs/fault", "/api/all",
+                    "/api/js?code=...", "/api/webrtc_diag",
+                    "/api/js_inject_monitors",
+                ]}, 404)
+
+        except Exception as e:
+            self._send_json({"error": str(e), "traceback": traceback.format_exc()}, 500)
+
+    def _dashboard_html(self):
+        """간단한 대시보드 HTML"""
+        from version import __version__
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WellcomLAND Debug</title>
+<style>
+body {{ font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 20px; }}
+h1 {{ color: #4CAF50; }}
+a {{ color: #64B5F6; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+.section {{ background: #16213e; padding: 15px; margin: 10px 0; border-radius: 8px; }}
+.endpoint {{ margin: 5px 0; }}
+pre {{ background: #0f3460; padding: 10px; border-radius: 5px; overflow-x: auto; }}
+#status {{ margin: 20px 0; }}
+</style>
+</head><body>
+<h1>WellcomLAND Debug Server v{__version__}</h1>
+
+<div class="section">
+<h2>API Endpoints</h2>
+<div class="endpoint"><a href="/api/status">/api/status</a> — 앱 상태 (버전, uptime, LiveView, StatusThread)</div>
+<div class="endpoint"><a href="/api/devices">/api/devices</a> — KVM 장치 목록</div>
+<div class="endpoint"><a href="/api/threads">/api/threads</a> — 활성 스레드 목록</div>
+<div class="endpoint"><a href="/api/thumbnails">/api/thumbnails</a> — 썸네일 WebView 상태</div>
+<div class="endpoint"><a href="/api/gpu">/api/gpu</a> — GPU 설정/크래시 정보</div>
+<div class="endpoint"><a href="/api/relay">/api/relay</a> — 릴레이 프록시 상태</div>
+<div class="endpoint"><a href="/api/network">/api/network</a> — 네트워크 정보</div>
+<div class="endpoint"><a href="/api/logs?n=200">/api/logs?n=200</a> — 최근 로그 (메모리 버퍼)</div>
+<div class="endpoint"><a href="/api/logs/file?f=app.log&n=200">/api/logs/file</a> — 로그 파일 직접 읽기</div>
+<div class="endpoint"><a href="/api/logs/fault">/api/logs/fault</a> — 크래시 로그 (fault.log)</div>
+<div class="endpoint"><a href="/api/all">/api/all</a> — 전체 상태 한 번에</div>
+</div>
+
+<div class="section" id="status">
+<h2>Live Status</h2>
+<pre id="status-data">로딩 중...</pre>
+</div>
+
+<script>
+async function refresh() {{
+    try {{
+        const r = await fetch('/api/status');
+        const d = await r.json();
+        document.getElementById('status-data').textContent = JSON.stringify(d, null, 2);
+    }} catch(e) {{
+        document.getElementById('status-data').textContent = 'Error: ' + e;
+    }}
+}}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body></html>"""
 
 
-@mcp.tool()
-def get_device_detail(device_name: str) -> str:
-    """특정 장치의 상세 정보를 반환합니다.
+# ─── 서버 시작 ──────────────────────────────────────
 
-    Args:
-        device_name: KVM 장치 이름
-    """
-    def _get():
-        if not _main_window or not hasattr(_main_window, 'manager'):
-            return json.dumps({"error": "MainWindow not available"})
-
-        devices = _main_window.manager.get_all_devices()
-        for d in devices:
-            if d.name == device_name:
-                info = {
-                    "name": d.name,
-                    "ip": d.ip,
-                    "status": str(d.status).split('.')[-1] if hasattr(d.status, 'name') else str(d.status),
-                    "web_port": getattr(d.info, 'web_port', 80),
-                    "ssh_port": getattr(d.info, 'ssh_port', 22),
-                    "ssh_user": getattr(d.info, 'ssh_user', ''),
-                    "group": getattr(d.info, 'group', 'default') or 'default',
-                    "model": getattr(d.info, 'model', ''),
-                    "firmware": getattr(d.info, 'firmware_version', ''),
-                }
-                return json.dumps(info, ensure_ascii=False, indent=2)
-
-        return json.dumps({"error": f"'{device_name}' not found"})
-
-    return _run_on_main_thread(_get) or '{}'
-
-
-# ─── 서버 시작/중지 ──────────────────────────────────
-
-def start_server(main_window, port: int = 5111):
-    """MCP 디버그 서버를 별도 스레드에서 시작
+def start_server(main_window, port=5111):
+    """디버그 HTTP 서버를 별도 스레드에서 시작
 
     Args:
         main_window: MainWindow 인스턴스
-        port: SSE 서버 포트 (기본 5111)
+        port: HTTP 포트 (기본 5111)
     """
     global _main_window, _server_thread
     _main_window = main_window
 
-    # 포트 변경이 필요한 경우 settings 업데이트
-    mcp.settings.port = port
-
     def _run():
         try:
-            # PyInstaller EXE에서 누락되는 stdlib 모듈을 시스템 Python에서 강제 로드
-            _patch_frozen_imports()
-            mcp.run(transport="sse")
-        except Exception as e:
-            _write_log(f"[MCP] 서버 스레드 오류: {e}")
-            import traceback
-            _write_log(traceback.format_exc())
+            # 0.0.0.0 바인딩 → Tailscale IP로 원격 접근 가능
+            server = HTTPServer(('0.0.0.0', port), DebugHandler)
+            server.timeout = 1.0
+            print(f"[Debug] 디버그 서버 시작: http://0.0.0.0:{port}/")
 
-    _server_thread = threading.Thread(target=_run, daemon=True, name="MCP-Debug")
+            while True:
+                server.handle_request()
+        except Exception as e:
+            print(f"[Debug] 서버 오류: {e}")
+            traceback.print_exc()
+
+    _server_thread = threading.Thread(target=_run, daemon=True, name="DebugHTTP")
     _server_thread.start()
 
-    # 스레드 시작 후 잠시 대기하여 즉시 크래시 감지
-    import time as _t2
-    _t2.sleep(1.0)
-    if not _server_thread.is_alive():
-        _write_log("[MCP] 경고: 서버 스레드가 1초 내에 종료됨!")
-    else:
-        _write_log(f"[MCP] 서버 스레드 정상 실행 중 (alive={_server_thread.is_alive()})")
-
-    return _server_thread
-
-
-def _write_log(msg):
-    """MCP 내부 로그를 파일에 기록"""
-    import os
+    # Tailscale IP 출력
     try:
-        log_path = os.path.join(
-            os.environ.get('WELLCOMLAND_BASE_DIR', '.'), 'logs', 'mcp_debug.log'
-        )
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        hostname = socket.gethostname()
+        for ai in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = ai[4][0]
+            if ip.startswith('100.'):
+                print(f"[Debug] Tailscale 접근: http://{ip}:{port}/")
+                break
     except Exception:
         pass
-    print(msg)
 
-
-def _patch_frozen_imports():
-    """PyInstaller EXE에서 누락되는 stdlib 서브모듈을 시스템 Python에서 강제 로드.
-
-    PyInstaller가 logging 패키지를 번들하지만 logging.config 등 일부
-    서브모듈을 누락시킴. sys.path에 시스템 stdlib을 넣어도 frozen importer가
-    logging 네임스페이스를 먼저 잡으므로, importlib로 직접 로드하여 등록.
-    """
-    import importlib, importlib.util, os, glob
-
-    if not getattr(sys, 'frozen', False):
-        return  # 개발 환경에서는 불필요
-
-    # 시스템 Python stdlib 경로 수집
-    stdlib_dirs = []
-    for pattern in [
-        os.path.expandvars(r'%LOCALAPPDATA%\Python\*\Lib'),
-        os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\*\Lib'),
-    ]:
-        stdlib_dirs.extend(glob.glob(pattern))
-
-    if not stdlib_dirs:
-        return
-
-    # 의존성 순서대로 나열 (handlers → config, config가 handlers에 의존)
-    missing_modules = [
-        ('logging.handlers', 'logging', 'handlers.py'),
-        ('logging.config', 'logging', 'config.py'),
-    ]
-
-    def _load_one(mod_name, parent_pkg, filename):
-        """하나의 모듈을 시스템 stdlib에서 로드하여 sys.modules에 등록"""
-        if mod_name in sys.modules:
-            return True
-        for lib_dir in stdlib_dirs:
-            candidate = os.path.join(lib_dir, parent_pkg, filename)
-            if os.path.exists(candidate):
-                try:
-                    spec = importlib.util.spec_from_file_location(mod_name, candidate)
-                    if spec and spec.loader:
-                        mod = importlib.util.module_from_spec(spec)
-                        sys.modules[mod_name] = mod
-                        spec.loader.exec_module(mod)
-                        # 부모 패키지에 attribute 등록
-                        parent = sys.modules.get(parent_pkg)
-                        if parent:
-                            setattr(parent, filename.replace('.py', ''), mod)
-                        return True
-                except Exception:
-                    # 의존성 부족으로 실패 가능 — 나중에 재시도
-                    if mod_name in sys.modules:
-                        del sys.modules[mod_name]
-        return False
-
-    # 2-pass: 1차에서 실패하면 의존성이 채워진 후 2차 시도
-    patched = []
-    for pass_num in range(2):
-        for mod_name, parent_pkg, filename in missing_modules:
-            if mod_name not in [m for m, _, _ in missing_modules if m not in patched]:
-                continue
-            if _load_one(mod_name, parent_pkg, filename):
-                if mod_name not in patched:
-                    patched.append(mod_name)
-
-    if patched:
-        _write_log(f"[MCP] frozen 모듈 패치 완료: {patched}")
+    return _server_thread
